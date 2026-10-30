@@ -1,0 +1,7 @@
+file(GLOB_RECURSE lr_examples_common_sources CONFIGURE_DEPENDS common/src/*.cpp common/include/*.h)
+add_library(lr_examples_common STATIC ${lr_examples_common_sources})
+target_include_directories(lr_examples_common PUBLIC common/include)
+target_link_libraries(lr_examples_common PUBLIC lr::render PRIVATE lr_build_options)
+
+add_executable(lrender_cli cli/main.cpp)
+target_link_libraries(lrender_cli PRIVATE lr_examples_common lr_build_options)

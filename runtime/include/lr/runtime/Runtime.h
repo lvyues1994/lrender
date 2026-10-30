@@ -34,6 +34,7 @@ struct Runtime {
     virtual ~Runtime() = default;
 
     virtual ComputeScheduler framePool() noexcept = 0;
+    virtual std::uint32_t framePoolThreads() const noexcept = 0;
     virtual ComputeScheduler backgroundPool() noexcept = 0;
     virtual IoScheduler io() noexcept = 0;
     // Register descriptors here (stackfull::io::Registration) to wait for them in IO tasks.

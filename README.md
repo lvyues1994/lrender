@@ -27,4 +27,10 @@ cmake --workflow --preset debug        # 配置、构建、测试
 }
 ```
 
+离线渲染演示场景：
+
+```sh
+./build/debug/examples/lrender_cli --backend vulkan --size 960x540 --out demo.ppm
+```
+
 GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。

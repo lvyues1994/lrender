@@ -33,3 +33,14 @@ lr_add_test(lr_dependencies_tests
     SOURCES dependencies/DependenciesTest.cpp
     KERNELS dependencies/SmokeKernels.h
     LIBRARIES lr::runtime co2::co2 tc_devices)
+
+lr_add_test(lr_core_tests
+    SOURCES core/CoreTest.cpp
+    LIBRARIES lr::core)
+
+lr_add_test(lr_render_tests
+    SOURCES render/RenderWorldTest.cpp render/FrameGraphTest.cpp render/VisibilityPipelineTest.cpp
+    KERNELS render/TestKernels.h
+    LIBRARIES lr::render tc_devices)
+# White-box tests of the render module's internals.
+target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src")

@@ -37,15 +37,18 @@ std::unique_ptr<stackfull::sched::Scheduler> makeIoScheduler(RuntimeConfig const
 
 struct RuntimeImpl final : Runtime {
     explicit RuntimeImpl(RuntimeConfig const &config)
-        : frame(config.framePoolThreads), background(config.backgroundPoolThreads),
-          ioPoller(stackfull::io::makeDefaultPoller()), ioScheduler(makeIoScheduler(config, *ioPoller)) {}
+        : frameThreads(config.framePoolThreads), frame(config.framePoolThreads),
+          background(config.backgroundPoolThreads), ioPoller(stackfull::io::makeDefaultPoller()),
+          ioScheduler(makeIoScheduler(config, *ioPoller)) {}
 
     ComputeScheduler framePool() noexcept override { return frame.get_scheduler(); }
+    std::uint32_t framePoolThreads() const noexcept override { return frameThreads; }
     ComputeScheduler backgroundPool() noexcept override { return background.get_scheduler(); }
     IoScheduler io() noexcept override { return IoScheduler{*ioScheduler}; }
     stackfull::io::Poller &poller() noexcept override { return *ioPoller; }
 
 private:
+    std::uint32_t frameThreads;
     // Destroyed bottom-up, which is the shutdown order: the IO scheduler, the poller it
     // borrows, then the pools.
     lexec::static_thread_pool frame;
