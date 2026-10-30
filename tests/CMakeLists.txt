@@ -39,8 +39,9 @@ lr_add_test(lr_core_tests
     LIBRARIES lr::core)
 
 lr_add_test(lr_render_tests
-    SOURCES render/RenderWorldTest.cpp render/FrameGraphTest.cpp render/VisibilityPipelineTest.cpp
+    SOURCES render/RenderWorldTest.cpp render/FrameGraphTest.cpp render/BvhTest.cpp
+            render/VisibilityPipelineTest.cpp render/PathTracePipelineTest.cpp
     KERNELS render/TestKernels.h
     LIBRARIES lr::render tc_devices)
-# White-box tests of the render module's internals.
-target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src")
+# White-box tests of the render module's internals, and of its kernels' functions on the host.
+target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src" "${PROJECT_SOURCE_DIR}/render")

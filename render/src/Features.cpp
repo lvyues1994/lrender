@@ -1,12 +1,15 @@
 #include <lr/render/Features.h>
 
 #include "Bind.h"
+#include "kernels/PathTrace.h"
 #include "kernels/Post.h"
 #include "kernels/Shading.h"
 #include "kernels/Visibility.h"
 
 #include <algorithm>
 #include <cstddef>
+#include <stdexcept>
+#include <unordered_map>
 #include <vector>
 
 namespace lr::render {
@@ -32,7 +35,17 @@ void clear(PassContext &context, BufferRef<tc::uint> const target, std::size_t c
     bind(device, kernel.target, context.buffer(target));
     set(device, kernel.fill, value);
     set(device, kernel.count, static_cast<tc::uint>(count));
-    device.execute(kernel, tc::uvec3{groupsFor(count, 64), 1, 1});
+    context.dispatch(kernel, tc::uvec3{groupsFor(count, 64), 1, 1});
+}
+
+tc::uvec3 groupsCovering(core::ivec2 const extent) {
+    return tc::uvec3{groupsFor(static_cast<std::size_t>(extent.x), 8), groupsFor(static_cast<std::size_t>(extent.y), 8),
+                     1};
+}
+
+bool sameCamera(core::CameraDesc const &a, core::CameraDesc const &b) noexcept {
+    return a.position == b.position and a.target == b.target and a.up == b.up and a.verticalFov == b.verticalFov
+       and a.nearPlane == b.nearPlane and a.farPlane == b.farPlane;
 }
 
 struct VisibilityFeature final : RenderFeature {
@@ -72,7 +85,7 @@ struct VisibilityFeature final : RenderFeature {
             bind(device, kernel.triangleCounts, context.buffer(triangleCounts));
             set(device, kernel.viewProjection, viewProjection);
             set(device, kernel.instanceCount, instanceCount);
-            device.execute(kernel, tc::uvec3{groupsFor(instanceCount, 64), 1, 1});
+            context.dispatch(kernel, tc::uvec3{groupsFor(instanceCount, 64), 1, 1});
         });
 
         auto &compact = graph.addPass("compact visible instances");
@@ -87,7 +100,7 @@ struct VisibilityFeature final : RenderFeature {
             bind(device, kernel.visible, context.buffer(outputs.visible));
             bind(device, kernel.rasterArguments, context.buffer(arguments));
             set(device, kernel.instanceCount, instanceCount);
-            device.execute(kernel, tc::uvec3{1, 1, 1});
+            context.dispatch(kernel, tc::uvec3{1, 1, 1});
         });
 
         for (auto const writeTriangles : {0u, 1u}) {
@@ -119,7 +132,7 @@ struct VisibilityFeature final : RenderFeature {
                 set(device, kernel.viewProjection, viewProjection);
                 set(device, kernel.size, extent);
                 set(device, kernel.writeTriangles, writeTriangles);
-                device.executeIndirect(kernel, context.buffer(arguments));
+                context.dispatchIndirect(kernel, arguments);
             });
         }
 
@@ -132,7 +145,7 @@ struct VisibilityFeature final : RenderFeature {
             device.useKernel(kernel);
             bind(device, kernel.visible, context.buffer(outputs.visible));
             bind(device, kernel.totals, context.buffer(totals));
-            device.execute(kernel, tc::uvec3{1, 1, 1});
+            context.dispatch(kernel, tc::uvec3{1, 1, 1});
         });
         graph.readback<tc::uvec2>(totals, [](tc::uvec2 const *data, std::size_t, ViewResult &result) {
             result.stats.visibleInstances = data[0].x;
@@ -173,10 +186,76 @@ struct ShadingFeature final : RenderFeature {
             set(device, kernel.environment, environment);
             set(device, kernel.size, extent);
             set(device, kernel.lightCount, lightCount);
-            device.execute(kernel, tc::uvec3{groupsFor(static_cast<std::size_t>(extent.x), 8),
-                                             groupsFor(static_cast<std::size_t>(extent.y), 8), 1});
+            context.dispatch(kernel, groupsCovering(extent));
         });
     }
+};
+
+struct PathTraceFeature final : RenderFeature {
+    FeatureStage stage() const noexcept override { return FeatureStage::Shading; }
+    SceneRequirements requirements() const noexcept override { return SceneRequirements{true}; }
+
+    void setup(FrameGraphBuilder &graph, ViewContext const &view) override {
+        auto const accumulation = graph.history<AccumulationFormat>("path trace accumulation", view.extent);
+        auto const samples = samplesBefore(view, accumulation.valid);
+        auto &pass = graph.addPass("path trace");
+        pass.read(accumulation.previous);
+        pass.write(accumulation.current);
+        pass.write(view.sceneColor);
+        pass.record([accumulation, samples, color = view.sceneColor, extent = view.extent,
+                     inverseViewProjection = view.inverseViewProjection,
+                     environment = tc::vec4{view.environment.radiance, 0.0f},
+                     lightCount = static_cast<tc::uint>(view.lightCount)](PassContext &context) {
+            auto &device = context.device();
+            auto const &scene = context.scene();
+            if (scene.tlasNodes == nullptr) {
+                throw std::logic_error{"lr::render: the path tracer ran before the scene had hierarchies"};
+            }
+            auto kernel = kernels::PathTrace{};
+            device.useKernel(kernel);
+            bind(device, kernel.previous, context.image(accumulation.previous));
+            bind(device, kernel.current, context.image(accumulation.current));
+            bind(device, kernel.color, context.image(color));
+            bind(device, kernel.instances, *scene.instances);
+            bind(device, kernel.vertices, *scene.vertices);
+            bind(device, kernel.materials, *scene.materials);
+            bind(device, kernel.lights, *scene.lights);
+            bind(device, kernel.tlasNodes, *scene.tlasNodes);
+            bind(device, kernel.blasNodes, *scene.blasNodes);
+            bind(device, kernel.blasTriangles, *scene.blasTriangles);
+            bind(device, kernel.blasRoots, *scene.blasRoots);
+            set(device, kernel.inverseViewProjection, inverseViewProjection);
+            set(device, kernel.environment, environment);
+            set(device, kernel.size, extent);
+            set(device, kernel.lightCount, lightCount);
+            set(device, kernel.tlasNodeCount, scene.tlasNodeCount);
+            set(device, kernel.sampleIndex, samples);
+            context.dispatch(kernel, groupsCovering(extent));
+        });
+        graph.onFinish([total = samples + 1](ViewResult &result) { result.stats.accumulatedSamples = total; });
+    }
+
+private:
+    // What the samples averaged so far show.
+    struct Accumulation {
+        core::CameraDesc camera;
+        core::ivec2 extent;
+        std::uint64_t sceneVersion;
+        std::uint32_t samples;
+    };
+
+    // The samples taken before this frame's, none when the view shows something else now.
+    std::uint32_t samplesBefore(ViewContext const &view, bool const historyValid) {
+        auto const found = accumulations.find(view.view);
+        auto const continues = historyValid and found != accumulations.end()
+                           and sameCamera(found->second.camera, view.camera) and found->second.extent == view.extent
+                           and found->second.sceneVersion == view.sceneVersion;
+        auto const before = continues ? found->second.samples : 0u;
+        accumulations[view.view] = Accumulation{view.camera, view.extent, view.sceneVersion, before + 1};
+        return before;
+    }
+
+    std::unordered_map<ViewId, Accumulation> accumulations;
 };
 
 struct TonemapFeature final : RenderFeature {
@@ -197,8 +276,7 @@ struct TonemapFeature final : RenderFeature {
             set(device, kernel.size, extent);
             set(device, kernel.exposure, exposure);
             set(device, kernel.filmic, filmic);
-            device.execute(kernel, tc::uvec3{groupsFor(static_cast<std::size_t>(extent.x), 8),
-                                             groupsFor(static_cast<std::size_t>(extent.y), 8), 1});
+            context.dispatch(kernel, groupsCovering(extent));
         });
         graph.readback<tc::uint>(view.output,
                                  [extent = view.extent](tc::uint const *data, std::size_t const count, ViewResult &result) {
@@ -212,5 +290,6 @@ struct TonemapFeature final : RenderFeature {
 std::shared_ptr<RenderFeature> makeVisibilityFeature() { return std::make_shared<VisibilityFeature>(); }
 std::shared_ptr<RenderFeature> makeShadingFeature() { return std::make_shared<ShadingFeature>(); }
 std::shared_ptr<RenderFeature> makeTonemapFeature() { return std::make_shared<TonemapFeature>(); }
+std::shared_ptr<RenderFeature> makePathTraceFeature() { return std::make_shared<PathTraceFeature>(); }
 
 } // namespace lr::render

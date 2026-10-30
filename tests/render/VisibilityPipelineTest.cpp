@@ -271,8 +271,8 @@ struct FillFeature final : render::RenderFeature {
             device.setUniform(kernel.fill);
             kernel.size = extent;
             device.setUniform(kernel.size);
-            device.execute(kernel, tc::uvec3{static_cast<tc::uint>((extent.x + 7) / 8),
-                                             static_cast<tc::uint>((extent.y + 7) / 8), 1});
+            context.dispatch(kernel, tc::uvec3{static_cast<tc::uint>((extent.x + 7) / 8),
+                                               static_cast<tc::uint>((extent.y + 7) / 8), 1});
         });
     }
 

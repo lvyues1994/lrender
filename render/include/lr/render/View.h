@@ -6,6 +6,7 @@
 
 #include <cstdint>
 #include <optional>
+#include <string>
 #include <vector>
 
 namespace lr::render {
@@ -24,6 +25,8 @@ struct ViewSettings {
     ToneMapping toneMapping = ToneMapping::Aces;
 };
 
+// A view keeps history (the path tracer's accumulation) by its id across frames, until
+// it goes unrendered for a while or its target is destroyed.
 struct ViewDesc {
     ViewId id;
     RenderTargetId target;
@@ -41,6 +44,18 @@ struct ImageRgba8 {
 struct ViewStats {
     std::uint32_t visibleInstances = 0;
     std::uint32_t visibleTriangles = 0;
+    // The samples per pixel the path tracer has averaged since its last reset; 0 for
+    // pipelines that do not accumulate.
+    std::uint32_t accumulatedSamples = 0;
+};
+
+// Device time of one pass of a view's frame graph.
+struct PassTiming {
+    std::string pass;
+    std::uint32_t dispatches = 0;
+    // The sum over the dispatches; nullopt when the device reported a clock change
+    // during one of them.
+    std::optional<double> milliseconds;
 };
 
 struct ViewResult {
@@ -48,6 +63,9 @@ struct ViewResult {
     RenderTargetId target;
     std::optional<ImageRgba8> image; // image targets
     ViewStats stats;
+    // Every pass that ran, in order, when RendererConfig::gpuTimers is on and the device
+    // has timers; empty otherwise.
+    std::vector<PassTiming> passTimings;
 };
 
 } // namespace lr::render

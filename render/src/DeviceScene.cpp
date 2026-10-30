@@ -78,7 +78,37 @@ void writeTable(tc::Device &device, tc::TableResource<T, Layout> &table, std::ve
     }
 }
 
+void writeBuffer(tc::Device &device, tc::BufferResource<tc::uint> &buffer, std::vector<Indexed<tc::uint>> const &writes,
+                 bool const whole) {
+    for (auto const &write : writes) {
+        buffer[static_cast<std::int32_t>(write.index)] = write.value;
+    }
+    if (whole) {
+        device.uploadBuffer(buffer);
+        return;
+    }
+    for (auto const range : rangesOf(writes)) {
+        device.uploadBuffer(buffer, range.first, range.count);
+    }
+}
+
 } // namespace
+
+void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update) {
+    auto const &capacity = update.capacity;
+    if (capacity.blasNodes == 0) {
+        return;
+    }
+    auto const newBlasNodes = reserveTable(blasNodes, capacity.blasNodes);
+    auto const newBlasTriangles = reserveTable(blasTriangles, capacity.blasTriangles);
+    auto const newBlasRoots = reserveBuffer(blasRoots, capacity.meshes);
+    auto const newTlasNodes = reserveTable(tlasNodes, capacity.tlasNodes);
+    writeTable(device, *blasNodes, update.blasNodes, newBlasNodes);
+    writeTable(device, *blasTriangles, update.blasTriangles, newBlasTriangles);
+    writeBuffer(device, *blasRoots, update.blasRoots, newBlasRoots);
+    writeTable(device, *tlasNodes, update.tlasNodes, newTlasNodes);
+    tlasNodeCount = update.tlasNodeCount;
+}
 
 void DeviceScene::apply(tc::Device &device, SceneUpdate const &update) {
     auto const &capacity = update.capacity;
@@ -116,11 +146,14 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update) {
     writeTable(device, *lights, update.lights, newLights);
     instanceCount = update.instanceCount;
     lightCount = update.lightCount;
+    applyHierarchies(device, update);
 }
 
 SceneTables DeviceScene::tables() const noexcept {
-    return SceneTables{vertices.get(), indices.get(),   meshes.get(), instances.get(),
-                       materials.get(), lights.get(), instanceCount, lightCount};
+    return SceneTables{vertices.get(),  indices.get(),       meshes.get(),    instances.get(),
+                       materials.get(), lights.get(),        instanceCount,   lightCount,
+                       blasNodes.get(), blasTriangles.get(), blasRoots.get(), tlasNodes.get(),
+                       tlasNodeCount};
 }
 
 } // namespace lr::render

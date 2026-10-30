@@ -22,4 +22,9 @@ std::shared_ptr<RenderFeature> makeVisibilityFeature();
 std::shared_ptr<RenderFeature> makeShadingFeature();
 std::shared_ptr<RenderFeature> makeTonemapFeature();
 
+// The path tracing pipeline's shading: a Shading-stage feature that adds one sample per
+// pixel to the view's running mean and writes the mean to the scene colour. The mean
+// starts over when the camera, the extent or the scene changes.
+std::shared_ptr<RenderFeature> makePathTraceFeature();
+
 } // namespace lr::render

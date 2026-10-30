@@ -11,6 +11,7 @@ target_link_libraries(lr_render
 tc_add_kernels(lr_render HEADERS
     kernels/Visibility.h
     kernels/Shading.h
+    kernels/PathTrace.h
     kernels/Post.h)
 
 # Each transpiled kernel registers itself from a static initializer that nothing refers

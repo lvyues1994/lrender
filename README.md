@@ -31,6 +31,9 @@ cmake --workflow --preset debug        # 配置、构建、测试
 
 ```sh
 ./build/debug/examples/lrender_cli --backend vulkan --size 960x540 --out demo.ppm
+./build/debug/examples/lrender_cli --pipeline pathtrace --samples 256 --timers on --out reference.ppm
 ```
+
+`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--timers on` 打印每个 pass 的设备耗时。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
 
 GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。

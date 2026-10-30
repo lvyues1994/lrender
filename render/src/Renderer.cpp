@@ -23,6 +23,9 @@ namespace lr::render {
 
 namespace {
 
+// Frames a view may go without using a history before it is released.
+constexpr auto kHistoryKeepFrames = std::uint64_t{60};
+
 struct TargetsImpl final : RenderTargets {
     RenderTargetId createImage(ImageTargetDesc const &desc) override {
         checkExtent(desc.extent);
@@ -47,6 +50,11 @@ struct TargetsImpl final : RenderTargets {
     core::ivec2 extentOf(RenderTargetId const id) {
         auto const lock = std::lock_guard<std::mutex>{mutex};
         return find(id);
+    }
+
+    bool exists(RenderTargetId const id) {
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        return extents.count(id) != 0;
     }
 
 private:
@@ -74,9 +82,11 @@ using FeatureList = std::vector<std::shared_ptr<RenderFeature>>;
 struct PipelinesImpl final : PipelineRegistry {
     PipelinesImpl() {
         pipelines.push_back(FeatureList{makeVisibilityFeature(), makeShadingFeature(), makeTonemapFeature()});
+        pipelines.push_back(FeatureList{makePathTraceFeature(), makeTonemapFeature()});
     }
 
     PipelineId visibility() const noexcept override { return PipelineId{0}; }
+    PipelineId pathTraceReference() const noexcept override { return PipelineId{1}; }
 
     PipelineId create(PipelineDesc desc) override {
         auto const lock = std::lock_guard<std::mutex>{mutex};
@@ -131,7 +141,15 @@ struct PreparedFrame {
     std::uint64_t index = 0;
     SceneUpdate scene;
     std::vector<PreparedView> views;
+    std::vector<std::uint64_t> releasedHistories;
 };
+
+bool tracesRays(std::vector<ViewPlan> const &plans) {
+    return std::any_of(plans.begin(), plans.end(), [](ViewPlan const &plan) {
+        return std::any_of(plan.features.begin(), plan.features.end(),
+                           [](auto const &feature) { return feature->requirements().rayTracing; });
+    });
+}
 
 ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     auto context = ViewContext{};
@@ -147,17 +165,41 @@ ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     context.inverseViewProjection = tc::inverse(context.viewProjection);
     context.instanceCount = world.instanceCount();
     context.lightCount = world.lightCount();
+    context.sceneVersion = world.version();
     return context;
+}
+
+// Whether the timings are those of the runs' dispatches: the device lists them in
+// execution order, the runs in recording order, and the two agree unless a pass
+// dispatched behind PassContext's back.
+bool timingsMatch(std::vector<GraphRun> const &runs, std::vector<tc::KernelTiming> const &timings) {
+    auto next = std::size_t{0};
+    for (auto const &run : runs) {
+        for (auto const &dispatch : run.dispatches()) {
+            if (next == timings.size() or timings[next].program != dispatch.program) {
+                return false;
+            }
+            ++next;
+        }
+    }
+    return next == timings.size();
 }
 
 struct RendererImpl final : Renderer {
     explicit RendererImpl(RendererConfig const &config)
-        : gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})) {}
+        : gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
+          timers(config.gpuTimers and gpu->info().timers) {
+        if (timers) {
+            static_cast<void>(
+                lexec::sync_wait(gpu->record([](gpu::GpuContext &context) { context.device->enableTimers(true); })));
+        }
+    }
 
     ~RendererImpl() override {
         static_cast<void>(lexec::sync_wait(scope.join()));
         static_cast<void>(lexec::sync_wait(gpu->record([this](gpu::GpuContext &) noexcept {
             pool.clear();
+            historyImages.clear();
             deviceScene = DeviceScene{};
         })));
     }
@@ -191,11 +233,14 @@ private:
     // stay in step.
     PreparedFrame prepare(std::uint64_t const index, core::RenderWorldDelta const &delta,
                           std::vector<ViewPlan> const &plans) {
-        auto frame = PreparedFrame{index, world.apply(delta), {}};
+        auto frame = PreparedFrame{index, world.apply(delta), {}, {}};
+        if (tracesRays(plans)) {
+            world.keepHierarchies(frame.scene);
+        }
         for (auto const &plan : plans) {
             auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr};
             try {
-                auto builder = GraphBuilder{};
+                auto builder = GraphBuilder{GraphOwner{&histories, plan.desc.id, plan.desc.target, index}};
                 auto context = makeViewContext(plan, world);
                 auto const pixels = static_cast<std::size_t>(plan.extent.x) * static_cast<std::size_t>(plan.extent.y);
                 context.sceneColor = builder.createImage<HdrFormat>("scene colour", plan.extent);
@@ -209,6 +254,8 @@ private:
             }
             frame.views.push_back(std::move(prepared));
         }
+        frame.releasedHistories =
+            histories.expire(index, [this](RenderTargetId const target) { return targetSet.exists(target); });
         return frame;
     }
 
@@ -216,6 +263,7 @@ private:
     FrameResult execute(gpu::GpuContext &context, PreparedFrame &frame) {
         auto &device = *context.device;
         deviceScene.apply(device, frame.scene);
+        historyImages.release(frame.releasedHistories);
         for (auto const &view : frame.views) {
             if (view.failure) {
                 std::rethrow_exception(view.failure);
@@ -225,15 +273,23 @@ private:
         auto runs = std::vector<GraphRun>{};
         runs.reserve(frame.views.size());
         for (auto &view : frame.views) {
-            runs.emplace_back(std::move(*view.graph), pool, device);
+            runs.emplace_back(std::move(*view.graph), pool, historyImages, device);
             runs.back().record(device, tables);
         }
+        auto const submission = device.submit();
         device.finish();
+        auto const timings = timers ? device.takeTimings(submission) : std::vector<tc::KernelTiming>{};
+        auto const timed = timers and timingsMatch(runs, timings);
         auto result = FrameResult{frame.index, {}};
+        auto firstTiming = std::size_t{0};
         for (auto index = std::size_t{0}; index < runs.size(); ++index) {
             auto view = ViewResult{};
             view.view = frame.views[index].view;
             view.target = frame.views[index].target;
+            if (timed) {
+                view.passTimings = runs[index].passTimings(timings, firstTiming);
+                firstTiming += runs[index].dispatches().size();
+            }
             runs[index].finish(view);
             result.views.push_back(std::move(view));
         }
@@ -241,12 +297,15 @@ private:
     }
 
     std::unique_ptr<gpu::GpuQueue> gpu;
+    bool timers;
     runtime::SerialThread renderThread;
     TargetsImpl targetSet;
     PipelinesImpl pipelineSet;
-    RenderWorld world;        // render thread
-    DeviceScene deviceScene; // GPU thread
-    ResourcePool pool;       // GPU thread
+    RenderWorld world;                              // render thread
+    FrameHistories histories{kHistoryKeepFrames};   // render thread
+    DeviceScene deviceScene;                        // GPU thread
+    ResourcePool pool;                              // GPU thread
+    HistoryResources historyImages;                 // GPU thread
     std::mutex submitMutex;
     std::uint64_t nextFrame = 0;
     lexec::counting_scope scope;

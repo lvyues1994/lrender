@@ -17,7 +17,7 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 ### lexec：异步契约、计算池与串行时间线
 
 - 所有跨模块的异步接口都返回 sender。虚接口边界上用 `any_sender_of` 擦除类型；每次 connect 分配一次，每帧只发生几次。
-- 两个 `static_thread_pool`：帧池跑帧内关键工作，后台池跑长任务（解码、BLAS 构建）。长任务因此挡不住帧内工作；lexec 的池没有优先级，分成两个池之后也不需要优先级。co2 的 `ThreadPool` 和 stackfull 的 worker 都不跑计算。帧池对 `bulk` 有并行定制，而且不分配内存。
+- 两个 `static_thread_pool`：帧池跑帧内关键工作，后台池跑长任务（解码）。长任务因此挡不住帧内工作；lexec 的池没有优先级，分成两个池之后也不需要优先级。co2 的 `ThreadPool` 和 stackfull 的 worker 都不跑计算。帧池对 `bulk` 有并行定制，而且不分配内存。
 - tc CPU 后端的 `ParallelExecutor` 由帧池上的 `bulk` 实现，CPU 后端的 kernel 和引擎共用线程。
 - 两个 `run_loop`：渲染线程和 GPU 线程。`continues_on(gpu)` 之后的代码就运行在独占设备的那个线程上。
 - `counting_scope` 加 `spawn_future` 管理在途帧和后台工作的生命周期，关闭时统一 join。
@@ -59,10 +59,10 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 |---|---|---|---|
 | 宿主线程 | 宿主 | — | 输入、模拟、`ScriptHost::tick`、`Renderer::submit` |
 | 模拟执行器 `co2::ManualExecutor` | scene | 调用 tick 的宿主线程 | 脚本 |
-| 渲染线程 `lexec::run_loop` | render | 1，大部分时间空闲 | 应用增量、编译帧图、编排编码 |
+| 渲染线程 `lexec::run_loop` | render | 1，大部分时间空闲 | 应用增量、构建 BVH、编译帧图、编排编码 |
 | GPU 线程 `lexec::run_loop` | gpu | 1 | 所有 `tc::Device` 调用：录制、提交、交给 Presenter；从不等待 GPU |
 | 帧池 `lexec::static_thread_pool` | runtime | 默认为硬件线程数 − 3 | 编码、变换传播、tc CPU 后端 |
-| 后台池 `lexec::static_thread_pool` | runtime | 默认 1 | 解码、BLAS 构建 |
+| 后台池 `lexec::static_thread_pool` | runtime | 默认 1 | 解码 |
 | IO 调度器 `stackfull::sched` | runtime | 2 个 worker 加阻塞线程池，大部分时间 park | 读文件、文件监听、等待 GPU 完成 |
 
 线程数都可以在 `RuntimeConfig` 里配置。四条线程规则：
@@ -252,7 +252,9 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - 一条管线就是按阶段排好的一组 feature。`PipelineRegistry` 提供两条内置管线，用户可以在它们的基础上按阶段插入自己的 feature，组成新的管线。
 - 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，分配临时资源（按描述符在帧之间复用），维护按 `ViewId` 保存的历史资源。
 - pass 按编译后的顺序在 GPU 线程上录制。屏障由 tc 按实际的读写冲突插入，互不相关的 pass 可以在设备上重叠，帧图不需要自己计算屏障。
-- `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`；用户 kernel 和内置 kernel 走同一条路径。
+- `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`，同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。
+- 历史资源：`graph.history<G>(name, extent)` 返回一对图像 `{previous, current, valid}`，同一个 `ViewId` 和名字在每个用到它的帧里拿到同一对，并且互换一次：上一帧写进 `current` 的内容，这一帧从 `previous` 读。互换而不是原地读写，是因为 GLES 3.1 不允许 kernel 同时读写 r32 以外格式的存储图像。两张图像在帧开始时都算已写入，写 `current` 的 pass 总会保留。第一次用到、尺寸或格式变了、或者被释放过之后，`valid` 为假。记录在渲染线程上（只是 id），图像在 GPU 线程上按 id 创建；连续 60 帧没用到、或者视图的目标已经销毁，就释放。TAA 也用它。
+- feature 用 `requirements()` 声明对场景的额外需求：要追踪光线的 feature 让 `RenderWorld` 从这一帧起维护 BVH（见“参考路径追踪”）。`graph.onFinish(fn)` 在帧完成后填写 `ViewResult`，比如累积的采样数。
 
 #### 两条内置管线
 
@@ -263,7 +265,10 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
   4. 材质分类：按材质模型把像素压缩成列表，每个模型一份间接参数；再对每个模型 `executeIndirect` 它的着色 kernel。
   5. 透明物体走单独的 pass，按屏幕 tile 处理。
   6. TAA，然后色调映射；后处理 kernel 声明中等精度（`Precision::Medium`）。
-- **参考路径追踪**：两级 BVH，用固定大小的 `std::array` 栈做迭代遍历（tc 不允许递归），渐进累积。它是画质参照，也是可见性缓冲管线着色结果的测试参照。BLAS 只有它用，按需在后台池构建。
+- **参考路径追踪**：两级 BVH，用固定大小的 `std::array` 栈做迭代遍历（tc 不允许递归），渐进累积。它是画质参照，也是可见性缓冲管线着色结果的测试参照。
+  - BVH 只有它用。第一次有视图需要时，渲染线程给每个网格建一棵 BLAS（分箱 SAH，叶子最多 4 个三角形），再在实例上建 TLAS（叶子一个实例）；之后增量里的网格重建自己的 BLAS，实例或网格有变化就重建 TLAS。深度不超过 31 层（快到上限时改按中位数对半分），遍历栈是 32 个元素。节点、三角形（三个角在顶点表里的位置）、每个网格的根、TLAS 节点经 `SceneUpdate` 进 `DeviceScene` 的表，可见性缓冲管线不读这些表。构建是同步的，大场景第一次用到时那一帧的准备会变长。
+  - kernel 每帧每像素一条路径：先 TLAS，再用 `worldToObject` 把射线变换到实例的物体空间遍历 BLAS（方向不归一化，两个空间里的距离相同）。着色和光源用与可见性缓冲管线同一份代码（`kernels/Lighting.h`），双面材质的处理也相同：单面材质的背面对所有射线都不可见，双面材质从背面看时法线翻转。每个顶点对方向光和点光源做下一事件估计并追踪阴影射线；加上自发光；逃逸的射线取均匀环境光；继续的方向按漫反射和 GGX 两个波瓣的混合采样，按混合密度加权；第三次弹射起用俄罗斯轮盘。随机数是像素、采样序号、维度的 PCG 散列，所以每个设备抽到的随机数相同。
+  - 累积放在 RGBA32F 的历史资源里，存运行均值，均值写进 `sceneColor`，后面照常色调映射。相机、目标尺寸或场景（任何改变网格、材质、实例、灯光、环境的增量）变了就从头开始；`ViewStats::accumulatedSamples` 给出当前的采样数。
 - 前缀和、压缩、规约这些通用 kernel 各有两个实例：用子组的，和只用 `Shared` 的。启动时按 `checkKernel` 的结果选择，没有子组的设备（Adreno 的 GLES）用后者。
 
 #### 材质
@@ -293,12 +298,12 @@ struct GpuInstance {
     uint meshIndex;
     uint materialIndex;
 };
-using VertexTable   = TableBinding<GpuVertex, 0>;           // 读整个元素：Aos
-using BvhNodeTable  = TableBinding<GpuBvhNode, 1>;
-using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部分字段：Soa
+using VertexTable   = TableBinding<GpuVertex, 0, Soa<>>;    // 光栅化和遍历只读位置
+using BvhNodeTable  = TableBinding<GpuBvhNode, 1>;          // 8 个字，按 uvec4 宽读
+using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部分字段
 ```
 
-- 这些布局只是起点：5 个字的记录按 `Aos` 存放时不能按 `uvec4` 宽读写，它是否比补齐到 8 个字的自定义布局（参考 tc 测试里的 `PaddedAos`）更快，要用设备计时器测过再定。
+- 布局是用 `probes/layout_probe` 的设备计时定的：各布局轮流 dispatch，设备的时钟变化对它们影响相同。RTX 5070 Ti 的 Vulkan 上，表远大于缓存时（400 万个实例、840 万个顶点）：剔除 `Aos` 0.49 ms、`Soa<>` 0.27 ms；只读三个角的位置，`Aos`（5 个字）0.54 ms、`Soa<>` 0.47 ms、补齐到 8 个字的 `PaddedAos` 0.66 ms；读整个顶点三者是 0.53、0.53、0.66 ms。补齐带来的宽读写抵不上多出来的字节。lavapipe 上 `Aos` 读位置快一成多，CPU 后端上布局没有影响；按硬件 GPU 选。
 - 表在 CPU 后端上读写比 std430 慢约 3 倍（要逐字打包，还要经过元素缓存），所以金标准测试的场景要保持很小。
 - 常驻表放在设备内存里。帧池把脏元素编码好，GPU 线程把它们写进自己持有的主机端表，再 `uploadTable(table, first, count)` 只传脏区间。传输在设备时间线上排队，与在途帧的读写冲突由 tc 的屏障处理，所以常驻表不需要为每个在途帧各备一份。
 - 每个内置 kernel 最多用 8 个 storage buffer、4 个存储图像，高于规范下限的 4 个 storage buffer；不满足的设备在启动时由 `checkKernel` 报告出来。
@@ -311,9 +316,9 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 #### 计时
 
 - `FrameResult` 总是带从提交到完成的墙钟时间。
-- `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch，帧图按同样的顺序记下每次 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）。
+- `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，`ViewResult::passTimings` 还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch，帧图按同样的顺序记下每次经 `PassContext` 的 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）；程序名只用来核对：有 pass 绕过 `PassContext` 直接调用设备时，两者对不上，这一帧就不给 pass 耗时。
 - 开着计时器时，tc 会在每个计时的 dispatch 前插入完整屏障，dispatch 之间不再重叠，所以 `gpuTimers` 默认关闭，只在开发、剖析和挑选表布局时打开。帧与帧之间的重叠不受影响。
-- Adreno 上 GLES 的计时查询几乎总是返回接近 0 的值，又不报告时钟不连续，所以这类设备上只看墙钟时间。
+- Adreno 上 GLES 的计时查询几乎总是返回接近 0 的值，又不报告时钟不连续，所以这类设备上只看墙钟时间。llvmpipe 的 OpenGL 和 GLES 也一样。
 
 ### present：Presenter 的实现
 
@@ -506,7 +511,7 @@ lrender/
   asset/     include/lr/asset/     src/           lr::asset    stackfull::exec、cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    co2、lexec 的 co2 桥
   examples/  view/  cli/                          lrender_view  lrender_cli
-  probes/    gpu_probe  present_probe  asset_probe
+  probes/    gpu_probe  present_probe  asset_probe  layout_probe
   tests/
 ```
 
@@ -526,6 +531,7 @@ lrender/
 | scene、ScriptHost | 确定 | 手动 tick 的单元测试；`Deterministic` 模式下的时间线逐帧比对 |
 | asset | 半确定 | 用内存源做单元测试；`asset_probe` 读真实文件、测热重载与取消 |
 | gpu | 边界 | `gpu_probe`：选择后端、打印 `checkKernel` 的结果，提交并分别走 sync file 和 `Submission` 两条等待路径，打开计时器时按提交打印每次 dispatch 的耗时 |
+| 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
 | present | 边界 | `present_probe`：每种 Presenter 显示测试图案 |
 
 1. **M0** 工程骨架：CMake、presets、固定版本的依赖、install 与包配置、CI（llvmpipe 与 lavapipe 上跑 GPU 后端，覆盖没有 sync file 的等待路径）。

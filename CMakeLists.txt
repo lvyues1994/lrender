@@ -12,6 +12,7 @@ set(CMAKE_POSITION_INDEPENDENT_CODE ON)
 
 option(LRENDER_BUILD_TESTS "Build lrender's tests" ${PROJECT_IS_TOP_LEVEL})
 option(LRENDER_BUILD_EXAMPLES "Build lrender_cli and the other examples" ${PROJECT_IS_TOP_LEVEL})
+option(LRENDER_BUILD_PROBES "Build the probes that measure lrender on real devices" ${PROJECT_IS_TOP_LEVEL})
 option(LRENDER_WARNINGS_AS_ERRORS "Treat warnings in lrender's own code as errors" ${PROJECT_IS_TOP_LEVEL})
 option(LRENDER_KERNEL_RELOAD
     "Let a running program reload edited kernels from disk (compute_shaders' TC_PROGRAM_RELOAD); off for releases" ON)
@@ -28,6 +29,10 @@ add_subdirectory(render)
 
 if(LRENDER_BUILD_EXAMPLES)
     add_subdirectory(examples)
+endif()
+
+if(LRENDER_BUILD_PROBES)
+    add_subdirectory(probes)
 endif()
 
 if(LRENDER_BUILD_TESTS)

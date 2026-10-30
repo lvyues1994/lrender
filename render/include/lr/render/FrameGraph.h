@@ -16,6 +16,7 @@
 #include <memory>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <typeindex>
 #include <typeinfo>
 #include <unordered_map>
@@ -37,6 +38,19 @@ struct ImageRef {
 template <class G>
 using GraphImage = tc::DeviceImage<G, tc::Dim::D2>;
 
+// An image a view keeps from frame to frame: two images that trade places every frame
+// the view uses them, so passes read what the view's previous such frame wrote into
+// `current` from `previous`, and write this frame's into `current`. Both count as
+// written when the frame starts, and whatever writes `current` runs.
+template <class G>
+struct HistoryImage {
+    ImageRef<G> previous;
+    ImageRef<G> current;
+    // False when `previous` holds nothing yet: the images are new, because the view had
+    // not used them, had not for a while, or asked for another extent.
+    bool valid = false;
+};
+
 // What FrameGraphBuilder implementations get for each resource.
 struct ResourceDesc {
     std::string name;
@@ -51,6 +65,8 @@ struct ResourceDesc {
 struct PassContext {
     virtual ~PassContext() = default;
 
+    // Dispatch through dispatch() and dispatchIndirect(), which attribute device time to
+    // the pass (RendererConfig::gpuTimers).
     virtual tc::Device &device() noexcept = 0;
     virtual SceneTables const &scene() const noexcept = 0;
 
@@ -64,9 +80,22 @@ struct PassContext {
         return *static_cast<GraphImage<G> *>(resource(ref.index, typeid(GraphImage<G>)));
     }
 
+    // device().execute() and device().executeIndirect(), as part of this pass.
+    template <class K>
+    void dispatch(K &kernel, tc::uvec3 const workGroups) {
+        device().execute(kernel, workGroups);
+        dispatched(K::fileLocation);
+    }
+    template <class K>
+    void dispatchIndirect(K &kernel, BufferRef<tc::DispatchIndirectCommand> const arguments) {
+        device().executeIndirect(kernel, buffer(arguments));
+        dispatched(K::fileLocation);
+    }
+
 protected:
     // Throws std::logic_error when `index` is not a resource of `type`.
     virtual void *resource(std::uint32_t index, std::type_info const &type) = 0;
+    virtual void dispatched(std::string_view program) = 0;
 };
 
 using PassRecorder = std::function<void(PassContext &)>;
@@ -128,6 +157,8 @@ private:
     std::unordered_map<std::type_index, std::shared_ptr<void>> entries;
 };
 
+using ResultHandler = std::function<void(ViewResult &)>;
+
 struct FrameGraphBuilder {
     virtual ~FrameGraphBuilder() = default;
 
@@ -145,13 +176,16 @@ struct FrameGraphBuilder {
 
     template <class G>
     ImageRef<G> createImage(std::string name, core::ivec2 const extent) {
-        auto const size = static_cast<std::uint64_t>(extent.x) << 32 | static_cast<std::uint32_t>(extent.y);
-        return ImageRef<G>{declareResource(ResourceDesc{
-            std::move(name), std::type_index{typeid(GraphImage<G>)}, size, false,
-            [extent](tc::Device &device) -> std::shared_ptr<void> {
-                return std::make_shared<GraphImage<G>>(device.createImage<G, tc::Dim::D2>(extent, 1));
-            },
-            {}})};
+        return ImageRef<G>{declareResource(imageDesc<G>(std::move(name), extent))};
+    }
+
+    // The view's history images called `name`; the same pair, swapped, in every frame of
+    // the view that asks for them with the same format and extent. Throws
+    // std::logic_error for a graph that belongs to no view.
+    template <class G>
+    HistoryImage<G> history(std::string name, core::ivec2 const extent) {
+        auto const declared = declareHistory(imageDesc<G>(std::move(name), extent));
+        return HistoryImage<G>{ImageRef<G>{declared.previous}, ImageRef<G>{declared.current}, declared.valid};
     }
 
     virtual PassBuilder &addPass(std::string name) = 0;
@@ -167,12 +201,22 @@ struct FrameGraphBuilder {
         });
     }
 
+    // Calls `handler` on the GPU thread once the frame is done, after the readbacks.
+    virtual void onFinish(ResultHandler handler) = 0;
+
     virtual Blackboard &blackboard() noexcept = 0;
 
 protected:
     using ReadbackHandler = std::function<void(void const *data, std::size_t count, ViewResult &)>;
 
+    struct DeclaredHistory {
+        std::uint32_t previous;
+        std::uint32_t current;
+        bool valid;
+    };
+
     virtual std::uint32_t declareResource(ResourceDesc desc) = 0;
+    virtual DeclaredHistory declareHistory(ResourceDesc desc) = 0;
     virtual void addReadback(std::uint32_t resource, ReadbackHandler handler) = 0;
 
 private:
@@ -196,6 +240,15 @@ private:
         return ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count, hostVisible,
                             std::move(create), std::move(hostData)};
     }
+
+    template <class G>
+    static ResourceDesc imageDesc(std::string name, core::ivec2 const extent) {
+        auto const size = static_cast<std::uint64_t>(extent.x) << 32 | static_cast<std::uint32_t>(extent.y);
+        auto create = [extent](tc::Device &device) -> std::shared_ptr<void> {
+            return std::make_shared<GraphImage<G>>(device.createImage<G, tc::Dim::D2>(extent, 1));
+        };
+        return ResourceDesc{std::move(name), std::type_index{typeid(GraphImage<G>)}, size, false, std::move(create), {}};
+    }
 };
 
 // What a feature knows about the view it sets up.
@@ -211,6 +264,9 @@ struct ViewContext {
     core::mat4 inverseViewProjection{1.0f};
     std::uint32_t instanceCount = 0;
     std::uint32_t lightCount = 0;
+    // Changes whenever a frame's delta changes meshes, materials, instances, lights or
+    // the environment.
+    std::uint64_t sceneVersion = 0;
     // Shading writes HDR radiance here; post-processing reads and rewrites it.
     ImageRef<HdrFormat> sceneColor;
     // The final pass writes the view's packed RGBA8 pixels here (a readback buffer).
@@ -224,12 +280,20 @@ enum class FeatureStage : std::uint8_t {
     Output,
 };
 
+// What a feature needs of the scene beyond the tables SceneTables always has.
+struct SceneRequirements {
+    // The hierarchies of SceneTables. Built from the first frame with a view that needs
+    // them, then kept up to date.
+    bool rayTracing = false;
+};
+
 // A pipeline is a list of features, set up in stage order (and, within a stage, in the
 // order they were added). Features may keep state; setup() only runs on the render thread.
 struct RenderFeature {
     virtual ~RenderFeature() = default;
 
     virtual FeatureStage stage() const noexcept = 0;
+    virtual SceneRequirements requirements() const noexcept { return SceneRequirements{}; }
     virtual void setup(FrameGraphBuilder &graph, ViewContext const &view) = 0;
 };
 

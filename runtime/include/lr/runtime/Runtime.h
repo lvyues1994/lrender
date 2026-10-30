@@ -25,8 +25,8 @@ struct RuntimeConfig {
 };
 
 // The execution resources several modules share: the frame pool for work a frame waits
-// on, the background pool for long work (decoding, BLAS builds) that must not hold the
-// frame pool up, and the IO scheduler, whose idle workers sleep in poller().
+// on, the background pool for long work (decoding) that must not hold the frame pool up,
+// and the IO scheduler, whose idle workers sleep in poller().
 //
 // Destroying it stops the IO scheduler first, while the pools its tasks may be waiting
 // on are still running, then joins the background pool and the frame pool.

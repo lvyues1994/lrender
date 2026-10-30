@@ -40,7 +40,11 @@ struct PipelineDesc {
 struct PipelineRegistry {
     virtual ~PipelineRegistry() = default;
 
+    // The real-time pipeline: visibility buffer, shading, tone mapping.
     virtual PipelineId visibility() const noexcept = 0;
+    // The reference: a path tracer that adds a sample per pixel each frame of a view and
+    // shows their mean, tone mapped (ViewStats::accumulatedSamples).
+    virtual PipelineId pathTraceReference() const noexcept = 0;
     virtual PipelineId create(PipelineDesc desc) = 0;
 };
 
@@ -61,6 +65,9 @@ struct RendererConfig {
     std::string backend = "cpu";    // one of tc::availableBackends()
     std::string deviceNameContains; // optional, e.g. "llvmpipe"
     runtime::Runtime *runtime = nullptr;
+    // Times every pass on the device (ViewResult::passTimings) where DeviceInfo::timers
+    // allows. Timed dispatches run one at a time, so leave it off but for profiling.
+    bool gpuTimers = false;
 };
 
 struct Renderer {

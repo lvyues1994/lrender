@@ -4,6 +4,8 @@
 // with it for perspective-correct barycentrics, and evaluates glTF's metallic-roughness
 // model under the scene's lights and the uniform environment.
 
+#include "Lighting.h"
+
 #include <lr/render/GpuTypes.h>
 
 #include <array>
@@ -11,42 +13,6 @@
 namespace lr::render::kernels {
 
 using namespace tc;
-
-// Radiance a surface reflects towards the viewer from light arriving from `toLight` with
-// `irradiance` on a surface facing it: Lambert diffuse plus GGX specular (Smith
-// height-correlated visibility, Schlick Fresnel).
-inline vec3 reflectedLight(vec3 normal, vec3 toViewer, vec3 toLight, vec3 irradiance, vec3 baseColor, float metallic,
-                           float roughness) {
-    float pi = 3.14159265f;
-    float nDotL = dot(normal, toLight);
-    if (nDotL <= 0.0f) {
-        return vec3(0.0f);
-    }
-    float nDotV = max(dot(normal, toViewer), 0.0001f);
-    vec3 halfway = normalize(toLight + toViewer);
-    float nDotH = max(dot(normal, halfway), 0.0f);
-    float vDotH = max(dot(toViewer, halfway), 0.0f);
-    float alpha = max(roughness * roughness, 0.001f);
-    float alpha2 = alpha * alpha;
-    float d = nDotH * nDotH * (alpha2 - 1.0f) + 1.0f;
-    float distribution = alpha2 / (pi * d * d);
-    float visibility = 0.5f / (nDotL * sqrt(nDotV * nDotV * (1.0f - alpha2) + alpha2)
-                               + nDotV * sqrt(nDotL * nDotL * (1.0f - alpha2) + alpha2));
-    vec3 f0 = mix(vec3(0.04f), baseColor, metallic);
-    vec3 fresnel = f0 + (vec3(1.0f) - f0) * pow(1.0f - vDotH, 5.0f);
-    vec3 diffuse = baseColor * ((1.0f - metallic) / pi);
-    return (diffuse + fresnel * (distribution * visibility)) * irradiance * nDotL;
-}
-
-// Point-light falloff to zero at `range` (glTF's KHR_lights_punctual recommendation).
-inline float rangeWindow(float distance, float range) {
-    if (range <= 0.0f) {
-        return 1.0f;
-    }
-    float ratio = distance / range;
-    float window = clamp(1.0f - ratio * ratio * ratio * ratio, 0.0f, 1.0f);
-    return window * window;
-}
 
 struct TC_KERNEL ShadeVisibility {
     static constexpr char fileLocation[] = "lr_shade_visibility";
@@ -127,17 +93,8 @@ struct TC_KERNEL ShadeVisibility {
         vec3 baseColor = material.baseColor.xyz();
         vec3 radiance = material.emissive + environment.value.xyz() * baseColor * (1.0f - material.metallic);
         for (uint i = 0u; i < lightCount.value; ++i) {
-            GpuLight light = lights[i];
-            vec3 toLight = -light.vector;
-            vec3 irradiance = light.radiance;
-            if (light.kind == lightPoint()) {
-                vec3 offset = light.vector - position;
-                float distance2 = max(dot(offset, offset), 1e-8f);
-                float distance = sqrt(distance2);
-                toLight = offset / distance;
-                irradiance = light.radiance * (rangeWindow(distance, light.range) / distance2);
-            }
-            radiance += reflectedLight(normal, toViewer, normalize(toLight), irradiance, baseColor, material.metallic,
+            IncidentLight light = incidentLight(lights[i], position);
+            radiance += reflectedLight(normal, toViewer, light.toLight, light.irradiance, baseColor, material.metallic,
                                        material.roughness);
         }
         return radiance;
