@@ -41,6 +41,16 @@ struct ImageRgba8 {
     std::vector<std::uint32_t> pixels;
 };
 
+// Pixels laid out as in ImageRgba8, in memory someone else owns.
+struct ImageRgba8View {
+    core::ivec2 extent{0};
+    std::uint32_t const *pixels = nullptr; // extent.x * extent.y of them
+};
+
+inline ImageRgba8View imageView(ImageRgba8 const &image) noexcept {
+    return ImageRgba8View{image.extent, image.pixels.data()};
+}
+
 struct ViewStats {
     std::uint32_t visibleInstances = 0;
     std::uint32_t visibleTriangles = 0;

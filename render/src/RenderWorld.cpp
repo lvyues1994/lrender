@@ -68,6 +68,20 @@ bool changesScene(core::RenderWorldDelta const &delta) noexcept {
         or not removed.materials.empty() or not removed.instances.empty() or not removed.lights.empty();
 }
 
+GeometryUpload encodeGeometry(core::MeshData const &data, std::uint32_t const firstVertex,
+                              std::uint32_t const firstIndex) {
+    auto geometry = GeometryUpload{};
+    geometry.firstVertex = firstVertex;
+    geometry.firstIndex = firstIndex;
+    geometry.vertices.reserve(data.positions.size());
+    for (auto index = std::size_t{0}; index < data.positions.size(); ++index) {
+        auto const uv = data.uvs.empty() ? core::vec2{0.0f} : data.uvs[index];
+        geometry.vertices.push_back(GpuVertex{data.positions[index], tc::normalize(data.normals[index]), uv});
+    }
+    geometry.indices.assign(data.indices.begin(), data.indices.end());
+    return geometry;
+}
+
 std::vector<core::Aabb> triangleBounds(core::MeshData const &mesh) {
     auto bounds = std::vector<core::Aabb>{};
     bounds.reserve(mesh.indices.size() / 3);
@@ -177,15 +191,7 @@ void RenderWorld::upsertMesh(core::MeshUpsert const &upsert, SceneUpdate &update
     auto const found = meshes.find(upsert.id);
     auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
 
-    auto geometry = GeometryUpload{};
-    geometry.firstVertex = vertexEnd;
-    geometry.firstIndex = indexEnd;
-    geometry.vertices.reserve(data.positions.size());
-    for (auto index = std::size_t{0}; index < data.positions.size(); ++index) {
-        auto const uv = data.uvs.empty() ? core::vec2{0.0f} : data.uvs[index];
-        geometry.vertices.push_back(GpuVertex{data.positions[index], tc::normalize(data.normals[index]), uv});
-    }
-    geometry.indices.assign(data.indices.begin(), data.indices.end());
+    auto geometry = encodeGeometry(data, vertexEnd, indexEnd);
     vertexEnd += static_cast<std::uint32_t>(geometry.vertices.size());
     indexEnd += static_cast<std::uint32_t>(geometry.indices.size());
 
@@ -295,6 +301,34 @@ void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUp
     if (not delta.meshes.empty() or not delta.instances.empty() or not delta.removed.instances.empty()) {
         buildTlas(update);
     }
+}
+
+SceneUpdate RenderWorld::fullUpdate() {
+    auto update = SceneUpdate{};
+    for (auto const &[id, record] : meshes) {
+        update.geometry.push_back(encodeGeometry(*record.data, record.gpu.firstVertex, record.gpu.firstIndex));
+        update.meshes.push_back(Indexed<GpuMesh>{record.slot, record.gpu});
+    }
+    for (auto const &[id, record] : materials) {
+        update.materials.push_back(Indexed<GpuMaterial>{record.slot, encodeMaterial(record.desc)});
+    }
+    for (auto index = std::uint32_t{0}; index < instanceCount(); ++index) {
+        writeInstance(index, update);
+    }
+    for (auto index = std::uint32_t{0}; index < lightCount(); ++index) {
+        writeLight(index, update);
+    }
+    if (hierarchies) {
+        hierarchies = false;
+        blasNodeEnd = 0;
+        blasTriangleEnd = 0;
+        keepHierarchies(update);
+    }
+    update.capacity = capacity();
+    update.instanceCount = instanceCount();
+    update.lightCount = lightCount();
+    update.tlasNodeCount = tlasNodeCount;
+    return update;
 }
 
 void RenderWorld::keepHierarchies(SceneUpdate &update) {

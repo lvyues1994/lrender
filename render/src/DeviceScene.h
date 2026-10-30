@@ -1,5 +1,6 @@
 #pragma once
 
+#include "RetireList.h"
 #include "SceneUpdate.h"
 
 #include <lr/render/GpuTypes.h>
@@ -11,14 +12,16 @@
 namespace lr::render {
 
 // The GPU thread's copy of the scene: device tables kept in step with RenderWorld by
-// applying its SceneUpdates in frame order. Grown tables are uploaded whole; otherwise
-// only the ranges an update writes move.
+// applying its SceneUpdates in frame order. Grown tables are uploaded whole and the ones
+// they replace go to `retired`; otherwise only the ranges an update writes move. Uploads
+// copy the host tables at the call, so an update may be applied while earlier frames
+// still read the tables on the device.
 struct DeviceScene {
-    void apply(tc::Device &device, SceneUpdate const &update);
+    void apply(tc::Device &device, SceneUpdate const &update, RetireList &retired);
     SceneTables tables() const noexcept;
 
 private:
-    void applyHierarchies(tc::Device &device, SceneUpdate const &update);
+    void applyHierarchies(tc::Device &device, SceneUpdate const &update, RetireList &retired);
 
     std::unique_ptr<tc::TableResource<GpuVertex, VertexLayout>> vertices;
     std::unique_ptr<tc::BufferResource<tc::uint>> indices;

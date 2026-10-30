@@ -278,10 +278,6 @@ struct TonemapFeature final : RenderFeature {
             set(device, kernel.filmic, filmic);
             context.dispatch(kernel, groupsCovering(extent));
         });
-        graph.readback<tc::uint>(view.output,
-                                 [extent = view.extent](tc::uint const *data, std::size_t const count, ViewResult &result) {
-                                     result.image = ImageRgba8{extent, std::vector<std::uint32_t>(data, data + count)};
-                                 });
     }
 };
 

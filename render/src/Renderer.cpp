@@ -1,7 +1,8 @@
 #include <lr/render/Renderer.h>
 
-#include "DeviceScene.h"
 #include "FrameGraphImpl.h"
+#include "FrameQueue.h"
+#include "PreparedFrame.h"
 #include "RenderWorld.h"
 
 #include <lr/gpu/GpuQueue.h>
@@ -9,13 +10,18 @@
 #include <lr/runtime/SerialThread.h>
 
 #include <lexec/scopes/counting_scope.hpp>
+#include <stackfull/exec/sync.hpp>
+#include <stackfull/sync/Completion.h>
 
 #include <algorithm>
+#include <atomic>
 #include <exception>
+#include <functional>
 #include <mutex>
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <system_error>
 #include <unordered_map>
 #include <utility>
 
@@ -25,36 +31,44 @@ namespace {
 
 // Frames a view may go without using a history before it is released.
 constexpr auto kHistoryKeepFrames = std::uint64_t{60};
+// A device generation no device has: the next frame uploads the whole scene.
+constexpr auto kSceneOutOfStep = ~std::uint64_t{0};
+
+struct TargetState {
+    core::ivec2 extent{0};
+    std::shared_ptr<Presenter> presenter; // window targets
+};
 
 struct TargetsImpl final : RenderTargets {
-    RenderTargetId createImage(ImageTargetDesc const &desc) override {
-        checkExtent(desc.extent);
-        auto const lock = std::lock_guard<std::mutex>{mutex};
-        auto const id = RenderTargetId{next++};
-        extents[id] = desc.extent;
-        return id;
+    RenderTargetId createWindow(WindowTargetDesc const &desc) override {
+        if (desc.presenter == nullptr) {
+            throw std::invalid_argument{"lr::render: a window target needs a presenter"};
+        }
+        return add(TargetState{desc.extent, desc.presenter});
     }
+
+    RenderTargetId createImage(ImageTargetDesc const &desc) override { return add(TargetState{desc.extent, nullptr}); }
 
     void resize(RenderTargetId const id, core::ivec2 const extent) override {
         checkExtent(extent);
         auto const lock = std::lock_guard<std::mutex>{mutex};
-        find(id) = extent;
+        find(id).extent = extent;
     }
 
     void destroy(RenderTargetId const id) override {
         auto const lock = std::lock_guard<std::mutex>{mutex};
         find(id);
-        extents.erase(id);
+        targets.erase(id);
     }
 
-    core::ivec2 extentOf(RenderTargetId const id) {
+    TargetState stateOf(RenderTargetId const id) {
         auto const lock = std::lock_guard<std::mutex>{mutex};
         return find(id);
     }
 
     bool exists(RenderTargetId const id) {
         auto const lock = std::lock_guard<std::mutex>{mutex};
-        return extents.count(id) != 0;
+        return targets.count(id) != 0;
     }
 
 private:
@@ -64,16 +78,24 @@ private:
         }
     }
 
-    core::ivec2 &find(RenderTargetId const id) {
-        auto const found = extents.find(id);
-        if (found == extents.end()) {
+    RenderTargetId add(TargetState state) {
+        checkExtent(state.extent);
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        auto const id = RenderTargetId{next++};
+        targets.emplace(id, std::move(state));
+        return id;
+    }
+
+    TargetState &find(RenderTargetId const id) {
+        auto const found = targets.find(id);
+        if (found == targets.end()) {
             throw std::invalid_argument{"lr::render: unknown render target " + std::to_string(id.value)};
         }
         return found->second;
     }
 
     std::mutex mutex;
-    std::unordered_map<RenderTargetId, core::ivec2> extents;
+    std::unordered_map<RenderTargetId, TargetState> targets;
     std::uint32_t next = 0;
 };
 
@@ -122,26 +144,12 @@ private:
     std::vector<FeatureList> pipelines;
 };
 
-// What submit() captures of a view: the target's extent and the pipeline's features as
-// they are at the call.
+// What submit() captures of a view: its target and the pipeline's features as they are
+// at the call.
 struct ViewPlan {
     ViewDesc desc;
-    core::ivec2 extent;
+    TargetState target;
     FeatureList features;
-};
-
-struct PreparedView {
-    ViewId view;
-    RenderTargetId target;
-    std::optional<CompiledGraph> graph;
-    std::exception_ptr failure;
-};
-
-struct PreparedFrame {
-    std::uint64_t index = 0;
-    SceneUpdate scene;
-    std::vector<PreparedView> views;
-    std::vector<std::uint64_t> releasedHistories;
 };
 
 bool tracesRays(std::vector<ViewPlan> const &plans) {
@@ -152,13 +160,14 @@ bool tracesRays(std::vector<ViewPlan> const &plans) {
 }
 
 ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
+    auto const extent = plan.target.extent;
     auto context = ViewContext{};
     context.view = plan.desc.id;
-    context.extent = plan.extent;
+    context.extent = extent;
     context.camera = plan.desc.camera;
     context.settings = plan.desc.settings;
     context.environment = world.environment();
-    auto const aspect = static_cast<float>(plan.extent.x) / static_cast<float>(plan.extent.y);
+    auto const aspect = static_cast<float>(extent.x) / static_cast<float>(extent.y);
     context.viewMatrix = core::viewMatrix(plan.desc.camera);
     context.projection = core::projectionMatrix(plan.desc.camera, aspect);
     context.viewProjection = context.projection * context.viewMatrix;
@@ -169,26 +178,48 @@ ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     return context;
 }
 
-// Whether the timings are those of the runs' dispatches: the device lists them in
-// execution order, the runs in recording order, and the two agree unless a pass
-// dispatched behind PassContext's back.
-bool timingsMatch(std::vector<GraphRun> const &runs, std::vector<tc::KernelTiming> const &timings) {
-    auto next = std::size_t{0};
-    for (auto const &run : runs) {
-        for (auto const &dispatch : run.dispatches()) {
-            if (next == timings.size() or timings[next].program != dispatch.program) {
-                return false;
-            }
-            ++next;
-        }
+using OutputHandler = std::function<void(tc::uint const *data, std::size_t count, ViewResult &)>;
+
+// Where the final pass's pixels go once the frame is done: into the ViewResult of an
+// image target, to the presenter of a window target.
+OutputHandler deliverOutput(ViewPlan const &plan, std::uint64_t const frameIndex) {
+    auto const extent = plan.target.extent;
+    if (plan.target.presenter == nullptr) {
+        return [extent](tc::uint const *data, std::size_t const count, ViewResult &result) {
+            result.image = ImageRgba8{extent, std::vector<std::uint32_t>(data, data + count)};
+        };
     }
-    return next == timings.size();
+    auto const frame = PresentFrame{frameIndex, plan.desc.id, plan.desc.target, ImageRgba8View{extent, nullptr}};
+    return [presenter = plan.target.presenter, frame](tc::uint const *data, std::size_t, ViewResult &) {
+        auto shown = frame;
+        shown.pixels.pixels = data;
+        presenter->present(shown);
+    };
+}
+
+std::exception_ptr asException(std::exception_ptr error) noexcept { return error; }
+
+std::exception_ptr asException(std::error_code const error) {
+    return std::make_exception_ptr(std::system_error{error, "lr::render: the frame was lost"});
+}
+
+std::exception_ptr frameStopped() noexcept {
+    return std::make_exception_ptr(std::runtime_error{"lr::render: the frame was stopped before the GPU thread"});
+}
+
+std::uint32_t checkedFramesInFlight(RendererConfig const &config) {
+    if (config.framesInFlight == 0) {
+        throw std::invalid_argument{"lr::render: framesInFlight must be at least 1"};
+    }
+    return config.framesInFlight;
 }
 
 struct RendererImpl final : Renderer {
     explicit RendererImpl(RendererConfig const &config)
-        : gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
-          timers(config.gpuTimers and gpu->info().timers) {
+        : framesInFlight(checkedFramesInFlight(config)),
+          gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
+          timers(config.gpuTimers and gpu->info().timers),
+          frames(FrameQueueConfig{gpu.get(), &scope, &deviceGeneration, framesInFlight, timers}) {
         if (timers) {
             static_cast<void>(
                 lexec::sync_wait(gpu->record([](gpu::GpuContext &context) { context.device->enableTimers(true); })));
@@ -197,118 +228,116 @@ struct RendererImpl final : Renderer {
 
     ~RendererImpl() override {
         static_cast<void>(lexec::sync_wait(scope.join()));
-        static_cast<void>(lexec::sync_wait(gpu->record([this](gpu::GpuContext &) noexcept {
-            pool.clear();
-            historyImages.clear();
-            deviceScene = DeviceScene{};
-        })));
+        static_cast<void>(lexec::sync_wait(gpu->record([this](gpu::GpuContext &) noexcept { frames.clear(); })));
     }
 
     tc::DeviceInfo const &deviceInfo() const noexcept override { return gpu->info(); }
     RenderTargets &targets() noexcept override { return targetSet; }
     PipelineRegistry &pipelines() noexcept override { return pipelineSet; }
 
+    // The frame's work runs whether or not its sender is started: the render thread and
+    // the GPU thread see every frame, in order, and the sender only waits for the result.
     FrameSender submit(FrameDesc frame) override {
         auto plans = std::vector<ViewPlan>{};
         plans.reserve(frame.views.size());
         for (auto const &view : frame.views) {
-            plans.push_back(ViewPlan{view, targetSet.extentOf(view.target), pipelineSet.featuresOf(view.pipeline)});
+            plans.push_back(ViewPlan{view, targetSet.stateOf(view.target), pipelineSet.featuresOf(view.pipeline)});
         }
+        auto pending = PreparedFrame{};
+        pending.submitted = std::chrono::steady_clock::now();
+        auto const completion = pending.completion;
         auto const lock = std::lock_guard<std::mutex>{submitMutex};
-        auto const index = nextFrame++;
+        pending.index = nextFrame++;
         auto work =
             lexec::schedule(renderThread.scheduler())
-            | lexec::then([this, index, delta = std::move(frame.delta), plans = std::move(plans)] {
-                  return std::make_shared<PreparedFrame>(prepare(index, delta, plans));
+            | lexec::then([this, pending = std::move(pending), delta = std::move(frame.delta),
+                           plans = std::move(plans)]() mutable { return prepare(std::move(pending), delta, plans); })
+            | lexec::let_value([this](PreparedFrame &ready) {
+                  return gpu->record([this, ready = std::move(ready)](gpu::GpuContext &context) mutable noexcept {
+                      frames.accept(context, std::move(ready));
+                  });
               })
-            | lexec::let_value([this](std::shared_ptr<PreparedFrame> &prepared) {
-                  return gpu->record([this, prepared](gpu::GpuContext &context) { return execute(context, *prepared); });
-              });
-        return FrameSender{lexec::spawn_future(std::move(work), scope.get_token())};
+            | lexec::upon_error([completion](std::exception_ptr const &failure) noexcept { completion.setException(failure); })
+            | lexec::upon_stopped([completion]() noexcept { completion.setException(frameStopped()); });
+        lexec::spawn(std::move(work), scope.get_token());
+        return FrameSender{stackfull::exec::async_get(completion)
+                           | lexec::let_error([](auto &error) { return lexec::just_error(asException(error)); })};
     }
 
 private:
-    // On the render thread. A view whose graph fails to build fails the frame on the GPU
-    // thread, after the scene update has been applied there, so both copies of the scene
-    // stay in step.
-    PreparedFrame prepare(std::uint64_t const index, core::RenderWorldDelta const &delta,
-                          std::vector<ViewPlan> const &plans) {
-        auto frame = PreparedFrame{index, world.apply(delta), {}, {}};
+    // On the render thread. A delta the world rejects fails the frame and changes nothing;
+    // anything failing later leaves the world ahead of the GPU copy, which the next frame
+    // then uploads whole.
+    PreparedFrame prepare(PreparedFrame frame, core::RenderWorldDelta const &delta, std::vector<ViewPlan> const &plans) {
+        frame.deviceGeneration = deviceGeneration.load(std::memory_order_acquire);
+        try {
+            frame.scene = world.apply(delta);
+        } catch (...) {
+            frame.failure = std::current_exception();
+            return frame;
+        }
+        try {
+            prepareViews(frame, plans);
+        } catch (...) {
+            sceneGeneration = kSceneOutOfStep;
+            frame.failure = std::current_exception();
+            frame.scene = SceneUpdate{};
+            frame.views.clear();
+        }
+        return frame;
+    }
+
+    void prepareViews(PreparedFrame &frame, std::vector<ViewPlan> const &plans) {
+        if (frame.deviceGeneration != sceneGeneration) {
+            frame.scene = world.fullUpdate();
+            histories.restart();
+        }
         if (tracesRays(plans)) {
             world.keepHierarchies(frame.scene);
         }
         for (auto const &plan : plans) {
-            auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr};
-            try {
-                auto builder = GraphBuilder{GraphOwner{&histories, plan.desc.id, plan.desc.target, index}};
-                auto context = makeViewContext(plan, world);
-                auto const pixels = static_cast<std::size_t>(plan.extent.x) * static_cast<std::size_t>(plan.extent.y);
-                context.sceneColor = builder.createImage<HdrFormat>("scene colour", plan.extent);
-                context.output = builder.createReadbackBuffer<tc::uint>("output", pixels);
-                for (auto const &feature : plan.features) {
-                    feature->setup(builder, context);
-                }
-                prepared.graph = std::move(builder).compile();
-            } catch (...) {
-                prepared.failure = std::current_exception();
-            }
-            frame.views.push_back(std::move(prepared));
+            frame.views.push_back(prepareView(plan, frame.index));
         }
         frame.releasedHistories =
-            histories.expire(index, [this](RenderTargetId const target) { return targetSet.exists(target); });
-        return frame;
+            histories.expire(frame.index, [this](RenderTargetId const target) { return targetSet.exists(target); });
+        sceneGeneration = frame.deviceGeneration;
     }
 
-    // On the GPU thread.
-    FrameResult execute(gpu::GpuContext &context, PreparedFrame &frame) {
-        auto &device = *context.device;
-        deviceScene.apply(device, frame.scene);
-        historyImages.release(frame.releasedHistories);
-        for (auto const &view : frame.views) {
-            if (view.failure) {
-                std::rethrow_exception(view.failure);
+    // A view whose graph fails to build fails the frame on the GPU thread.
+    PreparedView prepareView(ViewPlan const &plan, std::uint64_t const frameIndex) {
+        auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr};
+        try {
+            auto builder = GraphBuilder{GraphOwner{&histories, plan.desc.id, plan.desc.target, frameIndex}};
+            auto context = makeViewContext(plan, world);
+            auto const extent = plan.target.extent;
+            auto const pixels = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y);
+            context.sceneColor = builder.createImage<HdrFormat>("scene colour", extent);
+            context.output = builder.createReadbackBuffer<tc::uint>("output", pixels);
+            for (auto const &feature : plan.features) {
+                feature->setup(builder, context);
             }
+            builder.readback<tc::uint>(context.output, deliverOutput(plan, frameIndex));
+            prepared.graph = std::move(builder).compile();
+        } catch (...) {
+            prepared.failure = std::current_exception();
         }
-        auto const tables = deviceScene.tables();
-        auto runs = std::vector<GraphRun>{};
-        runs.reserve(frame.views.size());
-        for (auto &view : frame.views) {
-            runs.emplace_back(std::move(*view.graph), pool, historyImages, device);
-            runs.back().record(device, tables);
-        }
-        auto const submission = device.submit();
-        device.finish();
-        auto const timings = timers ? device.takeTimings(submission) : std::vector<tc::KernelTiming>{};
-        auto const timed = timers and timingsMatch(runs, timings);
-        auto result = FrameResult{frame.index, {}};
-        auto firstTiming = std::size_t{0};
-        for (auto index = std::size_t{0}; index < runs.size(); ++index) {
-            auto view = ViewResult{};
-            view.view = frame.views[index].view;
-            view.target = frame.views[index].target;
-            if (timed) {
-                view.passTimings = runs[index].passTimings(timings, firstTiming);
-                firstTiming += runs[index].dispatches().size();
-            }
-            runs[index].finish(view);
-            result.views.push_back(std::move(view));
-        }
-        return result;
+        return prepared;
     }
 
+    std::uint32_t framesInFlight;
     std::unique_ptr<gpu::GpuQueue> gpu;
     bool timers;
     runtime::SerialThread renderThread;
     TargetsImpl targetSet;
     PipelinesImpl pipelineSet;
-    RenderWorld world;                              // render thread
-    FrameHistories histories{kHistoryKeepFrames};   // render thread
-    DeviceScene deviceScene;                        // GPU thread
-    ResourcePool pool;                              // GPU thread
-    HistoryResources historyImages;                 // GPU thread
+    RenderWorld world;                            // render thread
+    FrameHistories histories{kHistoryKeepFrames}; // render thread
+    std::uint64_t sceneGeneration = 0;            // render thread: the device the GPU copy is for
+    std::atomic<std::uint64_t> deviceGeneration{0};
     std::mutex submitMutex;
     std::uint64_t nextFrame = 0;
     lexec::counting_scope scope;
+    FrameQueue frames; // GPU thread
 };
 
 } // namespace

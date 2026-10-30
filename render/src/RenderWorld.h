@@ -20,6 +20,11 @@ struct RenderWorld {
     // ids it does not know or carries malformed meshes.
     SceneUpdate apply(core::RenderWorldDelta const &delta);
 
+    // Everything the world holds, for a GPU copy that starts out empty (after the device
+    // was lost): geometry from the meshes' handles, every slot, and the hierarchies, built
+    // anew, when they are kept.
+    SceneUpdate fullUpdate();
+
     // From now on keeps a hierarchy over the triangles of each mesh and one over the
     // instances: builds them into `update`, and later apply() calls rebuild what their
     // deltas change.

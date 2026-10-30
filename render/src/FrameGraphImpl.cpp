@@ -84,6 +84,13 @@ std::vector<std::uint64_t> FrameHistories::expire(std::uint64_t const frame,
     return released;
 }
 
+void FrameHistories::restart() {
+    for (auto const &[key, record] : records) {
+        replaced.insert(replaced.end(), record.ids.begin(), record.ids.end());
+    }
+    records.clear();
+}
+
 std::shared_ptr<void> HistoryResources::acquire(std::uint64_t const id, ResourceDesc const &desc, tc::Device &device) {
     auto &resource = resources[id];
     if (resource == nullptr) {
@@ -92,9 +99,13 @@ std::shared_ptr<void> HistoryResources::acquire(std::uint64_t const id, Resource
     return resource;
 }
 
-void HistoryResources::release(std::vector<std::uint64_t> const &ids) {
+void HistoryResources::release(std::vector<std::uint64_t> const &ids, RetireList &retired) {
     for (auto const id : ids) {
-        resources.erase(id);
+        auto const found = resources.find(id);
+        if (found != resources.end()) {
+            retired.push_back(std::move(found->second));
+            resources.erase(found);
+        }
     }
 }
 

@@ -269,7 +269,8 @@ struct ViewContext {
     std::uint64_t sceneVersion = 0;
     // Shading writes HDR radiance here; post-processing reads and rewrites it.
     ImageRef<HdrFormat> sceneColor;
-    // The final pass writes the view's packed RGBA8 pixels here (a readback buffer).
+    // The final pass writes the view's packed RGBA8 pixels here: a readback buffer the
+    // renderer hands to the view's target once the frame is done.
     BufferRef<tc::uint> output;
 };
 

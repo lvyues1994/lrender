@@ -16,7 +16,8 @@ struct Range {
 // Ensures `table` holds at least `capacity` elements, keeping its contents. Returns
 // whether it was (re)created, in which case it has to be uploaded whole.
 template <class T, class Layout>
-bool reserveTable(std::unique_ptr<tc::TableResource<T, Layout>> &table, std::size_t const capacity) {
+bool reserveTable(std::unique_ptr<tc::TableResource<T, Layout>> &table, std::size_t const capacity,
+                  RetireList &retired) {
     if (table != nullptr and table->size() >= capacity) {
         return false;
     }
@@ -25,18 +26,21 @@ bool reserveTable(std::unique_ptr<tc::TableResource<T, Layout>> &table, std::siz
         for (auto index = std::size_t{0}; index < table->size(); ++index) {
             grown->set(index, table->get(index));
         }
+        retired.push_back(std::shared_ptr<void>{std::move(table)});
     }
     table = std::move(grown);
     return true;
 }
 
-bool reserveBuffer(std::unique_ptr<tc::BufferResource<tc::uint>> &buffer, std::size_t const capacity) {
+bool reserveBuffer(std::unique_ptr<tc::BufferResource<tc::uint>> &buffer, std::size_t const capacity,
+                   RetireList &retired) {
     if (buffer != nullptr and buffer->size() >= capacity) {
         return false;
     }
     auto grown = std::make_unique<tc::BufferResource<tc::uint>>(static_cast<std::int32_t>(capacity));
     if (buffer != nullptr) {
         std::copy(buffer->begin(), buffer->end(), grown->begin());
+        retired.push_back(std::shared_ptr<void>{std::move(buffer)});
     }
     buffer = std::move(grown);
     return true;
@@ -94,15 +98,15 @@ void writeBuffer(tc::Device &device, tc::BufferResource<tc::uint> &buffer, std::
 
 } // namespace
 
-void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update) {
+void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update, RetireList &retired) {
     auto const &capacity = update.capacity;
     if (capacity.blasNodes == 0) {
         return;
     }
-    auto const newBlasNodes = reserveTable(blasNodes, capacity.blasNodes);
-    auto const newBlasTriangles = reserveTable(blasTriangles, capacity.blasTriangles);
-    auto const newBlasRoots = reserveBuffer(blasRoots, capacity.meshes);
-    auto const newTlasNodes = reserveTable(tlasNodes, capacity.tlasNodes);
+    auto const newBlasNodes = reserveTable(blasNodes, capacity.blasNodes, retired);
+    auto const newBlasTriangles = reserveTable(blasTriangles, capacity.blasTriangles, retired);
+    auto const newBlasRoots = reserveBuffer(blasRoots, capacity.meshes, retired);
+    auto const newTlasNodes = reserveTable(tlasNodes, capacity.tlasNodes, retired);
     writeTable(device, *blasNodes, update.blasNodes, newBlasNodes);
     writeTable(device, *blasTriangles, update.blasTriangles, newBlasTriangles);
     writeBuffer(device, *blasRoots, update.blasRoots, newBlasRoots);
@@ -110,14 +114,14 @@ void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update
     tlasNodeCount = update.tlasNodeCount;
 }
 
-void DeviceScene::apply(tc::Device &device, SceneUpdate const &update) {
+void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, RetireList &retired) {
     auto const &capacity = update.capacity;
-    auto const newVertices = reserveTable(vertices, capacity.vertices);
-    auto const newIndices = reserveBuffer(indices, capacity.indices);
-    auto const newMeshes = reserveTable(meshes, capacity.meshes);
-    auto const newInstances = reserveTable(instances, capacity.instances);
-    auto const newMaterials = reserveTable(materials, capacity.materials);
-    auto const newLights = reserveTable(lights, capacity.lights);
+    auto const newVertices = reserveTable(vertices, capacity.vertices, retired);
+    auto const newIndices = reserveBuffer(indices, capacity.indices, retired);
+    auto const newMeshes = reserveTable(meshes, capacity.meshes, retired);
+    auto const newInstances = reserveTable(instances, capacity.instances, retired);
+    auto const newMaterials = reserveTable(materials, capacity.materials, retired);
+    auto const newLights = reserveTable(lights, capacity.lights, retired);
 
     for (auto const &geometry : update.geometry) {
         for (auto index = std::size_t{0}; index < geometry.vertices.size(); ++index) {
@@ -146,7 +150,7 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update) {
     writeTable(device, *lights, update.lights, newLights);
     instanceCount = update.instanceCount;
     lightCount = update.lightCount;
-    applyHierarchies(device, update);
+    applyHierarchies(device, update, retired);
 }
 
 SceneTables DeviceScene::tables() const noexcept {

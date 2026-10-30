@@ -23,6 +23,7 @@ struct HarnessOptions {
     std::string device;
     bool gpuTimers = false;
     std::uint32_t framePoolThreads = 2;
+    std::uint32_t framesInFlight = 2;
 };
 
 // A renderer with its own small runtime.
@@ -36,11 +37,12 @@ struct RenderHarness {
         config.deviceNameContains = options.device;
         config.runtime = runtimeInstance.get();
         config.gpuTimers = options.gpuTimers;
+        config.framesInFlight = options.framesInFlight;
         renderer = render::makeRenderer(config);
     }
 
     explicit RenderHarness(std::string const &backend = "cpu", std::string const &device = "")
-        : RenderHarness(HarnessOptions{backend, device, false, 2}) {}
+        : RenderHarness(HarnessOptions{backend, device, false, 2, 2}) {}
 
     // Throws what the frame failed with.
     render::FrameResult render(render::FrameDesc frame) {

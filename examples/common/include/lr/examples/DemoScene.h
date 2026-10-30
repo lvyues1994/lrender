@@ -2,9 +2,6 @@
 
 #include <lr/core/RenderWorldDelta.h>
 #include <lr/core/Scene.h>
-#include <lr/render/View.h>
-
-#include <string>
 
 namespace lr::examples {
 
@@ -16,8 +13,5 @@ struct DemoScene {
 // A ground plane with a box and spheres of different materials, a sun, a point light and
 // a sky.
 DemoScene makeDemoScene();
-
-// Binary PPM (P6); returns false when the file cannot be written.
-bool writePpm(render::ImageRgba8 const &image, std::string const &path);
 
 } // namespace lr::examples

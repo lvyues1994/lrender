@@ -26,6 +26,7 @@ add_subdirectory(runtime)
 add_subdirectory(core)
 add_subdirectory(gpu)
 add_subdirectory(render)
+add_subdirectory(present)
 
 if(LRENDER_BUILD_EXAMPLES)
     add_subdirectory(examples)

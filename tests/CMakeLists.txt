@@ -38,10 +38,28 @@ lr_add_test(lr_core_tests
     SOURCES core/CoreTest.cpp
     LIBRARIES lr::core)
 
+lr_add_test(lr_gpu_tests
+    SOURCES gpu/GpuQueueTest.cpp
+    LIBRARIES lr::gpu)
+
 lr_add_test(lr_render_tests
     SOURCES render/RenderWorldTest.cpp render/FrameGraphTest.cpp render/BvhTest.cpp
-            render/VisibilityPipelineTest.cpp render/PathTracePipelineTest.cpp
+            render/VisibilityPipelineTest.cpp render/PathTracePipelineTest.cpp render/RendererTest.cpp
     KERNELS render/TestKernels.h
     LIBRARIES lr::render tc_devices)
 # White-box tests of the render module's internals, and of its kernels' functions on the host.
 target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src" "${PROJECT_SOURCE_DIR}/render")
+
+set(lr_present_test_sources present/ImageSequencePresenterTest.cpp)
+set(lr_present_test_libraries lr::present_image)
+if(TARGET lr::present_sdl)
+    list(APPEND lr_present_test_sources present/SdlPresenterTest.cpp)
+    list(APPEND lr_present_test_libraries lr::present_sdl)
+endif()
+lr_add_test(lr_present_tests
+    SOURCES ${lr_present_test_sources}
+    KERNELS render/TestKernels.h
+    LIBRARIES ${lr_present_test_libraries})
+target_include_directories(lr_present_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+# Files the tests write go under the build tree.
+target_compile_definitions(lr_present_tests PRIVATE LR_TEST_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/output")

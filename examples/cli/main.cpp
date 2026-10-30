@@ -1,11 +1,16 @@
 // lrender_cli: renders the demo scene offline and writes it to a PPM file.
 //
 //   lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
-//               [--pipeline visibility|pathtrace] [--samples <n>] [--timers on|off] [--out <file>]
+//               [--pipeline visibility|pathtrace] [--samples <n>] [--timers on|off]
+//               [--out <file> | --sequence <directory>]
 //
-// The path tracer renders --samples frames, one sample per pixel each, and writes the last.
+// The path tracer renders --samples frames, one sample per pixel each, and writes the last
+// to --out; with --sequence every frame goes to <directory>/frame<index>.ppm instead.
 
+#include <lr/examples/CommandLine.h>
 #include <lr/examples/DemoScene.h>
+#include <lr/present/ImageSequencePresenter.h>
+#include <lr/present/Ppm.h>
 #include <lr/render/Renderer.h>
 #include <lr/runtime/Runtime.h>
 
@@ -16,6 +21,7 @@
 #include <cstdio>
 #include <cstdlib>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <string>
 
@@ -29,26 +35,8 @@ struct Options {
     std::uint32_t samples = 1;
     bool timers = false;
     std::string out = "lrender.ppm";
+    std::string sequence; // a directory: every frame through a window target
 };
-
-std::optional<lr::core::ivec2> parseSize(std::string const &text) {
-    auto width = 0;
-    auto height = 0;
-    if (std::sscanf(text.c_str(), "%dx%d", &width, &height) != 2 or width <= 0 or height <= 0) {
-        return std::nullopt;
-    }
-    return lr::core::ivec2{width, height};
-}
-
-std::optional<std::uint32_t> parseCount(std::string const &text) {
-    auto count = 0u;
-    auto end = 0;
-    if (std::sscanf(text.c_str(), "%u%n", &count, &end) != 1 or static_cast<std::size_t>(end) != text.size()
-        or count == 0) {
-        return std::nullopt;
-    }
-    return count;
-}
 
 // Applies one flag and its value; false when either is not understood.
 bool apply(Options &options, std::string const &flag, std::string const &value) {
@@ -57,14 +45,14 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
     } else if (flag == "--device") {
         options.device = value;
     } else if (flag == "--size") {
-        auto const size = parseSize(value);
+        auto const size = lr::examples::parseSize(value);
         options.size = size.value_or(lr::core::ivec2{0});
         return size.has_value();
     } else if (flag == "--pipeline") {
         options.pathTrace = value == "pathtrace";
         return value == "pathtrace" or value == "visibility";
     } else if (flag == "--samples") {
-        auto const samples = parseCount(value);
+        auto const samples = lr::examples::parseCount(value);
         options.samples = samples.value_or(0u);
         return samples.has_value();
     } else if (flag == "--timers") {
@@ -72,6 +60,8 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         return value == "on" or value == "off";
     } else if (flag == "--out") {
         options.out = value;
+    } else if (flag == "--sequence") {
+        options.sequence = value;
     } else {
         return false;
     }
@@ -101,8 +91,40 @@ void printTimings(lr::render::ViewResult const &view) {
     }
 }
 
+std::shared_ptr<lr::present::ImageSequencePresenter> sequenceOf(Options const &options, lr::runtime::Runtime &runtime) {
+    if (options.sequence.empty()) {
+        return nullptr;
+    }
+    auto config = lr::present::ImageSequenceConfig{};
+    config.directory = options.sequence;
+    config.runtime = &runtime;
+    return lr::present::makeImageSequencePresenter(config);
+}
+
+lr::render::RenderTargetId targetOf(lr::render::Renderer &renderer, Options const &options,
+                                    std::shared_ptr<lr::present::ImageSequencePresenter> const &sequence) {
+    if (sequence != nullptr) {
+        return renderer.targets().createWindow(lr::render::WindowTargetDesc{options.size, sequence});
+    }
+    return renderer.targets().createImage(lr::render::ImageTargetDesc{options.size});
+}
+
+// Where the frames went: the last one into --out, or all of them into --sequence.
+bool writeOutput(Options const &options, lr::render::ViewResult const &view,
+                 lr::present::ImageSequencePresenter *const sequence) {
+    if (sequence != nullptr) {
+        auto const progress = sequence->flush();
+        std::printf(" -> %s/frame*.ppm, %llu written", options.sequence.c_str(),
+                    static_cast<unsigned long long>(progress.written));
+        return progress.failed == 0;
+    }
+    std::printf(" -> %s", options.out.c_str());
+    return view.image and lr::present::writePpm(lr::render::imageView(*view.image), options.out);
+}
+
 int run(Options const &options) {
     auto runtime = lr::runtime::makeRuntime(lr::runtime::RuntimeConfig{});
+    auto const sequence = sequenceOf(options, *runtime);
     auto config = lr::render::RendererConfig{};
     config.backend = options.backend;
     config.deviceNameContains = options.device;
@@ -114,7 +136,7 @@ int run(Options const &options) {
     auto scene = lr::examples::makeDemoScene();
     auto view = lr::render::ViewDesc{};
     view.id = lr::core::ViewId{0};
-    view.target = renderer->targets().createImage(lr::render::ImageTargetDesc{options.size});
+    view.target = targetOf(*renderer, options, sequence);
     view.pipeline = options.pathTrace ? renderer->pipelines().pathTraceReference() : renderer->pipelines().visibility();
     view.camera = scene.camera;
     auto delta = std::move(scene.delta);
@@ -132,20 +154,21 @@ int run(Options const &options) {
         last = std::get<0>(std::move(*result));
     }
     auto const elapsed = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start);
-    auto const &views = last.views;
-    if (views.empty() or not views[0].image or not lr::examples::writePpm(*views[0].image, options.out)) {
-        std::fprintf(stderr, "cannot write %s\n", options.out.c_str());
-        return EXIT_FAILURE;
-    }
-    auto const &stats = views[0].stats;
+    auto const &result = last.views.at(0);
     std::printf("%dx%d, %u frames in %.1f ms", options.size.x, options.size.y, frames, elapsed.count());
     if (options.pathTrace) {
-        std::printf(", %u samples per pixel", stats.accumulatedSamples);
+        std::printf(", %u samples per pixel", result.stats.accumulatedSamples);
     } else {
-        std::printf(", %u instances and %u triangles visible", stats.visibleInstances, stats.visibleTriangles);
+        std::printf(", %u instances and %u triangles visible", result.stats.visibleInstances,
+                    result.stats.visibleTriangles);
     }
-    std::printf(" -> %s\n", options.out.c_str());
-    printTimings(views[0]);
+    auto const written = writeOutput(options, result, sequence.get());
+    std::printf("\n");
+    if (not written) {
+        std::fprintf(stderr, "cannot write the output\n");
+        return EXIT_FAILURE;
+    }
+    printTimings(result);
     return EXIT_SUCCESS;
 }
 
@@ -157,7 +180,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
                              "                   [--pipeline visibility|pathtrace] [--samples <n>] "
-                             "[--timers on|off] [--out <file>]\n");
+                             "[--timers on|off]\n"
+                             "                   [--out <file> | --sequence <directory>]\n");
         return 2;
     }
     try {

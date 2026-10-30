@@ -67,7 +67,7 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 
 线程数都可以在 `RuntimeConfig` 里配置。四条线程规则：
 
-- 只有 GPU 线程能访问 `tc::Device`。`GpuContext` 是一个能力令牌，只会作为 `GpuQueue::record(fn)` 回调的参数出现。GPU 侧状态包在 `GpuOwned<T>` 里，必须出示 `GpuContext &` 才能取到；析构时把删除操作提交回 GPU 线程，并推迟到用过它的帧完成之后。
+- 只有 GPU 线程能访问 `tc::Device`。`GpuContext` 是一个能力令牌，只会作为 `GpuQueue::record(fn)` 回调的参数出现。GPU 侧状态（常驻表、资源池、历史图像、在途帧）都在 render 的 `FrameQueue` 里，它只在 GPU 线程上运行；GPU 线程丢掉的东西进当前录制那一帧的退役列表，等这一帧完成（也就是它之前的帧都完成）之后才释放。
 - 准备侧状态（`RenderWorld` 镜像、BLAS 缓存、帧图的资源池、历史资源记录）只在渲染线程上修改。
 - 场景只在调用 tick 的那个宿主线程上访问。
 - 跨线程只传递不可变值（`RenderWorldDelta`、`shared_ptr<T const>` 形式的资产），或者转移所有权（准备好的帧、回读的图像）。
@@ -76,7 +76,7 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 
 ```
 examples → present, scene, asset, render, runtime
-present  → render, core        实现 render 定义的 Presenter 接口
+present  → render, runtime, core   实现 render 定义的 Presenter 接口
 render   → gpu, runtime, core
 gpu      → runtime, core
 asset    → runtime, core
@@ -126,13 +126,15 @@ std::unique_ptr<Runtime> makeRuntime(RuntimeConfig const &config);   // 析构�
 ```cpp
 struct GpuContext {                 // 能力令牌：只在 GPU 线程上的回调里拿得到
     tc::Device *device = nullptr;
-    std::uint64_t frameIndex = 0;
 };
+
+using CompletionSender = lexec::any_sender_of<lexec::set_value_t(), lexec::set_error_t(std::exception_ptr),
+                                              lexec::set_stopped_t()>;
 
 struct GpuQueue {
     virtual ~GpuQueue() = default;
-    virtual tc::DeviceInfo const &info() const = 0;   // 含 DeviceLimits 与 syncFiles
-    virtual GpuScheduler scheduler() noexcept = 0;
+    virtual tc::DeviceInfo const &info() const noexcept = 0;   // 含 DeviceLimits 与 syncFiles
+    virtual runtime::SerialScheduler scheduler() noexcept = 0;
 
     // 在 GPU 线程上运行 fn(GpuContext &)，以它的返回值完成；抛出的异常走 set_error。
     template <class Fn>
@@ -143,13 +145,15 @@ struct GpuQueue {
 
     // 在 GPU 线程上调用：提交到目前为止录制的工作，不等待。
     virtual tc::FencedSubmission submit(GpuContext &context) = 0;
-    // 一个 sender：设备做完这次提交时，在 IO 调度器上完成。
+    // 任意线程：一个 sender，设备做完这次提交时，在 IO 调度器上完成。
     virtual CompletionSender whenComplete(tc::FencedSubmission submitted) = 0;
+    // 在 GPU 线程上调用：销毁设备，再按同样的配置建一个；建不出来时抛 tc::DeviceError。
+    virtual void recreateDevice(GpuContext &context) = 0;
 
 protected:
-    virtual GpuContext &contextOnGpuThread() = 0;   // 在其他线程调用属于契约违规
+    virtual GpuContext &contextOnGpuThread() noexcept = 0;   // 在其他线程调用属于契约违规
 };
-std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后端名、设备名过滤、Runtime
+std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后端名、设备名过滤、Runtime（必需）
 ```
 
 - **启动**：GPU 线程先调用 `tc::createDevice()`，CPU 后端的 `CpuDeviceConfig::executor` 设成帧池上的 `bulk`；然后对 `ProgramRegistry::instance().all()` 逐个 `checkKernel`，把每个程序能不能运行记下来，供 render 选择变体；最后进入 `run_loop::run()`。设备也在这个线程上销毁。
@@ -157,6 +161,10 @@ std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后�
 - **等待完成**：`whenComplete` 是 IO 调度器上的一个 stackfull 任务（`exec::spawn(io, …)`），GPU 线程因此从不等待 GPU，可以接着录制下一帧：
   - `.fence` 不为空：先给 fd 设上 `O_NONBLOCK`，再用 `io::Registration` 注册进 Poller。任务先读 `readEvents()`，`isSignaled()` 为假时 `waitReadable(seen)`，然后重新检查。任务 park 期间不占线程，完成由 epoll 报告；`Registration` 在 `SyncFence` 之前析构。
   - `.fence` 为空：`.submission.isComplete()` 已为真就立即结束（CPU 后端总是如此）；否则在任务里 `stackfull::blocking([&] { submission.wait(); })`，等待落在 IO 调度器的阻塞线程池上。llvmpipe 和 lavapipe 没有 sync file，走的就是这条路径。
+  - fd 设不上非阻塞或注册失败时，改在阻塞池上 `fence.wait()`。fence 可读之后，`Submission` 自己的完成（Vulkan 的 `VkFence`）可能晚一点才报告，这时也在阻塞池上等它，这样回到 GPU 线程之后 `takeTimings` 一定不会等待。
+  - 等待抛出的异常（比如 `tc::DeviceError`）走 `set_error`；任务没能启动时 stackfull 给出的 `error_code` 包成 `std::system_error`。
+  - 测试里用 eventfd 代替 sync file：两者都是变成可读就算完成，所以没有 sync file 的机器上也能测到 Poller 这条路径。
+- **重建设备**：`recreateDevice` 在 GPU 线程上先销毁旧设备（tc 的 Vulkan 设备析构时会等它排队的工作，真正丢失的设备会立即返回），再按原来的配置创建新设备。`info()` 一直是第一个设备的信息，配置相同，设备也相同。
 - **同一个 fence 有两个使用者**：Android 零拷贝上屏时，`ASurfaceTransaction_setBuffer` 也要这个 fence，此时 `dup` 一份 fd 给 Presenter。
 - **计时**：完成之后回到 GPU 线程，用 `takeTimings(submitted.submission)` 取这一帧的设备耗时。这次提交已经完成，调用不会等待，也不会碰正在录制或执行的下一帧。
 - **开发期重新加载**：文件监听任务发现 `tc_generated/<target>/glsl` 有变化时，通过 `record` 在 GPU 线程上调用 `ProgramRegistry::instance().reloadFrom(dir)`，结果写进日志；下一次 `useKernel` 就换成新程序。发布构建关闭 `TC_PROGRAM_RELOAD`。
@@ -184,42 +192,43 @@ using FrameSender = lexec::any_sender_of<lexec::set_value_t(FrameResult),
 
 struct Renderer {
     virtual ~Renderer() = default;
-    virtual RenderTargets &targets() = 0;
-    virtual PipelineRegistry &pipelines() = 0;
-    // 立即返回，任意线程可调用。帧按调用顺序编号、依次处理；
-    // 设备做完该帧之后完成，FrameResult 里带统计和离屏目标的回读图像。
+    virtual tc::DeviceInfo const &deviceInfo() const noexcept = 0;
+    virtual RenderTargets &targets() noexcept = 0;
+    virtual PipelineRegistry &pipelines() noexcept = 0;
+    // 立即返回，任意线程可调用。帧按调用顺序编号、依次处理，不管它的 sender 有没有启动；
+    // sender 按同样的顺序在设备做完该帧之后完成，FrameResult 里带统计、墙钟时间和离屏目标的图像。
     virtual FrameSender submit(FrameDesc frame) = 0;
 };
-std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);   // 后端、Runtime、在途帧数
+std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);   // 后端、Runtime、framesInFlight（默认 2）
 
-struct RenderTargets {
+struct RenderTargets {                                                       // 线程安全，改动从之后提交的帧起生效
     virtual ~RenderTargets() = default;
-    virtual RenderTargetId createWindow(WindowTargetDesc const &desc) = 0;   // 带一个 Presenter
-    virtual RenderTargetId createImage(ImageTargetDesc const &desc) = 0;     // 结果随 FrameResult 回读
-    virtual void resize(RenderTargetId const id, Extent2 const extent) = 0;
-    virtual void destroy(RenderTargetId const id) = 0;
+    virtual RenderTargetId createWindow(WindowTargetDesc const &desc) = 0;   // {extent, shared_ptr<Presenter>}
+    virtual RenderTargetId createImage(ImageTargetDesc const &desc) = 0;     // 结果在 ViewResult::image 里
+    virtual void resize(RenderTargetId id, core::ivec2 extent) = 0;
+    virtual void destroy(RenderTargetId id) = 0;
 };
 
-struct ReadbackFrame {              // 设备做完之后：映射内存里的像素，present() 返回后失效
-    ImageRgba8View pixels;
+struct PresentFrame {               // Readback 路径：设备做完之后，映射内存里的像素
+    std::uint64_t frameIndex = 0;
+    ViewId view;
+    RenderTargetId target;
+    ImageRgba8View pixels;          // 只在 present() 调用期间有效
 };
-struct SharedBufferFrame {          // 提交之后立即：平台 buffer 和它的 acquire fence
-    AHardwareBuffer *buffer = nullptr;
-    tc::SyncFence acquire;
-};
-using PresentFrame = std::variant<ReadbackFrame, SharedBufferFrame>;
 
 struct Presenter {                  // lr::present 提供实现，宿主也可以自己写
     virtual ~Presenter() = default;
-    virtual PresentPath path() const = 0;
-    virtual void present(PresentFrame frame) = 0;   // GPU 线程调用，不得阻塞
+    virtual void present(PresentFrame const &frame) = 0;   // GPU 线程上按帧序调用，不得阻塞
 };
 ```
 
+- 窗口目标的像素交给它的 Presenter，`ViewResult::image` 留空；离屏目标的像素拷进 `ViewResult::image`。同一帧可以两种都有。
+- 目前只有 Readback 路径。SharedBuffer 路径（引擎直接渲染进 `AHardwareBuffer`，提交之后立即把 buffer 和 acquire fence 交给 Presenter）留给 Android：到时候 `Presenter` 加一个默认是 Readback 的 `path()`，再加一个接收 `SharedBufferFrame` 的入口，现有的 Presenter 不用改。
 - 多视图：一帧可以有任意个视图，渲染到不同目标，比如编辑器的多个视口、分屏、离屏缩略图。阴影贴图是管线内部的 pass，不算视图。
-- 缩放：帧图里的资源尺寸相对目标尺寸声明，`resize` 之后按新尺寸重建，并清掉这个目标上各视图的历史。
+- 缩放：帧图里的资源尺寸相对目标尺寸声明，`resize` 之后按新尺寸重建；历史资源按尺寸记录，尺寸变了就换一对新的，`valid` 为假，累积从头开始。
+- 销毁：已经提交的帧照样交给原来的 Presenter（帧图里持有它的 `shared_ptr`），之后再提交这个目标就抛 `std::invalid_argument`。
 - Android 生命周期：surface 销毁时宿主 `destroy` 对应的目标，重建时再 `createWindow`。tc 的设备不依赖窗口，所以这期间设备和常驻资源都留着。
-- 在途帧：引擎内部保证已提交、但设备还没做完的帧不超过 `framesInFlight`；宿主通过等待 `FrameSender` 自己决定提交节奏。
+- 在途帧：录制了、但还没收尾的帧最多 `framesInFlight` 个，见“一帧”。宿主通过等待 `FrameSender` 自己决定提交节奏；超过上限的帧准备好之后在 GPU 线程上排队，不会被丢掉。
 
 #### RenderWorld：渲染侧的常驻镜像
 
@@ -306,17 +315,19 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 - 布局是用 `probes/layout_probe` 的设备计时定的：各布局轮流 dispatch，设备的时钟变化对它们影响相同。RTX 5070 Ti 的 Vulkan 上，表远大于缓存时（400 万个实例、840 万个顶点）：剔除 `Aos` 0.49 ms、`Soa<>` 0.27 ms；只读三个角的位置，`Aos`（5 个字）0.54 ms、`Soa<>` 0.47 ms、补齐到 8 个字的 `PaddedAos` 0.66 ms；读整个顶点三者是 0.53、0.53、0.66 ms。补齐带来的宽读写抵不上多出来的字节。lavapipe 上 `Aos` 读位置快一成多，CPU 后端上布局没有影响；按硬件 GPU 选。
 - 表在 CPU 后端上读写比 std430 慢约 3 倍（要逐字打包，还要经过元素缓存），所以金标准测试的场景要保持很小。
 - 常驻表放在设备内存里。帧池把脏元素编码好，GPU 线程把它们写进自己持有的主机端表，再 `uploadTable(table, first, count)` 只传脏区间。传输在设备时间线上排队，与在途帧的读写冲突由 tc 的屏障处理，所以常驻表不需要为每个在途帧各备一份。
+- 上传在调用时就把主机端的数据拷走：Vulkan 后端 `memcpy` 进这次提交自己的暂存内存（提交完成之前不复用），再录一条 `vkCmdCopyBuffer`，屏障跟踪跨提交保留；GL 后端用 `glBufferData` / `glBufferSubData`，它们本身就是拷贝；CPU 后端的 kernel 在 `execute()` 时已经算完。所以帧 k 的场景更新可以在帧 k-1 还在设备上时录制，主机端表之后随便改。例外是 `createBuffer` 分配的映射内存，设备原地读写，回读 buffer 就是这种，它们由帧图在帧完成之前一直持有。
+- 表变大时换上一张新表，旧表进这一帧的退役列表，帧完成之后才释放。tc 自己也会把设备端的副本推迟到用过它的提交完成之后再销毁（Vulkan 的 graveyard，GL 删除对象时驱动本来就推迟），退役列表让主机端对象的寿命也不依赖这一点。
 - 每个内置 kernel 最多用 8 个 storage buffer、4 个存储图像，高于规范下限的 4 个 storage buffer；不满足的设备在启动时由 `checkKernel` 报告出来。
 - HDR 中间目标用 `RGBA16F`，它在 GLES 3.1 和 Vulkan 上都是强制支持的存储格式，也能线性过滤。
 
 #### 回读
 
-窗口目标的 Readback 路径和离屏目标都不调用 `downloadImage`，因为它总会等待。最后一个 pass 把打包的 RGBA8 直接写进 `createBuffer` 分配的映射内存：按 `framesInFlight` 分段，每帧用 `BufferBinding::attach(resource, first, count)` 绑定其中一段，起点按 `storageBufferOffsetAlignment` 对齐。`whenComplete` 完成之后，回到 GPU 线程直接读这一段，交给 Presenter 或拷进 `FrameResult`。
+窗口目标的 Readback 路径和离屏目标都不调用 `downloadImage`，因为它总会等待。最后一个 pass 把打包的 RGBA8 直接写进 `ViewContext::output`：渲染线程给每个视图声明的一个 `createReadbackBuffer`，也就是 `createBuffer` 分配的映射内存。它和别的帧图资源一样从资源池里按描述取，在途的每一帧各持有一份，帧收尾之后才回到池里，所以池里自然有 `framesInFlight` 份，不需要再按偏移分段。这个回读由 Renderer 自己登记，不归某个 feature：`whenComplete` 完成之后回到 GPU 线程，窗口目标把这段内存直接交给 Presenter，离屏目标拷进 `ViewResult::image`。
 
 #### 计时
 
-- `FrameResult` 总是带从提交到完成的墙钟时间。
-- `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，`ViewResult::passTimings` 还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch，帧图按同样的顺序记下每次经 `PassContext` 的 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）；程序名只用来核对：有 pass 绕过 `PassContext` 直接调用设备时，两者对不上，这一帧就不给 pass 耗时。
+- `FrameResult::wallTime` 总是带从 `submit()` 到这一帧收尾的墙钟时间。
+- `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，`ViewResult::passTimings` 还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch（帧按顺序收尾，失败的帧也取一次再丢掉，所以取到的正好是这一帧的），帧图按同样的顺序记下每次经 `PassContext` 的 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）；程序名只用来核对：有 pass 绕过 `PassContext` 直接调用设备时，两者对不上，这一帧就不给 pass 耗时。
 - 开着计时器时，tc 会在每个计时的 dispatch 前插入完整屏障，dispatch 之间不再重叠，所以 `gpuTimers` 默认关闭，只在开发、剖析和挑选表布局时打开。帧与帧之间的重叠不受影响。
 - Adreno 上 GLES 的计时查询几乎总是返回接近 0 的值，又不报告时钟不连续，所以这类设备上只看墙钟时间。llvmpipe 的 OpenGL 和 GLES 也一样。
 
@@ -324,10 +335,10 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 
 每种实现是一个单独的 CMake 目标，宿主只链接用得到的。需要特定线程或者可能阻塞的上屏，由 Presenter 自己转交，因为 `present()` 是在 GPU 线程上调用的。
 
-- `SdlPresenter`（Readback）：把像素拷进三缓冲信箱，宿主主线程调用 `blitLatest()` 上屏。SDL 要求在主线程上屏。1080p 的 RGBA8 约 8 MB 一帧，桌面的带宽足够，一直走这条路径。
+- `SdlPresenter`（Readback，`lr::present_sdl`，只在找到 SDL2 时构建）：`present()` 把像素拷进三缓冲信箱，宿主主线程调用 `blitLatest()` 上屏。SDL 要求在主线程上屏。信箱是三个槽加一个原子交换的“共享槽下标 + 新帧标记”：GPU 线程写自己的槽再换进共享槽，主线程看到新帧标记就换出来，双方都不等对方，主线程总是拿到最新的一帧，中间的帧直接被覆盖。`blitLatest()` 把它传进一张流式纹理（`SDL_PIXELFORMAT_ABGR8888`，就是低字节为红的打包 RGBA8），拉伸到整个输出再 `SDL_RenderPresent`，返回帧号；没有新帧时什么都不画。纹理随 Presenter 销毁，所以最后一个引用要在主线程上、Renderer 之后、`SDL_Renderer` 之前放掉。1080p 的 RGBA8 约 8 MB 一帧，桌面的带宽足够，一直走这条路径。
 - `SurfaceControlPresenter`（Android API 29+，SharedBuffer）：引擎直接渲染进一组 RGBA8 的 AHardwareBuffer（通过 `ExternalImageBinding` 写入），这个 Presenter 用 `ASurfaceTransaction_setBuffer` 提交，acquire fence 是 `submitWithFence()` 返回的 `.fence`（`dup` 出来的那一份）。合成器在回调里交还的 release fence，在 GPU 线程下次写这块 buffer 之前交给 `waitFor()`，由设备等待。没有回读，也没有拷贝。Vulkan 第一次以存储图像使用新导入的帧时可能丢弃原有内容，而输出 pass 本来就写满整帧，不受影响。
 - `NativeWindowPresenter`（Android API 29 以下，Readback）：在自己的线程上 `ANativeWindow_lock` 并拷贝。
-- `ImageSequencePresenter`（Readback）：离线输出，在 IO 调度器的任务里写文件，不阻塞 GPU 线程。
+- `ImageSequencePresenter`（Readback，`lr::present_image`）：离线输出。`present()` 拷一份像素，用 `exec::spawn(io, …)` 起一个任务，在 `stackfull::blocking()` 里写 `<directory>/<prefix><帧号>.ppm`，不阻塞 GPU 线程。`flush()` 等到目前交给它的帧都写完（或失败），返回写成和失败的帧数；析构时等还在写的帧，所以宿主要在 Renderer 之后、不在 GPU 线程上放掉最后一个引用。`lrender_cli --sequence <目录>` 用它输出每一帧。
 
 ### asset：资产 IO 与解码（可选）
 
@@ -413,7 +424,7 @@ CO2_END
 
 ### examples：组合根
 
-`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口）。宿主循环可以写成这样，阻塞与否完全由宿主决定：
+`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 和 asset 还没有，目前显示演示场景）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口）。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
 
 ```cpp
 for (;;) {
@@ -437,15 +448,16 @@ for (;;) {
 
 ```
 宿主线程 │ 输入 │ tick │ extractDelta │ submit N │ ……（不等引擎）
-渲染线程 │ 应用增量 N │ 编译帧图 N │ 等编码完成 │ 等在途帧少于上限 → 交给 GPU 线程
-帧池     │                 ████ 编码 ████
-GPU 线程 │ 录制 N │ 提交 N │ 录制 N+1 │ 提交 N+1 │ 收尾 N │ ……
+渲染线程 │ 应用增量 N │ 编译帧图 N │ 交给 GPU 线程 │ 应用增量 N+1 │ ……
+GPU 线程 │ 录制 N │ 提交 N │ 录制 N+1 │ 提交 N+1 │（N+2 排队）│ 收尾 N │ 录制 N+2 │ ……
 设备     │          ████████ N ████████ ████████ N+1 ████████
-IO       │          等 N 的 fence ──────────────┘
+IO       │          等 N 完成 ────────────────────────┘
 ```
 
-- 渲染线程上，一帧的编排是一条 sender 链：`then(applyDelta) | let_value(when_all(编码…))` 在帧池上并行，再 `continues_on(render)` 回到渲染线程收尾，最后交给 GPU 线程。渲染线程从不阻塞。
-- GPU 线程上，`record` 录制并提交，然后 `let_value(whenComplete)` 在 IO 调度器上等设备做完，再 `continues_on(gpu)` 回来收尾：读回读段、取计时（打开时）、交给 Readback 类的 Presenter、退役这一帧用过的 `GpuOwned`、暂存段和回读段，完成 `FrameSender`。SharedBuffer 类的 Presenter 在提交之后立即拿到帧。
+- `submit()` 在调用线程上取下目标和管线的当前状态，然后把这一帧的工作用 `lexec::spawn` 放进 Renderer 的 `counting_scope`：`schedule(render) | then(prepare) | let_value(record(accept))`。这条链不管宿主有没有启动 `FrameSender` 都会跑完，所以丢掉 sender 也不会让某一帧的增量只到了一半。渲染线程从不阻塞。
+- `FrameSender` 是 `exec::async_get(completion) | let_error(…)`，等的是这一帧自己的 `sync::Completion<FrameResult>`；`let_error` 把 `error_code` 和 `exception_ptr` 都变成 `set_error(std::exception_ptr)`。sender 在 GPU 线程上完成（启动时结果已经在了就当场完成），宿主要等别的东西之前先 `continues_on` 离开。用 `Completion` 做桥，是因为结果由 GPU 线程的状态机在帧收尾时给出，不是启动这一帧的那条链的延续：需要一个任意线程可写、单个消费者、结果先到或 sender 先启动都行、还能响应停止请求的一次性交接点，这正是 `Completion` 加 `async_get`；自己写一个 lexec sender 也要重做同样的原子状态和取消协议。
+- GPU 线程上是 `FrameQueue`，一个只在这个线程上运行的状态机，不用锁。准备好的帧先进等待队列；在途（录制了、还没收尾）的帧少于 `framesInFlight` 时取出来录制并提交，然后 `lexec::spawn(whenComplete(…) | … | let_value(record(deviceDone)))`，在 IO 调度器上等设备做完再回到 GPU 线程。设备完成的通知可能乱序到达，收尾总是从在途队列的头上按顺序做：取计时（打开时）、调回读（交给 Presenter 或拷进 `ViewResult`）和 `onFinish`、释放这一帧的帧图资源和退役列表，然后再录制等着的帧。所有收尾完的帧的 `Completion` 在这一步的最后才设置，宿主的接收者即使在 GPU 线程上同步运行，也看到一个已经整理好的队列。
+- 渲染线程准备失败的帧（增量无效、帧图建不起来）也走同一个队列，按顺序以 `set_error` 完成；视图的帧图失败时，场景更新照样先在 GPU 线程上应用，两份场景保持一致。录制中途抛出的非设备错误，已经录下的工作照样提交，这一帧的资源留到设备做完再释放，然后以那个错误完成。
 - 准备侧状态只在渲染线程上修改，设备侧状态只在 GPU 线程上修改，两个 `run_loop` 都是先进先出的，帧天然按序。
 
 ## 数据与状态
@@ -457,15 +469,17 @@ IO       │          等 N 的 fence ──────────────
 | `RenderWorldDelta` | 按帧移动的值 | 宿主 → 渲染线程 | 不可变 |
 | `MeshData` / `ImageData` | `shared_ptr<T const>` | 任意线程只读 | 不可变；热重载产生新对象 |
 | `RenderWorld` 镜像、BLAS 缓存、帧图资源池 | render | 渲染线程 | 单一序列 |
-| 常驻表、纹理池、临时资源、历史图像 | `GpuOwned<T>` | GPU 线程 | 单一序列，由令牌保护；删除推迟到用过它的帧完成 |
-| 暂存段、回读段 | `GpuOwned<T>` | GPU 线程写暂存、设备写回读 | 每个在途帧一段，帧完成之前不复用 |
+| 常驻表、纹理池、临时资源、历史图像 | `FrameQueue` | GPU 线程 | 单一序列；丢掉的进当前帧的退役列表，帧完成之后释放 |
+| 回读 buffer、暂存段 | 帧图资源池 | GPU 线程写暂存、设备写回读 | 每个在途帧各持有一份，帧收尾之前不回池 |
 | `FrameResult`（统计、回读图像） | 按帧移动的值 | GPU 线程 → 宿主 | 通过 sender 交接 |
 
 ## 跨模块约定
 
 - 错误：
   - 可恢复的情况（资产缺失、解码失败）作为值返回（`AssetResult<T>`），走 `set_value`。
-  - 设备错误（`tc::DeviceError`）是异常，可能出现在录制、提交或等待完成时。Renderer 收到后让在途帧以 `set_error` 完成，重建 `GpuQueue`，重新上传 `RenderWorld` 里的几何，在 `FrameResult` 里列出需要重新提交的纹理，然后继续处理后面的帧；宿主也可以选择换成 `cpu` 后端。
+  - 设备错误（`tc::DeviceError`）是异常，可能出现在录制、提交、等待完成或收尾时。GPU 线程收到后让出错的帧和所有在途帧以这个错误完成，先放掉旧设备上建的一切（帧图资源、资源池、历史图像、`DeviceScene`、退役列表），再 `recreateDevice`，最后把设备代数加一。等待完成失败也按设备丢失处理，因为那时不知道设备还用不用这一帧的资源。
+  - 每一帧在渲染线程上准备时记下当时的设备代数。代数已经过时的帧（设备重建之前准备好的）不再录制，同样以那个错误完成；渲染线程发现代数变了，下一帧用 `RenderWorld::fullUpdate()` 从网格句柄重新编码整个场景（几何、各个槽、要追踪光线时重建 BVH），并让所有历史资源从头开始。这一帧之后的帧照常渲染。纹理还没有实现，以后在 `FrameResult` 里列出需要重新提交的纹理；宿主也可以选择换成 `cpu` 后端。新设备建不出来时，下一帧再试一次，还不行就以那个原因失败。
+  - 测试里用一个录制时抛 `tc::DeviceError` 的 feature 模拟设备丢失。
   - 契约违规交给进程级处理器；co2 和 stackfull 都有这样的处理器，lrender 安装一个统一的。
 - 开启异常编译：co2、lexec 的 co2 桥和 tc 的错误报告都依赖异常。
 - 风格与 co2、stackfull、tc 一致：`struct`、east const、接口加工厂、数据类、camelCase；lexec 的 snake_case 只出现在调用处。C++17 没有指定初始化器，所以配置类型用默认成员初始化，再逐个字段赋值。
@@ -501,13 +515,15 @@ IO       │          等 N 的 fence ──────────────
 ```
 lrender/
   CMakeLists.txt  CMakePresets.json
-  cmake/Dependencies.cmake   FetchContent，固定提交：lexec、co2、stackfull、compute_shaders、
-                             SDL2、cgltf、stb、tl-expected、doctest
+  cmake/LrDependencies.cmake FetchContent，固定提交：lexec、co2、stackfull、compute_shaders
+                             （以后还有 cgltf、stb、tl-expected）；doctest 在 tests/ 里拉取；
+                             SDL2 用系统里的（find_package(SDL2 CONFIG)），找不到就不构建
+                             lr::present_sdl 和 lrender_view
   core/      include/lr/core/                     lr::core     INTERFACE
   runtime/   include/lr/runtime/   src/           lr::runtime  lexec::runtime、stackfull
-  gpu/       include/lr/gpu/       src/           lr::gpu      tc、tc_devices、stackfull::exec
+  gpu/       include/lr/gpu/       src/           lr::gpu      tc、tc_devices、stackfull::exec、stackfull::runtime
   render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)
-  present/   sdl/  android/  image_sequence/      lr::present_sdl  lr::present_android  lr::present_image
+  present/   image_sequence/  sdl/  （android/）  lr::present_image  lr::present_sdl  （lr::present_android）
   asset/     include/lr/asset/     src/           lr::asset    stackfull::exec、cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    co2、lexec 的 co2 桥
   examples/  view/  cli/                          lrender_view  lrender_cli
@@ -527,17 +543,17 @@ lrender/
 |---|---|---|
 | core、RenderWorld、帧图编译 | 确定 | 单元测试 |
 | render kernel | 确定 | CPU 后端的金标准图像，加上跨后端等价测试；子组和 64 位原子的变体与回退变体互相比对；设备图像没有读回接口，纹理池的内容用采样 kernel 读进 buffer 再比对 |
-| Renderer 整体 | 确定 | cpu 后端 + `ImageSequencePresenter` 跑完整路径：多视图、缩放、设备丢失恢复 |
+| Renderer 整体 | 确定 | cpu 后端，以及 llvmpipe、lavapipe 上的 GPU 后端（没有 sync file，走 `Submission` 的等待路径）：连续提交的帧按序完成、累积结果与逐帧提交相同、在途帧不超过上限（用一个数录制而未收尾帧数的 feature）、多视图、窗口目标交给测试用的 Presenter、缩放、设备丢失恢复（用一个录制时抛 `tc::DeviceError` 的 feature）；`ImageSequencePresenter` 写出的文件与离屏目标的图像逐像素相同 |
 | scene、ScriptHost | 确定 | 手动 tick 的单元测试；`Deterministic` 模式下的时间线逐帧比对 |
 | asset | 半确定 | 用内存源做单元测试；`asset_probe` 读真实文件、测热重载与取消 |
-| gpu | 边界 | `gpu_probe`：选择后端、打印 `checkKernel` 的结果，提交并分别走 sync file 和 `Submission` 两条等待路径，打开计时器时按提交打印每次 dispatch 的耗时 |
+| gpu | 边界 | 单元测试用 eventfd 代替 sync file、用自定义的 `Submission::Completion` 代替还没完成的提交，分别覆盖两条等待路径；`gpu_probe`：选择后端、打印 `checkKernel` 的结果，在真实设备上提交并走 sync file 路径，打开计时器时按提交打印每次 dispatch 的耗时 |
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
-| present | 边界 | `present_probe`：每种 Presenter 显示测试图案 |
+| present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
 
 1. **M0** 工程骨架：CMake、presets、固定版本的依赖、install 与包配置、CI（llvmpipe 与 lavapipe 上跑 GPU 后端，覆盖没有 sync file 的等待路径）。
 2. **M1** 渲染核心：`RenderWorld` 增量、帧图、可见性缓冲管线的最小版本（GPU 剔除与间接 dispatch、两遍可见性缓冲、基础 PBR 着色、色调映射），在 cpu 后端上配合 `lrender_cli` 建立金标准测试。
 3. **M2** 参考路径追踪，作为画质参照；Vulkan、OpenGL、GLES 与 CPU 的等价测试；打开设备计时器，定下每张表的布局和编码。
-4. **M3** 完整的 Renderer 接口：渲染线程、GPU 线程、异步提交与 IO 上的完成等待、回读段、在途帧、多视图、缩放、设备丢失恢复、SDL 窗口目标；`lrender_view`。
+4. **M3** 完整的 Renderer 接口：渲染线程、GPU 线程、异步提交与 IO 上的完成等待、回读 buffer、在途帧、多视图、缩放、设备丢失恢复、SDL 窗口目标与图片序列；`lrender_view`。`gpu_probe` 和 `present_probe` 还没有写。
 5. **M4** 画质：阴影、透明、材质分类与间接着色、TAA、设备端纹理池（mip、流式写入）、一遍写入的可见性缓冲和子组变体。
 6. **M5** asset：流式加载、取消、热重载、KTX2 与按设备选择压缩格式，以及开发期的 kernel 重新加载。
 7. **M6** scene 与脚本：生命周期、确定性模式。

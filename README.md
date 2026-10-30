@@ -8,11 +8,11 @@
 
 ```sh
 sudo apt install ninja-build libclang-18-dev glslang-tools libvulkan-dev mesa-vulkan-drivers \
-                 libegl-dev libgles-dev
+                 libegl-dev libgles-dev libsdl2-dev
 cmake --workflow --preset debug        # 配置、构建、测试
 ```
 
-预设有 `debug`、`release`、`clang-debug` 和 `asan`。依赖（lexec、co2、stackfull、compute_shaders）按固定提交拉取。要改用本地的副本，在不纳入版本管理的 `CMakeUserPresets.json` 里设置 `FETCHCONTENT_SOURCE_DIR_<NAME>`：
+预设有 `debug`、`release`、`clang-debug` 和 `asan`。依赖（lexec、co2、stackfull、compute_shaders）按固定提交拉取。SDL2 用系统里安装的（`libsdl2-dev`），只有窗口上屏（`lr::present_sdl`）和 `lrender_view` 需要它；没装时这两个不构建，其余照常。要改用依赖库的本地副本，在不纳入版本管理的 `CMakeUserPresets.json` 里设置 `FETCHCONTENT_SOURCE_DIR_<NAME>`：
 
 ```json
 {
@@ -32,8 +32,18 @@ cmake --workflow --preset debug        # 配置、构建、测试
 ```sh
 ./build/debug/examples/lrender_cli --backend vulkan --size 960x540 --out demo.ppm
 ./build/debug/examples/lrender_cli --pipeline pathtrace --samples 256 --timers on --out reference.ppm
+./build/debug/examples/lrender_cli --pipeline pathtrace --samples 16 --sequence frames/   # frames/frame0.ppm …
 ```
 
-`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--timers on` 打印每个 pass 的设备耗时。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
+`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--sequence <目录>` 改为把每一帧写成 `<目录>/frame<帧号>.ppm`（目录要先存在）；`--timers on` 打印每个 pass 的设备耗时。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
 
-GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。
+在窗口里看演示场景：
+
+```sh
+./build/debug/examples/lrender_view --backend vulkan --size 1280x720
+SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # 不开窗口，跑 30 帧就退出
+```
+
+左键拖动绕场景旋转，滚轮缩放；Tab 在可见性缓冲和路径追踪两条管线之间切换（1、2 直接选），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。
+
+GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。SDL 的测试用 offscreen（或 dummy）视频驱动，不打开可见的窗口，SDL 启动不了时跳过。

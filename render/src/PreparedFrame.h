@@ -1,0 +1,41 @@
+#pragma once
+
+#include "FrameGraphImpl.h"
+#include "SceneUpdate.h"
+
+#include <lr/render/Renderer.h>
+
+#include <stackfull/sync/Completion.h>
+
+#include <chrono>
+#include <cstdint>
+#include <exception>
+#include <optional>
+#include <vector>
+
+namespace lr::render {
+
+struct PreparedView {
+    ViewId view;
+    RenderTargetId target;
+    std::optional<CompiledGraph> graph;
+    std::exception_ptr failure; // the graph could not be built
+};
+
+// A frame as the render thread hands it to the GPU thread.
+struct PreparedFrame {
+    std::uint64_t index = 0;
+    std::chrono::steady_clock::time_point submitted;
+    // The device generation the scene update was made for: one the GPU thread has
+    // replaced cannot apply it.
+    std::uint64_t deviceGeneration = 0;
+    // The frame failed before anything was made of it.
+    std::exception_ptr failure;
+    SceneUpdate scene;
+    std::vector<PreparedView> views;
+    std::vector<std::uint64_t> releasedHistories;
+    // What the frame's FrameSender waits for.
+    stackfull::sync::Completion<FrameResult> completion;
+};
+
+} // namespace lr::render

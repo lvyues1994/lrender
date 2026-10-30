@@ -2,9 +2,6 @@
 
 #include <lr/core/Primitives.h>
 
-#include <array>
-#include <cstdint>
-#include <fstream>
 #include <memory>
 
 namespace lr::examples {
@@ -75,20 +72,6 @@ DemoScene makeDemoScene() {
     scene.camera.position = core::vec3{0.0f, 2.2f, 5.5f};
     scene.camera.target = core::vec3{0.0f, 0.5f, 0.0f};
     return scene;
-}
-
-bool writePpm(render::ImageRgba8 const &image, std::string const &path) {
-    auto file = std::ofstream{path, std::ios::binary};
-    if (not file) {
-        return false;
-    }
-    file << "P6\n" << image.extent.x << " " << image.extent.y << "\n255\n";
-    for (auto const pixel : image.pixels) {
-        auto const rgb = std::array<char, 3>{static_cast<char>(pixel & 0xFFu), static_cast<char>((pixel >> 8u) & 0xFFu),
-                                             static_cast<char>((pixel >> 16u) & 0xFFu)};
-        file.write(rgb.data(), static_cast<std::streamsize>(rgb.size()));
-    }
-    return static_cast<bool>(file);
 }
 
 } // namespace lr::examples

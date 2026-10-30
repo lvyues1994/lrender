@@ -1,5 +1,7 @@
 #pragma once
 
+#include "RetireList.h"
+
 #include <lr/render/FrameGraph.h>
 
 #include <array>
@@ -43,6 +45,9 @@ struct FrameHistories {
     // At the end of `frame`: the ids no graph will use again, those replaced since the
     // last call and those of histories unused for too long or whose target is gone.
     std::vector<std::uint64_t> expire(std::uint64_t frame, std::function<bool(RenderTargetId)> const &targetExists);
+    // Every history starts over with new images, as after the device was lost; expire()
+    // releases the old ids.
+    void restart();
 
 private:
     struct Record {
@@ -65,7 +70,7 @@ private:
 // The GPU thread's history images, by FrameHistories id.
 struct HistoryResources {
     std::shared_ptr<void> acquire(std::uint64_t id, ResourceDesc const &desc, tc::Device &device);
-    void release(std::vector<std::uint64_t> const &ids);
+    void release(std::vector<std::uint64_t> const &ids, RetireList &retired);
     void clear() noexcept { resources.clear(); }
     std::size_t size() const noexcept { return resources.size(); }
 
@@ -164,8 +169,8 @@ struct RecordedDispatch {
     std::string program;
 };
 
-// One view's graph on the GPU thread: holds its resources from record() until finish(),
-// which must wait until the device has finished the frame.
+// One view's graph on the GPU thread: holds its resources from record() until finish() or
+// its destruction, which must both wait until the device has finished the frame.
 struct GraphRun {
     GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device);
     GraphRun(GraphRun &&) noexcept = default;

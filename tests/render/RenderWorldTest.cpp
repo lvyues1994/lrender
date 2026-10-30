@@ -101,4 +101,36 @@ TEST_CASE("a replaced mesh keeps its slot and gets new geometry") {
     CHECK(second.geometry[0].firstVertex >= 4);
 }
 
+TEST_CASE("a full update writes everything the world holds now, hierarchies included") {
+    auto world = render::RenderWorld{};
+    auto delta = oneQuad();
+    delta.instances.push_back({core::InstanceId{31}, core::MeshId{10}, core::MaterialId{20}, core::mat4{2.0f}});
+    delta.lights = {{core::LightId{40}, core::DirectionalLight{}}};
+    auto unused = render::SceneUpdate{};
+    world.keepHierarchies(unused);
+    world.apply(delta);
+    auto change = core::RenderWorldDelta{};
+    change.meshes = {{core::MeshId{10}, std::make_shared<core::MeshData const>(core::makeBox(core::vec3{1.0f}))}};
+    change.removed.instances = {core::InstanceId{30}};
+    auto const changed = world.apply(change);
+
+    auto const full = world.fullUpdate();
+
+    REQUIRE(full.geometry.size() == 1);
+    CHECK(full.geometry[0].firstVertex == changed.geometry[0].firstVertex);
+    CHECK(full.geometry[0].vertices.size() == changed.geometry[0].vertices.size());
+    REQUIRE(full.meshes.size() == 1);
+    CHECK(full.meshes[0].value.triangleCount == 12);
+    CHECK(full.materials.size() == 1);
+    REQUIRE(full.instances.size() == 1);
+    CHECK(full.instances[0].value.objectToWorld.value[0][0] == doctest::Approx(2.0f));
+    CHECK(full.instanceCount == 1);
+    CHECK(full.lights.size() == 1);
+    CHECK(full.lightCount == 1);
+    CHECK(full.blasRoots.size() == 1);
+    CHECK(full.blasTriangles.size() == 12);
+    CHECK(full.tlasNodeCount == 1);
+    CHECK(full.capacity.blasNodes >= full.blasNodes.size());
+}
+
 } // namespace

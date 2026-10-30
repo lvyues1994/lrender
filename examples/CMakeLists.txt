@@ -4,4 +4,9 @@ target_include_directories(lr_examples_common PUBLIC common/include)
 target_link_libraries(lr_examples_common PUBLIC lr::render PRIVATE lr_build_options)
 
 add_executable(lrender_cli cli/main.cpp)
-target_link_libraries(lrender_cli PRIVATE lr_examples_common lr_build_options)
+target_link_libraries(lrender_cli PRIVATE lr_examples_common lr::present_image lr_build_options)
+
+if(TARGET lr::present_sdl)
+    add_executable(lrender_view view/main.cpp)
+    target_link_libraries(lrender_view PRIVATE lr_examples_common lr::present_sdl lr_build_options)
+endif()
