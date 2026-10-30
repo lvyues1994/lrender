@@ -1,0 +1,30 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    strategy:
+      fail-fast: false
+      matrix:
+        preset: [debug, clang-debug, asan]
+    env:
+      # The GPU backends run on Mesa's software devices (llvmpipe, lavapipe); a backend
+      # that cannot start fails the tests instead of being skipped.
+      LRENDER_TEST_REQUIRE_GPU: 1
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install packages
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            ninja-build clang-18 libclang-18-dev glslang-tools \
+            libvulkan-dev mesa-vulkan-drivers \
+            libegl-dev libgles-dev libegl-mesa0 libgl1-mesa-dri
+
+      - name: Configure, build and test
+        run: cmake --workflow --preset ${{ matrix.preset }}

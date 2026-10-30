@@ -1,0 +1,3 @@
+# GPU drivers that the Vulkan and EGL loaders load while probing every installed driver
+# keep libdbus allocations for the life of the process.
+leak:libdbus-1.so

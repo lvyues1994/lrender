@@ -1,0 +1,90 @@
+{
+  "version": 6,
+  "cmakeMinimumRequired": {
+    "major": 3,
+    "minor": 25,
+    "patch": 0
+  },
+  "configurePresets": [
+    {
+      "name": "base",
+      "hidden": true,
+      "generator": "Ninja",
+      "binaryDir": "${sourceDir}/build/${presetName}",
+      "cacheVariables": {
+        "CMAKE_EXPORT_COMPILE_COMMANDS": true
+      }
+    },
+    {
+      "name": "debug",
+      "displayName": "Debug, GCC",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Debug"
+      }
+    },
+    {
+      "name": "release",
+      "displayName": "Release, GCC, without kernel reloading",
+      "inherits": "base",
+      "cacheVariables": {
+        "CMAKE_BUILD_TYPE": "Release",
+        "LRENDER_KERNEL_RELOAD": false
+      }
+    },
+    {
+      "name": "clang-debug",
+      "displayName": "Debug, Clang",
+      "inherits": "debug",
+      "cacheVariables": {
+        "CMAKE_CXX_COMPILER": "clang++"
+      }
+    },
+    {
+      "name": "asan",
+      "displayName": "Debug with AddressSanitizer and UndefinedBehaviorSanitizer",
+      "inherits": "debug",
+      "cacheVariables": {
+        "LRENDER_SANITIZE": "address,undefined"
+      }
+    }
+  ],
+  "buildPresets": [
+    {"name": "debug", "configurePreset": "debug"},
+    {"name": "release", "configurePreset": "release"},
+    {"name": "clang-debug", "configurePreset": "clang-debug"},
+    {"name": "asan", "configurePreset": "asan"}
+  ],
+  "testPresets": [
+    {"name": "debug", "configurePreset": "debug", "output": {"outputOnFailure": true}},
+    {"name": "release", "configurePreset": "release", "output": {"outputOnFailure": true}},
+    {"name": "clang-debug", "configurePreset": "clang-debug", "output": {"outputOnFailure": true}},
+    {"name": "asan", "configurePreset": "asan", "output": {"outputOnFailure": true}}
+  ],
+  "workflowPresets": [
+    {
+      "name": "debug",
+      "steps": [
+        {"type": "configure", "name": "debug"},
+        {"type": "build", "name": "debug"},
+        {"type": "test", "name": "debug"}
+      ]
+    },
+    {
+      "name": "clang-debug",
+      "steps": [
+        {"type": "configure", "name": "clang-debug"},
+        {"type": "build", "name": "clang-debug"},
+        {"type": "test", "name": "clang-debug"}
+      ]
+    },
+    {
+      "name": "asan",
+      "steps": [
+        {"type": "configure", "name": "asan"},
+        {"type": "build", "name": "asan"},
+        {"type": "test", "name": "asan"}
+      ]
+    }
+  ]
+}
