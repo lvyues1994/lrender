@@ -47,10 +47,20 @@ lr_add_test(lr_render_tests
             render/VisibilityPipelineTest.cpp render/PathTracePipelineTest.cpp render/RendererTest.cpp
             render/TextureTest.cpp render/ShadowTest.cpp render/TransparencyTest.cpp
             render/VariantTest.cpp render/MaterialModelTest.cpp render/TemporalTest.cpp
+            render/KernelReloadTest.cpp
     KERNELS render/TestKernels.h render/TestMaterialModels.h
     LIBRARIES lr::render tc_devices)
 # White-box tests of the render module's internals, and of its kernels' functions on the host.
 target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src" "${PROJECT_SOURCE_DIR}/render")
+target_compile_definitions(lr_render_tests PRIVATE LR_TEST_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/output")
+
+lr_add_test(lr_asset_tests
+    SOURCES asset/TestFiles.cpp asset/ImageLoadingTest.cpp asset/GltfLoadingTest.cpp asset/LoadSchedulingTest.cpp
+            asset/HotReloadTest.cpp asset/SceneRenderingTest.cpp
+    KERNELS render/TestKernels.h
+    LIBRARIES lr::asset lr::render tc_devices lr_third_party_stb stackfull::runtime)
+target_include_directories(lr_asset_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(lr_asset_tests PRIVATE LR_TEST_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/output")
 
 set(lr_present_test_sources present/ImageSequencePresenterTest.cpp)
 set(lr_present_test_libraries lr::present_image tc_devices)

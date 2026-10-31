@@ -25,13 +25,13 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 
 ### stackfull：IO 与等待
 
-- 资产加载器是按同步写法写的普通函数，运行在 stackfull 任务里。读文件交给 `stackfull::blocking()`，因为普通文件不支持 epoll。默认先把文件整个读进来，再用 `exec::await(schedule(background) | then(decode))` 转到后台池解码，做完再回来；任务 park 期间，worker 去跑别的加载任务。
-- 需要边读边解的解码器（通过回调取数据，比如 stb_image 的 IO 回调）直接在任务里运行，回调里读文件会让任务 park。挂起点位于第三方代码的调用栈深处，而这些代码不需要任何改造；无栈协程和 sender 都做不到这一点。
+- 资产加载器是按同步写法写的普通函数，运行在 stackfull 任务里。读文件交给 `stackfull::blocking()`，因为普通文件不支持 epoll。先把文件整个读进来，再用 `exec::await(schedule(background) | then(decode))` 转到后台池解码，做完再回来；任务 park 期间，worker 去跑别的加载任务。
+- cgltf 和 stb_image 都从内存解码，没有用它们读文件的回调。需要边读边解时，可以让解码器直接在任务里运行，回调里读文件会让任务 park；挂起点在第三方代码的调用栈深处，这些代码也不需要改造，无栈协程和 sender 都做不到这一点。
 - 加载任务在步骤之间检查 `exec::stop_requested()`，被取消的加载以 `set_stopped` 结束，脚本的销毁依赖这一点。
 - 等待 GPU 完成：tc 导出的 `SyncFence` 是一个可 poll 的 sync file，用 `io::Registration` 注册进 Poller，由一个任务等它变成可读；详见 gpu 模块。
-- 文件监听：inotify fd 同样注册进 Poller，由一个任务循环读取事件，不额外占用线程。资产热重载和开发期的 kernel 重新加载共用这个监听任务。
-- 同一资产的并发加载会去重：在途表里存放 `sync::Completion`，后来的请求方用 `exec::async_get` 直接拿到 sender，不再占用任务。
-- 加载接口对外暴露为 `exec::spawn(io, fn)`，它本身就是 sender。
+- 文件监听：inotify fd 同样注册进 Poller，由一个任务用 `exec::wait(exec::async_read(…))` 循环读取事件，不额外占用线程。资产热重载和 `lrender_view` 的 kernel 重新加载各用一个 `FileWatcher`。
+- 同一资产的并发加载会去重。`sync::Completion` 只有一个消费者（只记一个 `Waker`，`get()` 把结果移走），所以在途表里每个请求方有自己的 `Completion`，加载结束时每个都 `set` 一份结果；请求方的 sender 是 `exec::async_get(自己的 Completion)`，不占任务。
+- 加载任务是 `exec::spawn(io, fn)`，由 `AssetLibrary` 用 `lexec::spawn` 放进自己的 scope，它的停止令牌来自这次加载，而不是某个请求方；见 asset 模块。
 
 ### co2：逐帧推进的逻辑
 
@@ -93,7 +93,7 @@ runtime  → 只依赖 lexec 与 stackfull
 - 数学类型直接使用 tc 的 `vec`/`mat`，因为 kernel 只认得它们。`Transform`、`Aabb`、四元数也建立在它们之上，并且没有基类、运算符都按值返回。tc 转译器会把用户类型的运算符和函数模板转译成 GLSL，所以这些类型在 kernel 里同样能用。
 - 强类型 ID：`MeshId`、`TextureId`、`MaterialId`、`InstanceId`、`LightId`、`ViewId`、`RenderTargetId`，以及 scene 用的、带代数的 `EntityId { index, generation }`。
 - 数据词汇：`MeshData`、`ImageData`、`MaterialDesc`、`LightDesc`、`CameraDesc`、`RenderWorldDelta`。资产以 `MeshHandle`（即 `shared_ptr<MeshData const>`）和 `ImageHandle` 的形式流转。
-- `Result<T, E>` 使用 `tl::expected`。
+- 可恢复错误的结果用 `tl::expected`（asset 的 `AssetResult<T>`），core 自己不依赖它。
 
 ```cpp
 struct RenderWorldDelta {                    // 自上一帧以来的变化；没变的东西不出现
@@ -167,7 +167,7 @@ std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后�
 - **重建设备**：`recreateDevice` 在 GPU 线程上先销毁旧设备（tc 的 Vulkan 设备析构时会等它排队的工作，真正丢失的设备会立即返回），再按原来的配置创建新设备。`info()` 一直是第一个设备的信息，配置相同，设备也相同。
 - **同一个 fence 有两个使用者**：Android 零拷贝上屏时，`ASurfaceTransaction_setBuffer` 也要这个 fence，此时 `dup` 一份 fd 给 Presenter。
 - **计时**：完成之后回到 GPU 线程，用 `takeTimings(submitted.submission)` 取这一帧的设备耗时。这次提交已经完成，调用不会等待，也不会碰正在录制或执行的下一帧。
-- **开发期重新加载**：文件监听任务发现 `tc_generated/<target>/glsl` 有变化时，通过 `record` 在 GPU 线程上调用 `ProgramRegistry::instance().reloadFrom(dir)`，结果写进日志；下一次 `useKernel` 就换成新程序。发布构建关闭 `TC_PROGRAM_RELOAD`。
+- **开发期重新加载**：`Renderer::reloadKernels(dir)` 通过 `record` 在 GPU 线程上调用 `ProgramRegistry::instance().reloadFrom(dir)`，在它之前和之后提交的帧之间生效，以 tc 的报告完成（换掉的程序，被拒绝的程序和原因）；GPU 设备下一次 `useKernel` 就用新程序，接口变了的程序被拒绝，CPU 后端照旧运行编译进来的 C++。`builtInKernelDirectory()` 是 CMake 写进来的 lrender 自己的 `tc_generated/lr_render/glsl`，只在打开 `LRENDER_KERNEL_RELOAD`（也就是 `TC_PROGRAM_RELOAD`）的构建里有；发布预设关掉它，`reloadFrom` 不读磁盘，拒绝一切。`lrender_view` 在 GPU 后端上用 asset 的 `FileWatcher` 监听这个目录，变化停下 300 ms 之后重新加载一次，因为构建会给每个 kernel 写好几个文件。转译器不删掉改名之前的 kernel 留下的文件，`reloadFrom` 找不到对应的程序，就跳过它们。
 
 ### render：渲染核心
 
@@ -200,8 +200,11 @@ struct Renderer {
     // 立即返回，任意线程可调用。帧按调用顺序编号、依次处理，不管它的 sender 有没有启动；
     // sender 按同样的顺序在设备做完该帧之后完成，FrameResult 里带统计、墙钟时间和离屏目标的图像。
     virtual FrameSender submit(FrameDesc frame) = 0;
+    // 开发期：在 GPU 线程上从 tc_add_kernels 的 glsl 目录换上新程序，以 tc 的报告完成，见 gpu 的“开发期重新加载”。
+    virtual KernelReloadSender reloadKernels(std::string directory) = 0;
 };
 std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);   // 后端、Runtime、framesInFlight（默认 2）、变体开关
+std::optional<std::string> builtInKernelDirectory();                    // lrender 自己的 kernel 目录，只在开发构建里有
 
 struct RenderTargets {                                                       // 线程安全，改动从之后提交的帧起生效
     virtual ~RenderTargets() = default;
@@ -310,7 +313,7 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - compute 没有导数，`texture()` 只采第 0 层，所以着色时用射线微分算 LOD：像素右边和下边相邻像素中心的相机射线与三角形所在平面相交，求出那里的 UV，与本像素 UV 的距离取较大者就是足迹，LOD = log2(足迹 × 边长)，再用 `textureLod`（`Mip::Linear`）三线性采样。各向同性，斜看时偏模糊。
 - 新纹理流入池时，GPU 线程把数据拷进当前帧的暂存段（`createBuffer` 分配的映射内存，每个在途帧一段，第一次用到时才分配），再 `copyBufferToImage` 写进对应的层和 mip 级别；拷贝和前后的 dispatch 一样在设备时间线上排序。每段从录制第 k 帧时用到的是第 k - framesInFlight 帧用过的那一段，那一帧已经做完，主机写它不会和设备读冲突。每帧最多拷 `RendererConfig::textureStreamingBytes`（默认 8 MiB），按 mip 级别排队，一帧放不下的留到下一帧；`copyBufferToImage` 只能整级拷贝，所以比预算还大的单个级别独占一帧，暂存段为它临时变大。RGBA8 纹理的第 0 层到了，同一帧里接着用下采样 kernel 逐级生成其余各级（每次 dispatch 一层，因为 llvmpipe 的 `texelFetch` 在一次 dispatch 里层号不同时会读错层）。最后一级写完，纹理才算驻留，材质才引用它；之前材质只用因子。
 - 材质里的引用由 GPU 线程填：`SceneUpdate` 里的材质带着纹理 ID，`DeviceScene` 按 `TexturePool` 的驻留情况把它们换成引用，驻留情况一变就重写所有材质。替换一个纹理（同一个 ID 再 upsert）时，旧数据马上不再被引用，新数据写完之前只用因子。
-- 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。lavapipe 没有 ETC2，测试里这条路走解码。解码和重采样现在在渲染线程上做，大纹理多的场景应该挪到后台池。
+- 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。lavapipe 没有 ETC2，测试里这条路走解码。经 asset 加载的图片，压缩池放不下的已经在后台池上解成 RGBA8（见 asset 的“压缩格式”）；宿主直接交来的压缩图像仍在渲染线程上解码，重采样也在渲染线程上。
 - `RenderWorld` 只把图像句柄交给 GPU 线程，自己不留；`TexturePool` 写完最后一级就放掉它，纹理在整个系统里只有设备上这一份（宿主自己留的句柄除外）。设备丢失后，渲染线程在下一帧把放置过的所有纹理记为丢失，`FrameResult::lostTextures` 列出需要重新提交的 `TextureId`，在此之前材质只用因子；那一帧失败的话，由下一个成功的帧报告。用了 scene 和 asset 时，由它们自动重新加载并提交。
 
 #### 与 kernel 共享的数据
@@ -365,40 +368,58 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 ### asset：资产 IO 与解码（可选）
 
 ```cpp
-struct AssetSource {                    // 同步写法，只在 stackfull 任务里调用
+struct AssetSource {                    // 同步写法，只在加载任务里调用
     virtual ~AssetSource() = default;
     virtual AssetResult<Bytes> read(AssetPath const &path) = 0;
+    virtual std::optional<std::string> localFile(AssetPath const &path) const = 0;   // 热重载监听的本地文件
 };
-std::unique_ptr<AssetSource> makeFileSource(FileSourceConfig const &config);      // 内部 stackfull::blocking()
-std::unique_ptr<AssetSource> makeAndroidAssetSource(AAssetManager *manager);
-std::unique_ptr<AssetSource> makeMemorySource(MemorySourceConfig const &config);  // 测试用
+std::unique_ptr<AssetSource> makeFileSource(FileSourceConfig const &config);   // 在 stackfull::blocking() 里整个读
+std::unique_ptr<AssetSource> makeMemorySource(MemorySourceConfig config);      // 测试用
+std::unique_ptr<AssetSource> makeAndroidAssetSource(AAssetManager *manager);   // 只在 Android 上编译
 
+template <class T>
+using AssetResult = tl::expected<T, AssetError>;   // AssetError：kind（NotFound、ReadFailed、Corrupt、Unsupported、Failed）和 message
 template <class T>
 using LoadSender = lexec::any_sender_of<lexec::set_value_t(AssetResult<T>), lexec::set_stopped_t()>;
 
 struct AssetLibrary {
     virtual ~AssetLibrary() = default;
-    virtual LoadSender<MeshHandle> loadMesh(AssetPath const &path) = 0;
-    virtual LoadSender<ImageHandle> loadImage(AssetPath const &path) = 0;
-    virtual void drainChanges(std::vector<AssetChange> &out) = 0;   // 宿主每帧调用，用于热重载
+    virtual LoadSender<MeshHandle> loadMesh(AssetPath const &path) = 0;     // glTF 场景合并成一个网格，没有材质
+    virtual LoadSender<ImageHandle> loadImage(AssetPath const &path, ColorEncoding encoding) = 0;   // PNG、JPEG、KTX2
+    virtual LoadSender<SceneHandle> loadScene(AssetPath const &path) = 0;   // .gltf、.glb
+    virtual void drainChanges(std::vector<AssetChange> &changes) = 0;       // 宿主线程，不等待
+    virtual AssetLibraryStats stats() const noexcept = 0;
 };
-std::unique_ptr<AssetLibrary> makeAssetLibrary(AssetLibraryConfig const &config);  // source、io、后台池、poller
+std::unique_ptr<AssetLibrary> makeAssetLibrary(AssetLibraryConfig const &config);
+// config：source、runtime、compressedFormats（设备的 compressedArrayFormats）、preferKtx2、watchFiles
+
+SceneDelta sceneDelta(SceneData const &scene, IdAllocator &ids);   // 加入场景的增量，和移除它的 Removals
 ```
 
-加载函数运行在 stackfull 任务里：
+一次加载是 IO 调度器上的一个任务，步骤之间检查停止：
 
 ```cpp
-AssetResult<MeshHandle> loadMeshInTask(LoadContext const &context, AssetPath const &path) {
-    auto const bytes = context.source->read(path);
-    if (not bytes) return tl::make_unexpected(bytes.error());
-    if (stackfull::exec::stop_requested()) throw stackfull::exec::stopped_error{};
-    return stackfull::exec::await(lexec::schedule(context.background)
-                                  | lexec::then([&] { return decodeGltf(*bytes); }));
+AssetResult<ImageHandle> loadImageInTask(LoadContext const &context, AssetPath const &path,
+                                         ColorEncoding const encoding, std::vector<AssetPath> &files) {
+    auto const file = readImageFile(context, path);   // 阻塞池；可能换成 KTX2 变体
+    if (not file) return errorOf(file);
+    files.push_back(file->path);
+    auto image = onBackgroundPool(context, [&] { return decodeImage(ByteView::of(file->bytes), encoding, context.images); });
+    if (not image) return assetError(image.error().kind, file->path + ": " + image.error().message);
+    return std::make_shared<ImageData const>(std::move(*image));
 }
 ```
 
-- 监听任务把 `AssetChange` 写入 `sync::Channel`；`drainChanges` 在宿主线程上用 `tryRecv` 取出，不会阻塞。
-- 资产只产出句柄，把它们变成 `RenderWorldDelta` 里的条目是 scene 或宿主的事。
+- glTF：任务读 `.gltf` 或 `.glb`，后台池上 cgltf 解析 JSON；任务再按其中的 URI 读外部 buffer 和纹理用到的图片；最后回到后台池装上 buffer（data URI 在这里解码）、`cgltf_validate`，转出网格、材质、图片，展平节点。`loadMesh` 不读图片。
+- 去重：在途表按种类和路径（图片再加编码）索引。sender 启动时才加入或发起加载（`let_value(just(), …)`），每个请求方拿到自己的 `Completion`（见 stackfull）。加载结束就从表里拿掉，之后的请求重新读，没有缓存。
+- 取消：请求方的停止令牌一触发，它的 `async_get` 立即以 `set_stopped` 完成，加载的等待人数减一。还有人在等，加载照常进行；最后一个也停了，这次加载就被放弃，从表里退出，并请求它自己的 `inplace_stop_source`（经 `write_env` 交给 `exec::spawn`）。任务在下一次读或解码之前以 `stopped_error` 结束，排在后台池里还没开始的解码也不会运行（池在取出工作时检查停止令牌）。之后的同一请求发起新的加载。库析构时停止所有在途加载，还在等的请求方以 `set_stopped` 完成。
+- 错误：缺失、损坏、不支持都是 `AssetError` 值，走 `set_value`。任务里的异常（比如内存不足）和任务起不来也变成 `AssetErrorKind::Failed`，所以 `LoadSender` 没有 `set_error`。
+- glTF 2.0（cgltf）：每个 primitive 一个 `MeshData`（三角形、带和扇；没有法线时按规范生成平面法线，每个三角形用自己的角）；metallic-roughness 的因子和四张纹理、`normalScale`、alpha 模式和阈值、双面、`KHR_materials_emissive_strength`、`KHR_texture_transform`（材质只有一个 UV 变换，取第一张带变换的纹理的）；节点层级展平成世界空间的实例；`KHR_lights_punctual` 的方向光和点光源（聚光灯当点光源）；透视相机。没有加载或只是近似的内容记在 `SceneData::warnings` 里。材质里的 `TextureId` 是 `SceneData::textures` 的下标，同一张图片既当颜色又当数据时是两张纹理。
+- 图片：PNG、JPEG 用 stb_image 解成 RGBA8。编码由用途决定：基础色、自发光是 sRGB，法线、metallic-roughness 是线性，KTX2 格式名里的 SRGB/UNORM 不算数。KTX2 自己解析（头、level index，vkFormat 映射到 RGBA8 或 `tc::CompressedFormat`），只读二维、单层、单面的文件；BasisLZ、Zstandard、ZLIB 超压缩和 Basis Universal 返回 `Unsupported`。
+- 压缩格式：KTX2 的块在 render 的 `TextureLayout` 会原样放进压缩池时（格式在 `compressedFormats` 里、正方形、2 的幂、完整 mip 链）原样交出，否则在后台池上用 `tc::decodeCompressed` 解成 RGBA8 的各级，渲染器拿到的总是它能直接用的。`preferKtx2` 打开时，请求 `name.png` 先读 `name.ktx2`：块会被保留就用它，否则用 `name.png`，只有 `name.png` 不存在才解码 KTX2。直接请求 `name.ktx2` 不找别的文件。
+- 场景到增量：`sceneDelta` 是纯函数，id 由调用方的 `IdAllocator` 给（`makeSequentialIds` 是最简单的一种）；资产只产出句柄，id 归宿主或 scene。返回的 `removal` 移除这次加入的一切，热重载时放进下一帧增量的 `removed`，新场景用新的 id 一起加入。
+- 热重载：`FileWatcher` 是一个 inotify fd（`IN_NONBLOCK | IN_CLOEXEC`），由一个 IO 任务读，事件变成 `FileChange`（Created、Modified、Removed、Overflow）进 `sync::Channel`，`drainChanges` 在宿主线程上 `tryRecv`，队列满了任务就停在发送上，事件留在内核里。它监听目录而不是文件，因为编辑器常常写临时文件再改名过来。`watchFiles` 打开时，加载任务在交出结果之前监听它读过的本地文件所在的目录，并记下文件属于哪些资产；`AssetLibrary::drainChanges` 把 Modified（写完关闭，或改名进来）换成要重新加载的资产，Overflow 报告全部。`FileWatcher` 也能单独用。
+- `stats()`：加载次数、加入在途加载的请求数、读次数、后台解码步数、停止的加载数，测试靠它确认“只读一次”“没有解码”。
 
 ### scene：世界模型与脚本（可选）
 
@@ -446,7 +467,7 @@ CO2_END
 
 ### examples：组合根
 
-`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 和 asset 还没有，目前显示演示场景；TAA 默认打开，T 键开关）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口；`--taa` 打开 TAA，默认关）。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
+`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 还没有；TAA 默认打开，T 键开关）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口；`--taa` 打开 TAA，默认关）。两者默认显示演示场景，`--gltf <文件>` 改为经 `AssetLibrary` 加载的 glTF 场景：有相机就用文件里的第一个，否则按包围盒取景；再加一个天空，文件里没有灯时加一个太阳。`lrender_view` 在场景的文件变了时重新加载，用上一份的 `removal` 换掉旧场景，开发构建的 GPU 后端上还会重新加载 kernel。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
 
 ```cpp
 for (;;) {
@@ -498,7 +519,7 @@ IO       │          等 N 完成 ───────────────
 ## 跨模块约定
 
 - 错误：
-  - 可恢复的情况（资产缺失、解码失败）作为值返回（`AssetResult<T>`），走 `set_value`。
+  - 可恢复的情况（资产缺失、解码失败）作为值返回（`AssetResult<T>`，`AssetError` 带种类和消息），走 `set_value`；停止的请求走 `set_stopped`。
   - 设备错误（`tc::DeviceError`）是异常，可能出现在录制、提交、等待完成或收尾时。GPU 线程收到后让出错的帧和所有在途帧以这个错误完成，先放掉旧设备上建的一切（帧图资源、资源池、历史图像、`DeviceScene`、退役列表），再 `recreateDevice`，最后把设备代数加一。等待完成失败也按设备丢失处理，因为那时不知道设备还用不用这一帧的资源。
   - 每一帧在渲染线程上准备时记下当时的设备代数。代数已经过时的帧（设备重建之前准备好的）不再录制，同样以那个错误完成；渲染线程发现代数变了，下一帧用 `RenderWorld::fullUpdate()` 从网格句柄重新编码整个场景（几何、各个槽、要追踪光线时重建 BVH），并让所有历史资源从头开始。这一帧之后的帧照常渲染。纹理的像素不在渲染线程上，没法重新上传：这一帧把放置过的纹理记为丢失，在 `FrameResult::lostTextures` 里列出，宿主重新 upsert 之前材质只用因子；宿主也可以选择换成 `cpu` 后端。新设备建不出来时，下一帧再试一次，还不行就以那个原因失败。
   - 测试里用一个录制时抛 `tc::DeviceError` 的 feature 模拟设备丢失。
@@ -537,8 +558,8 @@ IO       │          等 N 完成 ───────────────
 ```
 lrender/
   CMakeLists.txt  CMakePresets.json
-  cmake/LrDependencies.cmake FetchContent，固定提交：lexec、co2、stackfull、compute_shaders
-                             （以后还有 cgltf、stb、tl-expected）；doctest 在 tests/ 里拉取；
+  cmake/LrDependencies.cmake FetchContent，固定提交：lexec、co2、stackfull、compute_shaders，
+                             以及 tl-expected、cgltf、stb（提交的源码包加哈希）；doctest 在 tests/ 里拉取；
                              SDL2 用系统里的（find_package(SDL2 CONFIG)），找不到就不构建
                              lr::present_sdl 和 lrender_view
   core/      include/lr/core/                     lr::core     INTERFACE
@@ -546,7 +567,7 @@ lrender/
   gpu/       include/lr/gpu/       src/           lr::gpu      tc、tc_devices、stackfull::exec、stackfull::runtime
   render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)；include/lr/render/kernels/ 是用户 kernel 也要用的公开 kernel 头文件
   present/   image_sequence/  sdl/  （android/）  lr::present_image  lr::present_sdl  （lr::present_android）
-  asset/     include/lr/asset/     src/           lr::asset    stackfull::exec、cgltf、stb
+  asset/     include/lr/asset/     src/           lr::asset    lr::core、lr::runtime、tl::expected；私有 cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    co2、lexec 的 co2 桥
   examples/  view/  cli/                          lrender_view  lrender_cli
   probes/    gpu_probe  present_probe  asset_probe  layout_probe
@@ -567,7 +588,7 @@ lrender/
 | render kernel | 确定 | CPU 后端的金标准图像，加上跨后端等价测试；子组和 64 位原子的变体与回退变体在同一个设备上互相比对（三角形、深度、可见实例列表、图像逐位相同）；自定义材质模型只改变自己的像素；TAA 与主机上的模拟和解析覆盖率比对，并测拖影、运动矢量和历史的重置；设备图像没有读回接口，纹理池的内容由着色 kernel 采样（自发光纹理贴满一个四边形，像素中心对准纹素中心），再用读 HDR 颜色的 feature 读进 buffer 比对；阴影、透明、环境光的镜面部分、法线贴图与路径追踪器或解析结果比对 |
 | Renderer 整体 | 确定 | cpu 后端，以及 llvmpipe、lavapipe 上的 GPU 后端（没有 sync file，走 `Submission` 的等待路径）：连续提交的帧按序完成、累积结果与逐帧提交相同、在途帧不超过上限（用一个数录制而未收尾帧数的 feature）、多视图、窗口目标交给测试用的 Presenter、缩放、设备丢失恢复（用一个录制时抛 `tc::DeviceError` 的 feature）；`ImageSequencePresenter` 写出的文件与离屏目标的图像逐像素相同 |
 | scene、ScriptHost | 确定 | 手动 tick 的单元测试；`Deterministic` 模式下的时间线逐帧比对 |
-| asset | 半确定 | 用内存源做单元测试；`asset_probe` 读真实文件、测热重载与取消 |
+| asset | 半确定 | 测试自己生成 glTF（内嵌、外部文件、.glb）、PNG、JPEG、KTX2；用一个计数、能扣住读取的测试源测去重、加载重叠和取消；热重载在构建目录下改真实文件，轮询 `drainChanges`；加载的场景经 `sceneDelta` 交给 Renderer，与解析结果和 CPU 后端比对；kernel 重新加载用改过注释的生成目录，前后两帧逐位相同 |
 | gpu | 边界 | 单元测试用 eventfd 代替 sync file、用自定义的 `Submission::Completion` 代替还没完成的提交，分别覆盖两条等待路径；`gpu_probe`：选择后端、打印 `checkKernel` 的结果，在真实设备上提交并走 sync file 路径，打开计时器时按提交打印每次 dispatch 的耗时 |
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
 | present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
@@ -577,6 +598,6 @@ lrender/
 3. **M2** 参考路径追踪，作为画质参照；Vulkan、OpenGL、GLES 与 CPU 的等价测试；打开设备计时器，定下每张表的布局和编码。
 4. **M3** 完整的 Renderer 接口：渲染线程、GPU 线程、异步提交与 IO 上的完成等待、回读 buffer、在途帧、多视图、缩放、设备丢失恢复、SDL 窗口目标与图片序列；`lrender_view`。`gpu_probe` 和 `present_probe` 还没有写。
 5. **M4** 画质。M4a：设备端纹理池（mip、流式写入、压缩格式与解码回退、设备丢失后列出丢失的纹理）、带纹理的材质（法线贴图、UV 变换、alpha 遮罩）、级联阴影、逐像素链表的顺序无关透明、均匀环境光的镜面部分；路径追踪器同样采样纹理，混合材质按随机不透明处理。M4b：启动时的 kernel 检查与变体选择、一遍写入的可见性缓冲和子组变体、材质分类与间接着色（应用可以加自己的材质模型）、TAA。
-6. **M5** asset：流式加载、取消、热重载、KTX2 与按设备选择压缩格式，以及开发期的 kernel 重新加载。
+6. **M5** asset：流式加载、取消、热重载、KTX2 与按设备选择压缩格式，以及开发期的 kernel 重新加载；`lrender_cli` 和 `lrender_view` 的 `--gltf`。`asset_probe` 还没有写。
 7. **M6** scene 与脚本：生命周期、确定性模式。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。

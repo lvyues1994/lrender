@@ -179,6 +179,28 @@ TEST_CASE("a directional light lights a plane as the BRDF says") {
     }
 }
 
+// A negative scale reverses the winding of the instance's triangles: the visible side
+// must stay visible and keep its outward normal, as glTF requires for mirrored nodes.
+TEST_CASE("a mirrored instance keeps its front faces and its normals") {
+    auto harness = RenderHarness{};
+    auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});
+    auto sun = core::DirectionalLight{};
+    sun.illuminance = 1.0f;
+    auto delta = litPlane(sun);
+    auto mirror = core::Transform{};
+    mirror.scale = core::vec3{-1.0f, 1.0f, 1.0f};
+    delta.instances[0].objectToWorld = core::matrixOf(mirror);
+
+    auto const result = harness.render(frameOf(std::move(delta), test::viewOf(target, overheadCamera())));
+
+    auto const expected = test::srgb8(straightDownRadiance(0.5f, 1.0f));
+    auto const centre = test::pixelAt(*result.views[0].image, kSize / 2, kSize / 2);
+    for (auto c = 0u; c < 3u; ++c) {
+        CHECK(test::channel(centre, c) >= expected - 1);
+        CHECK(test::channel(centre, c) <= expected + 1);
+    }
+}
+
 TEST_CASE("a point light falls off with the square of the distance") {
     auto harness = RenderHarness{};
     auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});

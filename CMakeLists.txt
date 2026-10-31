@@ -27,6 +27,7 @@ add_subdirectory(core)
 add_subdirectory(gpu)
 add_subdirectory(render)
 add_subdirectory(present)
+add_subdirectory(asset)
 
 if(LRENDER_BUILD_EXAMPLES)
     add_subdirectory(examples)

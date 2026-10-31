@@ -300,7 +300,7 @@ inline bool covers(float weight, vec2 from, vec2 to, bool topLeft) {
     }                                                                                                                  \
                                                                                                                        \
     void rasterize(RasterVertex first, RasterVertex second, RasterVertex third, uint triangle, bool doubleSided,       \
-                   GpuMaterial material) {                                                                             \
+                   bool mirrored, GpuMaterial material) {                                                              \
         RasterVertex va = first;                                                                                       \
         RasterVertex vb = second;                                                                                      \
         RasterVertex vc = third;                                                                                       \
@@ -308,8 +308,10 @@ inline bool covers(float weight, vec2 from, vec2 to, bool topLeft) {
         vec3 b = toScreen(vb.clip);                                                                                    \
         vec3 c = toScreen(vc.clip);                                                                                    \
         float area = (b.x - a.x) * (c.y - a.y) - (b.y - a.y) * (c.x - a.x);                                            \
-        /* Rows run downwards, so a front face (counter-clockwise in clip space) has negative area. */                \
-        if (area == 0.0f or (area > 0.0f and not doubleSided)) {                                                       \
+        /* Rows run downwards, so a front face (counter-clockwise in clip space) has negative area, unless the     \
+           instance's transform mirrors, which reverses the winding. */                                               \
+        float facing = mirrored ? -area : area;                                                                        \
+        if (area == 0.0f or (facing > 0.0f and not doubleSided)) {                                                     \
             return;                                                                                                    \
         }                                                                                                              \
         if (area < 0.0f) {                                                                                             \
@@ -353,7 +355,9 @@ inline bool covers(float weight, vec2 from, vec2 to, bool topLeft) {
         uint instance = entry.x;                                                                                       \
         GpuMaterial material = materials[instances[instance].material];                                                \
         bool doubleSided = (material.flags & materialDoubleSided()) != 0u;                                             \
-        mat4 toClip = viewProjection.value * instances[instance].objectToWorld.value;                                  \
+        mat4 objectToWorld = instances[instance].objectToWorld.value;                                                  \
+        bool mirrored = determinant(mat3(objectToWorld)) < 0.0f;                                                       \
+        mat4 toClip = viewProjection.value * objectToWorld;                                                            \
         uint first = entry.z + 3u * (triangle - entry.y);                                                              \
         std::array<RasterVertex, 3> corners;                                                                           \
         for (uint k = 0u; k < 3u; ++k) {                                                                               \
@@ -377,7 +381,7 @@ inline bool covers(float weight, vec2 from, vec2 to, bool topLeft) {
             }                                                                                                          \
         }                                                                                                              \
         for (uint k = 2u; k < count; ++k) {                                                                            \
-            rasterize(polygon[0], polygon[k - 1u], polygon[k], triangle, doubleSided, material);                       \
+            rasterize(polygon[0], polygon[k - 1u], polygon[k], triangle, doubleSided, mirrored, material);             \
         }                                                                                                              \
     }
 

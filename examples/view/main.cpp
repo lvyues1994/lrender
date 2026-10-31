@@ -1,19 +1,26 @@
-// lrender_view: shows the demo scene in an SDL window.
+// lrender_view: shows the demo scene, or a glTF file's, in an SDL window.
 //
 //   lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
-//                [--pipeline visibility|pathtrace] [--frames <n>]
+//                [--pipeline visibility|pathtrace] [--frames <n>] [--gltf <file>]
 //
 // Drag with the left mouse button to orbit and scroll to zoom. Tab switches between the
 // visibility and the path tracing pipelines (1 and 2 pick one); T turns the visibility
 // pipeline's temporal anti-aliasing off and on (on to begin with); Esc or Q quits. With
 // --frames it quits after that many frames, for runs nobody watches
-// (SDL_VIDEODRIVER=offscreen).
+// (SDL_VIDEODRIVER=offscreen). A --gltf scene is loaded again when its files change;
+// development builds on a GPU backend also reload lrender's kernels when the build
+// rewrites them.
 
 #define SDL_MAIN_HANDLED
 #include <SDL.h>
 
+#include <lr/asset/AssetLibrary.h>
+#include <lr/asset/AssetSource.h>
+#include <lr/asset/FileWatcher.h>
+#include <lr/asset/SceneDelta.h>
 #include <lr/examples/CommandLine.h>
 #include <lr/examples/DemoScene.h>
+#include <lr/examples/GltfScene.h>
 #include <lr/present/SdlPresenter.h>
 #include <lr/render/Renderer.h>
 #include <lr/runtime/Runtime.h>
@@ -48,10 +55,13 @@ struct Options {
     ivec2 size{960, 540};
     bool pathTrace = false;
     std::uint32_t frames = 0; // 0: until the window is closed
+    std::string gltf;
 };
 
 bool apply(Options &options, std::string const &flag, std::string const &value) {
-    if (flag == "--backend") {
+    if (flag == "--gltf") {
+        options.gltf = value;
+    } else if (flag == "--backend") {
         options.backend = value;
     } else if (flag == "--device") {
         options.device = value;
@@ -235,6 +245,124 @@ struct LoopResult {
     std::uint64_t shown = 0;
 };
 
+using Clock = std::chrono::steady_clock;
+
+// The build writes several files for each kernel; they are reloaded once it has been
+// quiet this long.
+constexpr auto kKernelsQuiet = std::chrono::milliseconds{300};
+
+// A --gltf scene, loaded again when the asset library reports that one of its files changed.
+struct SceneReloads {
+    lr::asset::AssetLibrary *assets = nullptr; // null without --gltf
+    std::string path;
+    lr::asset::IdAllocator *ids = nullptr;
+    lr::core::Removals shown; // removes the scene now in the world
+    bool loading = false;
+    std::vector<lr::asset::AssetChange> changes;
+    std::mutex mutex; // guards `arrived`, which an IO worker fills
+    std::optional<lr::asset::AssetResult<lr::asset::SceneHandle>> arrived;
+};
+
+void watchScene(SceneReloads &reloads, lexec::counting_scope &scope) {
+    if (reloads.assets == nullptr or reloads.loading) {
+        return;
+    }
+    reloads.assets->drainChanges(reloads.changes);
+    if (reloads.changes.empty()) {
+        return;
+    }
+    reloads.loading = true;
+    lexec::spawn(reloads.assets->loadScene(reloads.path)
+                     | lexec::then([&reloads](lr::asset::AssetResult<lr::asset::SceneHandle> scene) noexcept {
+                           auto const lock = std::lock_guard<std::mutex>{reloads.mutex};
+                           reloads.arrived = std::move(scene);
+                       }),
+                 scope.get_token());
+}
+
+// The change that swaps the scene in the world for the one just loaded, if one was.
+std::optional<lr::core::RenderWorldDelta> reloadedScene(SceneReloads &reloads) {
+    auto arrived = std::optional<lr::asset::AssetResult<lr::asset::SceneHandle>>{};
+    {
+        auto const lock = std::lock_guard<std::mutex>{reloads.mutex};
+        arrived = std::exchange(reloads.arrived, std::nullopt);
+    }
+    if (not arrived) {
+        return std::nullopt;
+    }
+    reloads.loading = false;
+    if (not *arrived) {
+        std::fprintf(stderr, "reloading %s: %s\n", reloads.path.c_str(), arrived->error().message.c_str());
+        return std::nullopt;
+    }
+    auto scene = lr::examples::viewableScene(***arrived, *reloads.ids);
+    scene.delta.removed = std::exchange(reloads.shown, scene.removal);
+    std::printf("reloaded %s\n", reloads.path.c_str());
+    return std::move(scene.delta);
+}
+
+// lrender's kernels, reloaded on GPU backends of development builds when the build
+// rewrites them.
+struct KernelReloads {
+    std::unique_ptr<lr::asset::FileWatcher> watcher; // null where kernels are not reloaded
+    std::string directory;
+    std::optional<Clock::time_point> changedAt;
+    std::vector<lr::asset::FileChange> changes;
+};
+
+KernelReloads kernelReloadsFor(lr::render::Renderer &renderer, lr::runtime::Runtime &runtime) {
+    auto reloads = KernelReloads{};
+    auto const directory = lr::render::builtInKernelDirectory();
+    if (not directory or renderer.deviceInfo().backend == "cpu") {
+        return reloads;
+    }
+    auto config = lr::asset::FileWatcherConfig{};
+    config.runtime = &runtime;
+    reloads.watcher = lr::asset::makeFileWatcher(config);
+    if (auto const error = reloads.watcher->watchDirectory(*directory)) {
+        std::fprintf(stderr, "cannot watch %s: %s\n", directory->c_str(), error.message().c_str());
+        reloads.watcher.reset();
+        return reloads;
+    }
+    reloads.directory = *directory;
+    std::printf("kernels reload from %s when the build rewrites them\n", directory->c_str());
+    return reloads;
+}
+
+void printReport(tc::ReloadReport const &report) noexcept {
+    std::printf("reloaded %zu kernels\n", report.reloaded.size());
+    for (auto const &rejection : report.rejected) {
+        std::fprintf(stderr, "kernel %s not reloaded: %s\n", rejection.program.c_str(), rejection.reason.c_str());
+    }
+}
+
+void watchKernels(KernelReloads &reloads, lr::render::Renderer &renderer, lexec::counting_scope &scope) {
+    if (reloads.watcher == nullptr) {
+        return;
+    }
+    reloads.watcher->drainChanges(reloads.changes);
+    if (std::any_of(reloads.changes.begin(), reloads.changes.end(), [](lr::asset::FileChange const &change) {
+            return change.kind == lr::asset::FileChangeKind::Modified;
+        })) {
+        reloads.changedAt = Clock::now();
+    }
+    if (not reloads.changedAt or Clock::now() - *reloads.changedAt < kKernelsQuiet) {
+        return;
+    }
+    reloads.changedAt.reset();
+    lexec::spawn(renderer.reloadKernels(reloads.directory)
+                     | lexec::then([](tc::ReloadReport const &report) noexcept { printReport(report); })
+                     | lexec::upon_error([](std::exception_ptr const &) noexcept {
+                           std::fprintf(stderr, "reloading the kernels failed\n");
+                       }),
+                 scope.get_token());
+}
+
+struct Reloads {
+    SceneReloads &scene;
+    KernelReloads &kernels;
+};
+
 void submitFrame(Session const &session, ViewerInput const &input, lr::core::RenderWorldDelta delta,
                  FrameReports &reports, lexec::counting_scope &scope) {
     auto &pipelines = session.renderer.pipelines();
@@ -262,11 +390,13 @@ void showStatus(Session const &session, ViewerInput const &input, FrameReports c
 // Keeps at most kFramesInFlight frames outstanding and shows the newest each turn, never
 // waiting for a frame.
 LoopResult runLoop(Session const &session, Options const &options, lr::core::RenderWorldDelta scene,
-                   FrameReports &reports, lexec::counting_scope &scope) {
+                   Reloads const &reloads, FrameReports &reports, lexec::counting_scope &scope) {
     auto input = ViewerInput{orbitOf(session.camera), options.pathTrace, true, false, false};
     auto result = LoopResult{};
     auto delta = std::move(scene);
     while (not input.quit and not reports.firstFailure()) {
+        watchScene(reloads.scene, scope);
+        watchKernels(reloads.kernels, session.renderer, scope);
         auto event = SDL_Event{};
         while (SDL_PollEvent(&event) != 0) {
             handle(event, input);
@@ -281,6 +411,9 @@ LoopResult runLoop(Session const &session, Options const &options, lr::core::Ren
         }
         auto const wanted = options.frames == 0 or result.submitted < options.frames;
         auto const submitting = wanted and result.submitted - finished < kFramesInFlight;
+        if (submitting and result.submitted != 0) {
+            delta = reloadedScene(reloads.scene).value_or(lr::core::RenderWorldDelta{});
+        }
         if (submitting) {
             submitFrame(session, input, std::move(delta), reports, scope);
             delta = lr::core::RenderWorldDelta{};
@@ -319,7 +452,25 @@ int run(Options const &options) {
     std::printf("backend %s: %s; SDL %s on %s\n", renderer->deviceInfo().backend.c_str(),
                 renderer->deviceInfo().deviceName.c_str(), sdlInfo.name, SDL_GetCurrentVideoDriver());
 
+    auto const source = lr::asset::makeFileSource(lr::asset::FileSourceConfig{});
+    auto assetConfig = lr::asset::AssetLibraryConfig{};
+    assetConfig.source = source.get();
+    assetConfig.runtime = runtime.get();
+    assetConfig.compressedFormats = renderer->deviceInfo().limits.compressedArrayFormats;
+    assetConfig.watchFiles = true;
+    auto const assets = options.gltf.empty() ? nullptr : lr::asset::makeAssetLibrary(assetConfig);
+    auto const ids = lr::asset::makeSequentialIds();
+    auto sceneReloads = SceneReloads{};
     auto scene = lr::examples::makeDemoScene();
+    if (assets != nullptr) {
+        auto loaded = lr::examples::viewableScene(*lr::examples::loadSceneNow(*assets, options.gltf), *ids);
+        scene = lr::examples::DemoScene{std::move(loaded.delta), loaded.camera};
+        sceneReloads.assets = assets.get();
+        sceneReloads.path = options.gltf;
+        sceneReloads.ids = ids.get();
+        sceneReloads.shown = std::move(loaded.removal);
+    }
+    auto kernelReloads = kernelReloadsFor(*renderer, *runtime);
     auto const target = renderer->targets().createWindow(
         lr::render::WindowTargetDesc{outputSize(sdlRenderer.get()), presenter});
     auto const session = Session{*renderer, *presenter, window.get(), sdlRenderer.get(), target, scene.camera};
@@ -329,7 +480,7 @@ int run(Options const &options) {
     auto loop = LoopResult{};
     auto failure = std::exception_ptr{};
     try {
-        loop = runLoop(session, options, std::move(scene.delta), reports, scope);
+        loop = runLoop(session, options, std::move(scene.delta), Reloads{sceneReloads, kernelReloads}, reports, scope);
     } catch (...) {
         failure = std::current_exception();
     }
@@ -359,7 +510,7 @@ int main(int argc, char **argv) {
     if (not options) {
         std::fprintf(stderr, "usage: lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
-                             "                    [--pipeline visibility|pathtrace] [--frames <n>]\n");
+                             "                    [--pipeline visibility|pathtrace] [--frames <n>] [--gltf <file>]\n");
         return 2;
     }
     try {

@@ -1,16 +1,21 @@
-// lrender_cli: renders the demo scene offline and writes it to a PPM file.
+// lrender_cli: renders the demo scene, or a glTF file's, offline and writes it to a PPM file.
 //
 //   lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
 //               [--pipeline visibility|pathtrace] [--taa] [--samples <n>] [--timers on|off]
-//               [--out <file> | --sequence <directory>]
+//               [--gltf <file>] [--out <file> | --sequence <directory>]
 //
 // The path tracer renders --samples frames, one sample per pixel each, and writes the last
 // to --out; with --sequence every frame goes to <directory>/frame<index>.ppm instead.
 // --taa turns on the visibility pipeline's temporal anti-aliasing, which then renders
-// --samples frames (16 unless given) of the still scene.
+// --samples frames (16 unless given) of the still scene. --gltf renders the file's default
+// scene through its first camera, or a camera that frames it.
 
+#include <lr/asset/AssetLibrary.h>
+#include <lr/asset/AssetSource.h>
+#include <lr/asset/SceneDelta.h>
 #include <lr/examples/CommandLine.h>
 #include <lr/examples/DemoScene.h>
+#include <lr/examples/GltfScene.h>
 #include <lr/present/ImageSequencePresenter.h>
 #include <lr/present/Ppm.h>
 #include <lr/render/Renderer.h>
@@ -39,6 +44,7 @@ struct Options {
     bool taa = false;
     std::optional<std::uint32_t> samples;
     bool timers = false;
+    std::string gltf;
     std::string out = "lrender.ppm";
     std::string sequence; // a directory: every frame through a window target
 };
@@ -69,6 +75,8 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
     } else if (flag == "--timers") {
         options.timers = value == "on";
         return value == "on" or value == "off";
+    } else if (flag == "--gltf") {
+        options.gltf = value;
     } else if (flag == "--out") {
         options.out = value;
     } else if (flag == "--sequence") {
@@ -136,6 +144,29 @@ bool writeOutput(Options const &options, lr::render::ViewResult const &view,
     return view.image and lr::present::writePpm(lr::render::imageView(*view.image), options.out);
 }
 
+// The demo scene, or the glTF file's through an asset library with the device's formats.
+lr::examples::DemoScene sceneOf(Options const &options, lr::render::Renderer &renderer, lr::runtime::Runtime &runtime) {
+    if (options.gltf.empty()) {
+        return lr::examples::makeDemoScene();
+    }
+    auto const source = lr::asset::makeFileSource(lr::asset::FileSourceConfig{});
+    auto config = lr::asset::AssetLibraryConfig{};
+    config.source = source.get();
+    config.runtime = &runtime;
+    config.compressedFormats = renderer.deviceInfo().limits.compressedArrayFormats;
+    auto const assets = lr::asset::makeAssetLibrary(config);
+    auto const loaded = lr::examples::loadSceneNow(*assets, options.gltf);
+    for (auto const &warning : loaded->warnings) {
+        std::fprintf(stderr, "%s: %s\n", options.gltf.c_str(), warning.c_str());
+    }
+    std::printf("%s: %zu meshes, %zu instances, %zu materials, %zu textures, %zu lights, %zu cameras\n",
+                options.gltf.c_str(), loaded->meshes.size(), loaded->instances.size(), loaded->materials.size(),
+                loaded->textures.size(), loaded->lights.size(), loaded->cameras.size());
+    auto const ids = lr::asset::makeSequentialIds();
+    auto scene = lr::examples::viewableScene(*loaded, *ids);
+    return lr::examples::DemoScene{std::move(scene.delta), scene.camera};
+}
+
 int run(Options const &options) {
     auto runtime = lr::runtime::makeRuntime(lr::runtime::RuntimeConfig{});
     auto const sequence = sequenceOf(options, *runtime);
@@ -150,7 +181,7 @@ int run(Options const &options) {
                 renderer->deviceInfo().deviceName.c_str(), capabilities.subgroups ? "on" : "off",
                 capabilities.singlePassVisibility ? "on" : "off");
 
-    auto scene = lr::examples::makeDemoScene();
+    auto scene = sceneOf(options, *renderer, *runtime);
     auto view = lr::render::ViewDesc{};
     view.id = lr::core::ViewId{0};
     view.target = targetOf(*renderer, options, sequence);
@@ -199,7 +230,7 @@ int main(int argc, char **argv) {
                              "[--size <w>x<h>]\n"
                              "                   [--pipeline visibility|pathtrace] [--taa] [--samples <n>] "
                              "[--timers on|off]\n"
-                             "                   [--out <file> | --sequence <directory>]\n");
+                             "                   [--gltf <file>] [--out <file> | --sequence <directory>]\n");
         return 2;
     }
     try {

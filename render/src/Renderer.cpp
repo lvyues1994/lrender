@@ -361,6 +361,12 @@ struct RendererImpl final : Renderer {
                            | lexec::let_error([](auto &error) { return lexec::just_error(asException(error)); })};
     }
 
+    KernelReloadSender reloadKernels(std::string directory) override {
+        return gpu->record([directory = std::move(directory)](gpu::GpuContext &) {
+            return tc::ProgramRegistry::instance().reloadFrom(directory);
+        });
+    }
+
 private:
     // On the render thread. A delta the world rejects fails the frame and changes nothing;
     // anything failing later leaves the world ahead of the GPU copy, which the next frame
@@ -470,5 +476,13 @@ private:
 } // namespace
 
 std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config) { return std::make_unique<RendererImpl>(config); }
+
+std::optional<std::string> builtInKernelDirectory() {
+#ifdef LR_BUILT_IN_KERNEL_DIRECTORY
+    return std::string{LR_BUILT_IN_KERNEL_DIRECTORY};
+#else
+    return std::nullopt;
+#endif
+}
 
 } // namespace lr::render

@@ -12,7 +12,7 @@ sudo apt install ninja-build libclang-18-dev glslang-tools libvulkan-dev mesa-vu
 cmake --workflow --preset debug        # 配置、构建、测试
 ```
 
-预设有 `debug`、`release`、`clang-debug` 和 `asan`。依赖（lexec、co2、stackfull、compute_shaders）按固定提交拉取。SDL2 用系统里安装的（`libsdl2-dev`），只有窗口上屏（`lr::present_sdl`）和 `lrender_view` 需要它；没装时这两个不构建，其余照常。要改用依赖库的本地副本，在不纳入版本管理的 `CMakeUserPresets.json` 里设置 `FETCHCONTENT_SOURCE_DIR_<NAME>`：
+预设有 `debug`、`release`、`clang-debug` 和 `asan`。依赖（lexec、co2、stackfull、compute_shaders，以及 asset 用的 tl-expected、cgltf、stb）按固定提交拉取。SDL2 用系统里安装的（`libsdl2-dev`），只有窗口上屏（`lr::present_sdl`）和 `lrender_view` 需要它；没装时这两个不构建，其余照常。要改用依赖库的本地副本，在不纳入版本管理的 `CMakeUserPresets.json` 里设置 `FETCHCONTENT_SOURCE_DIR_<NAME>`：
 
 ```json
 {
@@ -46,6 +46,36 @@ SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # �
 ```
 
 左键拖动绕场景旋转，滚轮缩放；Tab 在可见性缓冲和路径追踪两条管线之间切换（1、2 直接选），T 开关时间抗锯齿（默认开），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。
+
+两个程序都可以用 `--gltf` 换成 glTF 场景（`.gltf` 带外部文件或 data URI，或 `.glb`；图片是 PNG、JPEG 或 KTX2）：
+
+```sh
+./build/debug/examples/lrender_cli --backend vulkan --gltf models/scene.gltf --out scene.ppm
+./build/debug/examples/lrender_view --backend vulkan --gltf models/scene.glb
+```
+
+有相机就用文件里的第一个，否则按场景的包围盒取景；另外加一个天空，文件里没有灯时再加一个太阳。`lrender_cli` 会打印加载的网格、材质、纹理、灯光和相机数，以及没能加载的内容。`lrender_view` 监听场景用到的文件，改了就重新加载；debug 构建在 GPU 后端上还监听 lrender 自己的 kernel 目录，改了 kernel 再构建一次，运行中的窗口就换上新程序（release 预设关掉了这个功能）。
+
+在自己的程序里加载 glTF：
+
+```cpp
+auto source = lr::asset::makeFileSource({});
+auto config = lr::asset::AssetLibraryConfig{};
+config.source = source.get();
+config.runtime = runtime.get();
+config.compressedFormats = renderer->deviceInfo().limits.compressedArrayFormats;
+auto assets = lr::asset::makeAssetLibrary(config);
+
+auto loaded = lexec::sync_wait(assets->loadScene("models/scene.gltf"));   // 或者组合进别的 sender
+auto const &scene = std::get<0>(*loaded);                                 // AssetResult<SceneHandle>
+if (not scene) { /* scene.error().message */ }
+auto ids = lr::asset::makeSequentialIds();
+auto added = lr::asset::sceneDelta(**scene, *ids);          // added.removal 以后用来移除它
+auto view = lr::render::ViewDesc{};
+view.target = renderer->targets().createImage({lr::core::ivec2{960, 540}});
+view.camera = (*scene)->cameras.at(0).camera;
+lexec::sync_wait(renderer->submit({std::move(added.delta), {view}}));
+```
 
 自定义材质模型的写法见 `render/include/lr/render/MaterialModel.h` 开头的例子，测试里的 `tests/render/TestMaterialModels.h` 是一个完整的例子。
 

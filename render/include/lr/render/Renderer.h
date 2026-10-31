@@ -11,12 +11,14 @@
 #include <lexec/any_sender_of.hpp>
 #include <lexec/execution.hpp>
 #include <tc/device.hpp>
+#include <tc/program.hpp>
 
 #include <chrono>
 #include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
+#include <optional>
 #include <string>
 #include <vector>
 
@@ -80,6 +82,10 @@ struct FrameResult {
 using FrameSender = lexec::any_sender_of<lexec::set_value_t(FrameResult), lexec::set_error_t(std::exception_ptr),
                                          lexec::set_stopped_t()>;
 
+// tc's report: the programs replaced, and those rejected with the reason.
+using KernelReloadSender = lexec::any_sender_of<lexec::set_value_t(tc::ReloadReport),
+                                                lexec::set_error_t(std::exception_ptr), lexec::set_stopped_t()>;
+
 struct RendererConfig {
     std::string backend = "cpu";    // one of tc::availableBackends()
     std::string deviceNameContains; // optional, e.g. "llvmpipe"
@@ -118,10 +124,22 @@ struct Renderer {
     // happens in, those in flight and those prepared before the device was recreated;
     // the next frame uploads the whole scene again.
     virtual FrameSender submit(FrameDesc frame) = 0;
+
+    // Development: on the GPU thread, between the frames submitted before and after the
+    // call, replaces the programs of a tc_add_kernels glsl directory (such as
+    // builtInKernelDirectory()) with what the build last wrote there, and completes with
+    // the report there. GPU devices use them from their next frame; programs whose
+    // interface changed are rejected, and the CPU backend keeps running compiled C++.
+    // Release builds (LRENDER_KERNEL_RELOAD off) reject everything.
+    virtual KernelReloadSender reloadKernels(std::string directory) = 0;
 };
 
 // Throws tc::DeviceError when the device cannot be created, or cannot run one of the
 // kernels every frame may need (the message names them).
 std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);
+
+// Where the build writes lrender's own kernels for reloadKernels(); nullopt in builds
+// without LRENDER_KERNEL_RELOAD.
+std::optional<std::string> builtInKernelDirectory();
 
 } // namespace lr::render

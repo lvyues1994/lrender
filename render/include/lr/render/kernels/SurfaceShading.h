@@ -238,6 +238,10 @@ inline float pcfWeight(uint texel, float fraction) {
         vec3 normal = normalize(transpose(mat3(worldToObject)) * objectNormal);                                        \
         normal = perturbNormal(normal, uvAxes(edge1, edge2, uvs[1] - uvs[0], uvs[2] - uvs[0]), sampled.normal);        \
         vec3 geometric = normalize(cross(edge1, edge2));                                                               \
+        /* A mirroring transform reverses the winding the geometric normal comes from. */                             \
+        if (determinant(mat3(worldToObject)) < 0.0f) {                                                                 \
+            geometric = -geometric;                                                                                    \
+        }                                                                                                              \
         vec3 toViewer = -rays.direction;                                                                               \
         /* Seen from behind (double-sided materials only), the surface faces the other way. */                       \
         if (dot(geometric, toViewer) < 0.0f) {                                                                         \

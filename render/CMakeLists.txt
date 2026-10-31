@@ -16,6 +16,12 @@ tc_add_kernels(lr_render HEADERS
     kernels/Post.h
     kernels/Textures.h)
 
+# tc_add_kernels writes the GLSL and SPIR-V here; Renderer::reloadKernels reads them back.
+if(LRENDER_KERNEL_RELOAD)
+    target_compile_definitions(lr_render PRIVATE
+        LR_BUILT_IN_KERNEL_DIRECTORY="${CMAKE_CURRENT_BINARY_DIR}/tc_generated/lr_render/glsl")
+endif()
+
 # Each transpiled kernel registers itself from a static initializer that nothing refers
 # to, so consumers link the whole archive or the linker drops the registrations.
 add_library(lr_render_whole INTERFACE)
