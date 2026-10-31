@@ -96,7 +96,42 @@ void writeBuffer(tc::Device &device, tc::BufferResource<tc::uint> &buffer, std::
     }
 }
 
+GpuMaterial resolved(MaterialEncoding const &source, TexturePool const &textures) {
+    auto const refOf = [&](std::size_t const index) {
+        auto const id = source.textures[index];
+        return id.isValid() ? textures.residentRef(id) : noTexture();
+    };
+    auto material = source.gpu;
+    material.textures = tc::uvec4{refOf(0), refOf(1), refOf(2), refOf(3)};
+    return material;
+}
+
 } // namespace
+
+void DeviceScene::applyMaterials(tc::Device &device, SceneUpdate const &update, TexturePool &textures,
+                                 bool const grown) {
+    if (materialSources.size() < materials->size()) {
+        materialSources.resize(materials->size());
+    }
+    for (auto const &write : update.materials) {
+        materialSources[write.index] = write.value;
+    }
+    auto writes = std::vector<Indexed<GpuMaterial>>{};
+    if (textures.takeResidencyChange() or grown) {
+        for (auto index = std::size_t{0}; index < materialSources.size(); ++index) {
+            if (materialSources[index]) {
+                writes.push_back(Indexed<GpuMaterial>{static_cast<std::uint32_t>(index),
+                                                      resolved(*materialSources[index], textures)});
+            }
+        }
+        writeTable(device, *materials, writes, true);
+        return;
+    }
+    for (auto const &write : update.materials) {
+        writes.push_back(Indexed<GpuMaterial>{write.index, resolved(write.value, textures)});
+    }
+    writeTable(device, *materials, writes, false);
+}
 
 void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update, RetireList &retired) {
     auto const &capacity = update.capacity;
@@ -114,7 +149,7 @@ void DeviceScene::applyHierarchies(tc::Device &device, SceneUpdate const &update
     tlasNodeCount = update.tlasNodeCount;
 }
 
-void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, RetireList &retired) {
+void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, TexturePool &textures, RetireList &retired) {
     auto const &capacity = update.capacity;
     auto const newVertices = reserveTable(vertices, capacity.vertices, retired);
     auto const newIndices = reserveBuffer(indices, capacity.indices, retired);
@@ -146,7 +181,7 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, RetireLis
 
     writeTable(device, *meshes, update.meshes, newMeshes);
     writeTable(device, *instances, update.instances, newInstances);
-    writeTable(device, *materials, update.materials, newMaterials);
+    applyMaterials(device, update, textures, newMaterials);
     writeTable(device, *lights, update.lights, newLights);
     instanceCount = update.instanceCount;
     lightCount = update.lightCount;
@@ -157,7 +192,7 @@ SceneTables DeviceScene::tables() const noexcept {
     return SceneTables{vertices.get(),  indices.get(),       meshes.get(),    instances.get(),
                        materials.get(), lights.get(),        instanceCount,   lightCount,
                        blasNodes.get(), blasTriangles.get(), blasRoots.get(), tlasNodes.get(),
-                       tlasNodeCount};
+                       tlasNodeCount,   MaterialTextures{}};
 }
 
 } // namespace lr::render

@@ -42,7 +42,7 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 
 ### compute_shaders：同一份 kernel 跑在 GPU 和 CPU 上
 
-- `render/kernels/` 下的 kernel 在构建时由 `tc_add_kernels` 转译成 GLSL/SPIR-V；用户自己的 kernel 在用户的目标里用同一个函数转译。材质模型这类变体写成 kernel 模板，用 `TC_KERNEL_INSTANCE` 实例化。
+- `render/kernels/` 下的 kernel 在构建时由 `tc_add_kernels` 转译成 GLSL/SPIR-V；用户自己的 kernel 在用户的目标里用同一个函数转译。材质模型这类变体写成 kernel 模板，用 `TC_KERNEL_INSTANCE` 实例化。用户 kernel 要用到的部分（着色 kernel 模板、材质采样、光照）是公开头文件，在 `render/include/lr/render/kernels/`。tc 只为被转译的那个头文件里的 kernel 和 `TC_KERNEL_INSTANCE` 生成程序，所以用户头文件包含这些公开头文件不会重复生成 lrender 自己的程序。
 - 与 kernel 共享的数据（顶点、三角形、BVH 节点、实例、材质、灯光）存成表（`TableBinding`）。元素是按自然写法定义的 C++17 struct，主机端和 kernel 用同一份类型定义；布局（`Aos`、`Soa<P>`）和字段编码是类型参数。
 - 提交是异步的：`submit()` 返回 `Submission`；支持 sync file 的设备用 `submitWithFence()`，返回的 `FencedSubmission` 里同时有 `.submission` 和 `.fence`。后端只在真正有读写冲突的 dispatch 之间插屏障，互不相关的 pass 可以在设备上重叠。
 - 纹理池是只驻留在设备上的图像（`createImage` 返回的 `DeviceImage` / `DeviceCompressedImage`），没有主机副本；内容由 kernel 写入，或者用 `copyBufferToImage` 在设备时间线上从 buffer 拷贝。
@@ -156,7 +156,7 @@ protected:
 std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后端名、设备名过滤、Runtime（必需）
 ```
 
-- **启动**：GPU 线程先调用 `tc::createDevice()`，CPU 后端的 `CpuDeviceConfig::executor` 设成帧池上的 `bulk`；然后对 `ProgramRegistry::instance().all()` 逐个 `checkKernel`，把每个程序能不能运行记下来，供 render 选择变体；最后进入 `run_loop::run()`。设备也在这个线程上销毁。
+- **启动**：GPU 线程先调用 `tc::createDevice()`，CPU 后端的 `CpuDeviceConfig::executor` 设成帧池上的 `bulk`，然后进入 `run_loop::run()`。设备也在这个线程上销毁。检查 kernel 能不能运行、选择变体归 render，见“启动检查与 kernel 变体”。
 - **提交**：`info().syncFiles` 为真时用 `submitWithFence()`；否则用 `submit()`，包成一个 `.fence` 为空的 `FencedSubmission`。两种调用都不等待。`syncFiles` 为假时 `submitWithFence()` 会先等工作完成再返回空 fence，所以这时只用 `submit()`。
 - **等待完成**：`whenComplete` 是 IO 调度器上的一个 stackfull 任务（`exec::spawn(io, …)`），GPU 线程因此从不等待 GPU，可以接着录制下一帧：
   - `.fence` 不为空：先给 fd 设上 `O_NONBLOCK`，再用 `io::Registration` 注册进 Poller。任务先读 `readEvents()`，`isSignaled()` 为假时 `waitReadable(seen)`，然后重新检查。任务 park 期间不占线程，完成由 epoll 报告；`Registration` 在 `SyncFence` 之前析构。
@@ -193,13 +193,15 @@ using FrameSender = lexec::any_sender_of<lexec::set_value_t(FrameResult),
 struct Renderer {
     virtual ~Renderer() = default;
     virtual tc::DeviceInfo const &deviceInfo() const noexcept = 0;
+    virtual RendererCapabilities const &capabilities() const noexcept = 0;   // 为设备选中的 kernel 变体
     virtual RenderTargets &targets() noexcept = 0;
     virtual PipelineRegistry &pipelines() noexcept = 0;
+    virtual MaterialModels &materialModels() noexcept = 0;                  // 见“材质”
     // 立即返回，任意线程可调用。帧按调用顺序编号、依次处理，不管它的 sender 有没有启动；
     // sender 按同样的顺序在设备做完该帧之后完成，FrameResult 里带统计、墙钟时间和离屏目标的图像。
     virtual FrameSender submit(FrameDesc frame) = 0;
 };
-std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);   // 后端、Runtime、framesInFlight（默认 2）
+std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);   // 后端、Runtime、framesInFlight（默认 2）、变体开关
 
 struct RenderTargets {                                                       // 线程安全，改动从之后提交的帧起生效
     virtual ~RenderTargets() = default;
@@ -232,7 +234,7 @@ struct Presenter {                  // lr::present 提供实现，宿主也可�
 
 #### RenderWorld：渲染侧的常驻镜像
 
-渲染线程上的一份场景镜像，按种类以 SoA 存放，槽位稳定。每帧只应用 `RenderWorldDelta`，并记下每张表的脏区间；编码只处理脏的部分，在帧池上并行完成。它还保留上一帧的世界矩阵，用来算 TAA 的运动矢量。
+渲染线程上的一份场景镜像，按种类以 SoA 存放，槽位稳定。每帧只应用 `RenderWorldDelta`，并记下每张表的脏区间；编码只处理脏的部分，在帧池上并行完成。每个实例还记着上一帧的世界矩阵（`GpuInstance::previousObjectToWorld`），用来算 TAA 的运动矢量：增量移动了实例，这一帧写的是移动前的矩阵，下一帧再写一次这个实例，把它改成当前的矩阵；新实例两者相同。所以每帧必须恰好应用一次增量。
 
 镜像持有网格的不可变句柄，设备丢失之后可以重新上传几何；纹理的像素数据不保留（见“纹理”）。
 
@@ -241,7 +243,7 @@ struct Presenter {                  // lr::present 提供实现，宿主也可�
 ```cpp
 struct RenderFeature {                      // 扩展点：往一个视图的帧图里加 pass
     virtual ~RenderFeature() = default;
-    virtual FeatureStage stage() const = 0;  // Visibility、Shadow、Shading、Transparent、Post、Overlay
+    virtual FeatureStage stage() const = 0;  // Visibility、Shadow、Shading、Transparent、PostProcess、Output
     virtual void setup(FrameGraphBuilder &graph, ViewContext const &view) = 0;   // 渲染线程
 };
 
@@ -261,37 +263,55 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - 一条管线就是按阶段排好的一组 feature。`PipelineRegistry` 提供两条内置管线，用户可以在它们的基础上按阶段插入自己的 feature，组成新的管线。
 - 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，分配临时资源（按描述符在帧之间复用），维护按 `ViewId` 保存的历史资源。
 - pass 按编译后的顺序在 GPU 线程上录制。屏障由 tc 按实际的读写冲突插入，互不相关的 pass 可以在设备上重叠，帧图不需要自己计算屏障。
-- `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`，同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。
+- `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`（可以指定读参数 buffer 的第几项），同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。
 - 历史资源：`graph.history<G>(name, extent)` 返回一对图像 `{previous, current, valid}`，同一个 `ViewId` 和名字在每个用到它的帧里拿到同一对，并且互换一次：上一帧写进 `current` 的内容，这一帧从 `previous` 读。互换而不是原地读写，是因为 GLES 3.1 不允许 kernel 同时读写 r32 以外格式的存储图像。两张图像在帧开始时都算已写入，写 `current` 的 pass 总会保留。第一次用到、尺寸或格式变了、或者被释放过之后，`valid` 为假。记录在渲染线程上（只是 id），图像在 GPU 线程上按 id 创建；连续 60 帧没用到、或者视图的目标已经销毁，就释放。TAA 也用它。
-- feature 用 `requirements()` 声明对场景的额外需求：要追踪光线的 feature 让 `RenderWorld` 从这一帧起维护 BVH（见“参考路径追踪”）。`graph.onFinish(fn)` 在帧完成后填写 `ViewResult`，比如累积的采样数。
+- feature 用 `requirements()`（`FeatureRequirements`）声明额外的需求：要追踪光线的 feature 让 `RenderWorld` 从这一帧起维护 BVH（见“参考路径追踪”）；要抖动投影的 feature（TAA）让设置了 `AntiAliasing::Taa` 的视图每帧换一个子像素偏移，`ViewContext::temporal` 里有偏移、不带偏移的这一帧和上一帧的视图投影矩阵，以及历史能不能接着用。`graph.onFinish(fn)` 在帧完成后填写 `ViewResult`，比如累积的采样数。
 
 #### 两条内置管线
 
-- **可见性缓冲管线（实时主管线）**：
-  1. GPU 实例剔除：写出可见实例列表，以及后续光栅化的 `DispatchIndirectCommand`。
-  2. 计算光栅化写可见性缓冲：有 `KernelFeature::Int64Atomics` 的设备上，一遍 64 位 `atomicMin` 写入“深度加三角形 ID”；其他设备（包括所有 GLES）分两遍，先写深度，再在深度相等时写 ID。
-  3. 用同样的计算光栅化写阴影深度。
-  4. 材质分类：按材质模型把像素压缩成列表，每个模型一份间接参数；再对每个模型 `executeIndirect` 它的着色 kernel。
-  5. 透明物体走单独的 pass，按屏幕 tile 处理。
-  6. TAA，然后色调映射；后处理 kernel 声明中等精度（`Precision::Medium`）。
+- **可见性缓冲管线（实时主管线）**：可见性、阴影、着色、透明、时间抗锯齿、色调映射六个 feature。
+  1. GPU 实例剔除：写出可见实例列表（实例、它的第一个可见三角形、网格的第一个索引和第一个顶点，每项四个字，后面的 pass 因此不必再读网格表），以及后续光栅化的 `DispatchIndirectCommand`。材质是 `Blend` 的实例不进这张列表，留给透明 pass。
+  2. 计算光栅化写可见性缓冲：每个像素留下最近的深度，以及这个深度上编号最小的可见三角形。设备有 64 位原子（`KernelFeature::Int64Atomics`）时一遍完成：每个覆盖的像素对一个 `tc::u64` 做 `atomicMin(floatBitsToUint(depth) << 32 | 三角形)`，最小值正好是这两样，再由一个逐像素的 pass 拆进两个 32 位 buffer；其他设备分两遍，先 `atomicMin` 深度，再在深度相等时 `atomicMin` 三角形。两个光栅化 kernel 展开同一个宏 `LR_TRIANGLE_RASTERIZER`，只有写像素的那一步不同，算出的深度逐位相同，所以两种做法的三角形和深度也逐位相同（测试在 CPU 后端和 lavapipe 上比对）。后面的 pass（着色、透明的深度测试、TAA）只读拆开后的 `VisibilityOutputs`，不关心是哪一种。`Mask` 材质在光栅化时按透视校正的 UV 采基础色纹理的第 0 层，alpha 低于阈值的像素不覆盖。阴影贴图本来就只写深度，总是用两遍的那个 kernel 的深度模式。
+  3. 阴影：场景里第一个 `castsShadows` 的方向光有级联阴影贴图，一次只有这一盏灯有阴影。视锥在 `ViewSettings::shadows.distance` 之内按对数与均匀 3:1 混合的分割点切成 1 到 4 段，每段取包住这段视锥的球，球的大小只由这段视锥的形状决定，球心在光空间里对齐到整数个纹素，所以相机移动时级联只按整纹素移动，阴影边缘不闪。深度范围取整个场景包围盒沿光方向的投影，视锥外的遮挡物也能投下阴影。每个级联用同一套剔除、压缩和光栅化 kernel（只写深度）画进一个 `BufferBinding<uint>` 的一段，深度是 `floatBitsToUint` 后 `atomicMin`；级联的矩阵放在这个 buffer 开头的 128 个字里，由清除 pass 从主机上传。着色时选最细的、能容下 PCF 核的级联，接收点先沿几何法线偏移约一个纹素（按坡度增大），深度再减去随坡度增大的偏置，然后做 3×3 的双线性 PCF（16 次手动比较，因为深度在 buffer 里）。透明物体不投阴影，但接收阴影。
+  4. 着色：先分类，再按材质模型间接着色。分类 pass 逐像素从三角形找到实例和材质，读出材质模型号；没有三角形的像素当场写环境光。每个工作组先在内部给每个模型的像素排好名次（共享内存的 `atomicAdd`，或者子组变体里每个子组对每个模型做一次 `subgroupExclusiveAdd`），再给每个模型做一次全局 `atomicAdd`，取得这个工作组在该模型里的位置，写进逐像素的“模型、名次”。一个工作组的小 pass 按模型号求前缀和，得到每个模型列表的起点，同时写好每个模型的 `DispatchIndirectCommand`（每 64 个像素一个工作组）；再一个逐像素的 pass 把（像素、三角形）放进各自模型的列表。最后每个模型一个 pass，用 `executeIndirect` 读自己那一项参数，只跑自己的像素。列表里像素的顺序随原子操作而变，但每个像素的着色只取决于它自己，所以图像是确定的。
+  5. 透明：`Blend` 实例单独剔除、压缩，再用同一个光栅化 kernel 的第三种模式把片元插进逐像素链表：一个 `uint` buffer 里依次是每个像素的表头、片元计数、每个片元三个字（深度、下一个、可见三角形），`atomicAdd` 分配、`atomicExchange` 挂表头，容量是每像素平均 2 个，超出的片元丢弃。只插入比不透明深度更近的片元。这一遍按 top-left 规则覆盖像素，边函数按端点的固定顺序计算，共享一条边的两个三角形算出的值严格相反，所以落在边上的像素只归其中一个，不会混合两次。之后把场景颜色拷一份，透明混合 kernel 对每个像素的链表按（深度、三角形）排序，保留最近的 8 个，用内置的 metallic-roughness 模型、相同的灯光和阴影着色（材质指定了别的模型也一样），从前往后混合到不透明颜色上。排序键里有三角形，所以结果与片元插入的顺序无关。
+  6. 时间抗锯齿（`ViewSettings::antiAliasing` 为 `Taa` 时，在色调映射之前）。视图的投影每帧按 Halton(2, 3) 的第 1 到 16 个点（减 0.5）平移不到一个像素，渲染线程按视图记住抖动序号和上一帧不带抖动的视图投影矩阵；上一帧没有渲染这个视图、尺寸变了、`ViewDesc::cameraCut` 为真或设备重建过，序号回到 0，历史作废。运动 pass 逐像素在实例的物体空间里求出可见点，分别用这一帧和上一帧的世界矩阵、视图投影矩阵（都不带抖动）投到屏幕上，差就是运动矢量；静止的物体在静止的相机下运动恰好是 0，历史因此在纹素中心采样，不会变模糊。没有三角形的像素跟着远平面走。解析 pass 在 `p + 0.5 - 运动` 处双线性采样 RGBA16F 的历史（`graph.history`），把它夹在这一帧 3×3 邻域颜色在 YCoCg 里的包围盒中，再与这一帧混合：历史的 alpha 里存平均了多少帧，前 10 帧取平均，之后新一帧的权重固定为 0.1。历史作废、或者点上一帧在屏幕外的像素从这一帧重新开始。结果写进历史，再拷回场景颜色。透明像素用的是它后面不透明表面的运动。路径追踪管线没有这个 feature，不抖动。
+     收敛与拖影的测量（32×32、斜 0.3 弧度的直边，64×64、每帧移动 2 像素的白块）：32 帧后边缘像素的值与像素被覆盖面积的平均差 0.036（不开 TAA 时 0.197），这 16 个点本身能做到的最大差是 0.12；GPU 的值与在主机上按同样的抖动和混合模拟的结果相差不到 4e-4（半精度的舍入）。白块移走后留下的轨迹与背景的差在 5e-5 以内（就是 0.2 存成半精度的误差），白块内部仍然是 1。
+  7. 色调映射；后处理 kernel 声明中等精度（`Precision::Medium`）。
 - **参考路径追踪**：两级 BVH，用固定大小的 `std::array` 栈做迭代遍历（tc 不允许递归），渐进累积。它是画质参照，也是可见性缓冲管线着色结果的测试参照。
   - BVH 只有它用。第一次有视图需要时，渲染线程给每个网格建一棵 BLAS（分箱 SAH，叶子最多 4 个三角形），再在实例上建 TLAS（叶子一个实例）；之后增量里的网格重建自己的 BLAS，实例或网格有变化就重建 TLAS。深度不超过 31 层（快到上限时改按中位数对半分），遍历栈是 32 个元素。节点、三角形（三个角在顶点表里的位置）、每个网格的根、TLAS 节点经 `SceneUpdate` 进 `DeviceScene` 的表，可见性缓冲管线不读这些表。构建是同步的，大场景第一次用到时那一帧的准备会变长。
-  - kernel 每帧每像素一条路径：先 TLAS，再用 `worldToObject` 把射线变换到实例的物体空间遍历 BLAS（方向不归一化，两个空间里的距离相同）。着色和光源用与可见性缓冲管线同一份代码（`kernels/Lighting.h`），双面材质的处理也相同：单面材质的背面对所有射线都不可见，双面材质从背面看时法线翻转。每个顶点对方向光和点光源做下一事件估计并追踪阴影射线；加上自发光；逃逸的射线取均匀环境光；继续的方向按漫反射和 GGX 两个波瓣的混合采样，按混合密度加权；第三次弹射起用俄罗斯轮盘。随机数是像素、采样序号、维度的 PCG 散列，所以每个设备抽到的随机数相同。
-  - 累积放在 RGBA32F 的历史资源里，存运行均值，均值写进 `sceneColor`，后面照常色调映射。相机、目标尺寸或场景（任何改变网格、材质、实例、灯光、环境的增量）变了就从头开始；`ViewStats::accumulatedSamples` 给出当前的采样数。
-- 前缀和、压缩、规约这些通用 kernel 各有两个实例：用子组的，和只用 `Shared` 的。启动时按 `checkKernel` 的结果选择，没有子组的设备（Adreno 的 GLES）用后者。
+  - kernel 每帧每像素一条路径：先 TLAS，再用 `worldToObject` 把射线变换到实例的物体空间遍历 BLAS（方向不归一化，两个空间里的距离相同）。着色和光源用与可见性缓冲管线同一份代码（`kernels/Lighting.h`、`kernels/Material.h`），双面材质的处理也相同：单面材质的背面对所有射线都不可见，双面材质从背面看时法线翻转。纹理固定采第 0 层（多个采样平均下来就是像素足迹上的平均）。`Mask` 材质在遍历时按 alpha 剔掉命中；`Blend` 材质是随机不透明：射线（包括阴影射线）以 1 - alpha 的概率穿过它，判定用射线的种子和三角形号散列，期望正好是按 alpha 混合，所以简单场景两条管线一致。每个顶点对方向光和点光源做下一事件估计并追踪阴影射线；加上自发光；逃逸的射线取均匀环境光；继续的方向按漫反射和 GGX 两个波瓣的混合采样，按混合密度加权；第三次弹射起用俄罗斯轮盘。随机数是像素、采样序号、维度的 PCG 散列，所以每个设备抽到的随机数相同。
+  - 累积放在 RGBA32F 的历史资源里，存运行均值，均值写进 `sceneColor`，后面照常色调映射。相机、目标尺寸或场景（任何改变网格、纹理、材质、实例、灯光、环境的增量）变了就从头开始，这由渲染线程判断；纹理流式写完或消失也要从头开始，而这只有 GPU 线程知道，所以采样数在 GPU 线程上按视图记：录制时看渲染线程给的“可以继续”和纹理驻留的代数，`ViewStats::accumulatedSamples` 给出当前的采样数。
+- 可见实例的压缩和像素分类各有两个 kernel：用子组的（`subgroupExclusiveAdd`、`subgroupAdd`，`Shared` 只存每个子组的总数，子组大小取 `gl_SubgroupSize`），和只用 `Shared` 的。两者的输出相同（分类的列表顺序除外，图像相同），启动时选择，见下一节。
+
+#### 启动检查与 kernel 变体
+
+- render 自己维护一张程序表：任何一帧都可能用到的程序，和每种可选变体的程序（子组：压缩和分类的子组版本；一遍写入的可见性缓冲：清除、光栅化、拆分三个用 64 位整数的 kernel）。测试检查注册表里每个 `lr_` 开头的程序都在表里。
+- `makeRenderer` 建好设备后，在 GPU 线程上对表里的程序逐个 `checkKernel`。必需的程序有不能运行的，就抛 `tc::DeviceError`，消息里列出每个程序和原因，比如“`lr_shade_metallic_roughness` 用了 8 个 storage buffer，设备只允许 4 个”。可选变体的程序全部能运行、并且 `RendererConfig::subgroups` / `singlePassVisibility` 不是 `VariantUse::Off`，才用这个变体。选择结果是 `Renderer::capabilities()`（`RendererCapabilities`：是否用子组、是否一遍写可见性缓冲、子组大小），feature 从 `ViewContext::capabilities` 读到，按它在帧图里放 pass。`Off` 让测试能在同一个设备上比较两种变体。
+- 设备丢失后重建的设备用同样的配置创建，但仍然检查一遍：已选变体和所有材质模型的程序都要能运行，否则按建不出设备处理。
+- 测试用的设备选到的变体：CPU 后端两者都用（子组大小 32）；lavapipe 的 Vulkan 两者都用（子组大小 8）；llvmpipe 的 OpenGL 和 GLES 都不用（没有子组，也没有 64 位原子）。GLES 本来就没有 64 位整数。
 
 #### 材质
 
-- 内置一个 uber 材质模型，覆盖 glTF 的 metallic-roughness，加上自发光和 alpha 遮罩/混合。
-- 着色 kernel 是模板 `template <class Model> struct TC_KERNEL ShadeKernel`，每个材质模型一行 `TC_KERNEL_INSTANCE`。自定义材质模型就是用户在自己的头文件里写一个模型类型和一行实例化，再注册一个对应的 feature。
+- 内置一个 uber 材质模型，覆盖 glTF 的 metallic-roughness：基础色、metallic-roughness（G 是粗糙度、B 是金属度）、自发光、法线四张可选纹理，各自乘对应的因子；法线强度 `normalScale`；一个对所有纹理生效的 UV 变换（KHR_texture_transform：先缩放、再逆时针旋转、再平移）；alpha 模式 `Opaque`、`Mask`、`Blend`。材质引用的纹理不存在或还没流式写完时，按缺席处理，只用因子。
+- 没有存切线：法线贴图的切线空间由三角形三个角的位置差和 UV 差求出 U、V 增大的方向，切线沿 U 方向对着色法线正交化；按 glTF 的约定，切线空间的 +Y 指向图像的上方（V 减小的方向），副切线按这个方向定号，所以 UV 镜像时也对。双面材质从背面看时，整个扰动后的法线翻转。
+- 均匀环境光：漫反射部分是 `baseColor·(1 - metallic)·L`；镜面部分是 `L·(F0·A + B)`，(A, B) 是这套 GGX（高度相关的 Smith 可见性、Schlick 菲涅尔）在 (n·v, 粗糙度) 上的方向反照率，进程里第一次用到时在主机上用重要性采样（每格 2048 个 Hammersley 样本）算出 32×32 的表，放进一张 RG16F 纹理，着色时双线性采样。与暴力积分相比，表的误差不到 0.25%；在白炉测试里，金属球和电介质球的光栅结果与路径追踪的平均差在 0.1% 以内。
+- 材质模型：`MaterialDesc::model` 指定用哪个模型着色，0 是内置的 metallic-roughness；`MaterialDesc::modelParameters`（一个 `vec4`）留给其他模型用。每个模型是着色 kernel 模板 `template <class Model> struct TC_KERNEL ShadeMaterialModel` 的一个实例，一个模型一个程序。kernel 在像素看到的点上插值出表面、采好材质的四张纹理，交给 `Model::evaluate(ShadingInputs)`（位置、着色法线、几何法线、视线方向、UV、`GpuMaterial`、纹理乘因子后的 `MaterialSample`、实例号）；模型返回 `ShadedSurface`（自发光、基础色、金属度、粗糙度、法线、覆盖率、是否受光），kernel 再用场景的灯光、阴影和环境光照亮它，每个模型都一样。所以模型决定的是“这一点是什么样的表面”，光照模型（Lambert 加 GGX）是公共的；`emissionOnly(radiance)` 是只发光的表面。这对应可见性缓冲引擎里“材质 pass 求表面属性、光照统一”的分法。
+- 应用自己的模型：在自己用 `tc_add_kernels` 转译的头文件里写模型类型和一行 `TC_KERNEL_INSTANCE("app_xxx", ShadeMaterialModel<app::Xxx>)`（写在 `lr::render::kernels` 命名空间里），再 `renderer->materialModels().add(makeMaterialModel<app::Xxx>())` 得到模型号。`MaterialModel` 接口有两个函数：`program()` 给出 kernel 的程序名，`add` 在 GPU 线程上 `checkKernel`，不能运行就抛 `tc::DeviceError`；`shade(ModelShading &)` 在 GPU 线程上录制，`makeMaterialModel` 给出的实现调用 `ModelShading::dispatch(kernel)`，它绑定所有实例共有的绑定，按模型号 `executeIndirect`。最多 16 个模型（`maxMaterialModels()`），因为分类时每个工作组在共享内存里给每个模型计数。材质用了渲染器没有的模型号，增量在渲染线程上被拒绝（`std::invalid_argument`），世界不变。
+- 透明片元和路径追踪器总是用内置模型着色，材质指定了别的模型也一样。
+- tc 只认 kernel 自己的成员为绑定，没有办法把一组绑定放进别的结构体，所以采样纹理池的 kernel 都展开同一个宏 `LR_MATERIAL_TEXTURES(first)`，它声明 12 个池绑定和采样它们的成员函数。同样的办法：所有模型的着色 kernel 和透明混合 kernel 展开 `LR_SURFACE_SHADING(first)`（材质纹理、环境表、场景的表、可见实例、阴影贴图，以及求表面、阴影和光照的成员函数），两种可见性光栅化展开 `LR_TRIANGLE_RASTERIZER`，用到可见实例列表的 kernel 展开 `LR_FIND_VISIBLE_SLOT`。
 
 #### 纹理
 
-- tc 没有无绑定资源（它以 GLES 3.1 为底线），所以纹理按“格式 + 尺寸档”分池：每个池是一张只在设备上的 `Dim::D2Array` 图像，带完整的 mip 链，材质记录 `TextureId` 对应的池和层号。未压缩的池是 `DeviceImage`，压缩的池是 `DeviceCompressedImage`，在 kernel 里分别通过 `TextureBinding` 和 `CompressedTextureBinding<…, Dim::D2Array>` 采样。池的尺寸和层数受 `DeviceLimits::imageDimension2D` 与 `imageArrayLayers` 限制（规范下限是 2048 和 256）。
-- compute 没有导数，`texture()` 只采第 0 层，所以着色时根据可见性缓冲重建的导数算出 LOD，再用 `textureLod`（`Mip::Linear`）三线性采样。
-- 新纹理流入池时，GPU 线程把数据拷进当前帧的暂存段（`createBuffer` 分配的映射内存，每个在途帧一段），再 `copyBufferToImage` 写进对应的层和 mip 级别；拷贝和前后的 dispatch 一样在设备时间线上排序。暂存段的大小就是每帧的流式预算，大纹理分几帧写完。未压缩纹理只需要第 0 层，其余各级由下采样 kernel 生成；压缩纹理不能被 kernel 写入，所有级别都从文件拷贝。
-- 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。设备不支持某种格式时，后台池用 `tc::decodeCompressed` 解码，再放进未压缩的池。
-- 纹理写进池之后，`RenderWorld` 不再保留像素数据，纹理在整个系统里只有设备上这一份。设备丢失后，`FrameResult` 列出需要重新提交的 `TextureId`；用了 scene 和 asset 时，由它们自动重新加载并提交。
+- tc 没有无绑定资源（它以 GLES 3.1 为底线），所以纹理按“格式 + 尺寸档”分池：每个池是一张只在设备上的 `Dim::D2Array` 图像，正方形、边长是 2 的幂、带完整的 mip 链。kernel 里有固定的 12 个池槽：8 个 RGBA8 池（`DeviceImage`，第 k 个放边长 16·2^k 的纹理，16 到 2048），4 个压缩池（`DeviceCompressedImage`，先到先得，每个池一种格式一种尺寸），分别通过 `TextureBinding` 和 `CompressedTextureBinding<…, Dim::D2Array>` 采样；没有池的槽绑一张 1×1 的空图像。池的尺寸和层数受 `DeviceLimits::imageDimension2D` 与 `imageArrayLayers` 限制（规范下限是 2048 和 256），也受 `RendererConfig::maxTextureSize` 限制。
+- 纹理在材质里是一个 32 位的引用：槽、层、log2 边长、是否 sRGB、U 和 V 的寻址方式。池的采样器总是 Repeat、线性、三线性 mip；Clamp 和 Mirror 在 kernel 里折叠坐标，并让坐标离边缘半个纹素（取三线性混合的两层里较粗的那层），这样不会混进对边的纹素。
+- 渲染线程上的 `TextureLayout` 决定纹理放进哪个池的哪一层：压缩图像在设备有这种格式的数组、是正方形 2 的幂、不超过上限、带完整 mip 链、还有空的压缩槽时，原样进压缩池，所有级别都从图像拷贝；其余的图像（包括设备不支持的压缩格式）在渲染线程上用 `tc::decodeCompressed` 解码成 RGBA8，在线性颜色里重采样成下一个 2 的幂的正方形（缩小用面积平均，放大用按寻址方式环绕的双线性；超过上限的缩小到上限），进 RGBA8 池，只上传第 0 层。RGBA8 池满了就把层数翻倍：GPU 线程建一张更大的图像，用 kernel 逐层逐级拷过去，旧图像进退役列表。压缩池不能被 kernel 写，也没有图像到图像的拷贝，所以一开始就按约 32 MiB 分配层数，满了的新纹理改走解码。移除纹理时它的层回到空闲列表。
+- RGBA8 池存纹理自己的编码（sRGB 纹理存 sRGB 值），kernel 采样之后再解码。下采样 kernel 在线性颜色里求 2×2 平均（黑白相间的棋盘格在第 1 层是线性 0.5，而不是 sRGB 平均出来的 0.21），所以 mip 级别是对的；代价是纹素之间的双线性插值发生在 sRGB 值上，高对比边缘的插值偏暗。tc 没有 sRGB 格式，要完全正确只能存 RGBA16F，内存翻倍，现在没有这样做。
+- compute 没有导数，`texture()` 只采第 0 层，所以着色时用射线微分算 LOD：像素右边和下边相邻像素中心的相机射线与三角形所在平面相交，求出那里的 UV，与本像素 UV 的距离取较大者就是足迹，LOD = log2(足迹 × 边长)，再用 `textureLod`（`Mip::Linear`）三线性采样。各向同性，斜看时偏模糊。
+- 新纹理流入池时，GPU 线程把数据拷进当前帧的暂存段（`createBuffer` 分配的映射内存，每个在途帧一段，第一次用到时才分配），再 `copyBufferToImage` 写进对应的层和 mip 级别；拷贝和前后的 dispatch 一样在设备时间线上排序。每段从录制第 k 帧时用到的是第 k - framesInFlight 帧用过的那一段，那一帧已经做完，主机写它不会和设备读冲突。每帧最多拷 `RendererConfig::textureStreamingBytes`（默认 8 MiB），按 mip 级别排队，一帧放不下的留到下一帧；`copyBufferToImage` 只能整级拷贝，所以比预算还大的单个级别独占一帧，暂存段为它临时变大。RGBA8 纹理的第 0 层到了，同一帧里接着用下采样 kernel 逐级生成其余各级（每次 dispatch 一层，因为 llvmpipe 的 `texelFetch` 在一次 dispatch 里层号不同时会读错层）。最后一级写完，纹理才算驻留，材质才引用它；之前材质只用因子。
+- 材质里的引用由 GPU 线程填：`SceneUpdate` 里的材质带着纹理 ID，`DeviceScene` 按 `TexturePool` 的驻留情况把它们换成引用，驻留情况一变就重写所有材质。替换一个纹理（同一个 ID 再 upsert）时，旧数据马上不再被引用，新数据写完之前只用因子。
+- 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。lavapipe 没有 ETC2，测试里这条路走解码。解码和重采样现在在渲染线程上做，大纹理多的场景应该挪到后台池。
+- `RenderWorld` 只把图像句柄交给 GPU 线程，自己不留；`TexturePool` 写完最后一级就放掉它，纹理在整个系统里只有设备上这一份（宿主自己留的句柄除外）。设备丢失后，渲染线程在下一帧把放置过的所有纹理记为丢失，`FrameResult::lostTextures` 列出需要重新提交的 `TextureId`，在此之前材质只用因子；那一帧失败的话，由下一个成功的帧报告。用了 scene 和 asset 时，由它们自动重新加载并提交。
 
 #### 与 kernel 共享的数据
 
@@ -306,6 +326,7 @@ struct GpuInstance {
     Encoded<mat4, Affine3x4> worldToObject;
     uint meshIndex;
     uint materialIndex;
+    Encoded<mat4, Affine3x4> previousObjectToWorld; // 上一帧的，算运动矢量用
 };
 using VertexTable   = TableBinding<GpuVertex, 0, Soa<>>;    // 光栅化和遍历只读位置
 using BvhNodeTable  = TableBinding<GpuBvhNode, 1>;          // 8 个字，按 uvec4 宽读
@@ -317,7 +338,8 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 - 常驻表放在设备内存里。帧池把脏元素编码好，GPU 线程把它们写进自己持有的主机端表，再 `uploadTable(table, first, count)` 只传脏区间。传输在设备时间线上排队，与在途帧的读写冲突由 tc 的屏障处理，所以常驻表不需要为每个在途帧各备一份。
 - 上传在调用时就把主机端的数据拷走：Vulkan 后端 `memcpy` 进这次提交自己的暂存内存（提交完成之前不复用），再录一条 `vkCmdCopyBuffer`，屏障跟踪跨提交保留；GL 后端用 `glBufferData` / `glBufferSubData`，它们本身就是拷贝；CPU 后端的 kernel 在 `execute()` 时已经算完。所以帧 k 的场景更新可以在帧 k-1 还在设备上时录制，主机端表之后随便改。例外是 `createBuffer` 分配的映射内存，设备原地读写，回读 buffer 就是这种，它们由帧图在帧完成之前一直持有。
 - 表变大时换上一张新表，旧表进这一帧的退役列表，帧完成之后才释放。tc 自己也会把设备端的副本推迟到用过它的提交完成之后再销毁（Vulkan 的 graveyard，GL 删除对象时驱动本来就推迟），退役列表让主机端对象的寿命也不依赖这一点。
-- 每个内置 kernel 最多用 8 个 storage buffer、4 个存储图像，高于规范下限的 4 个 storage buffer；不满足的设备在启动时由 `checkKernel` 报告出来。
+- 每个内置 kernel 最多用 8 个 storage buffer、4 个存储图像、16 个采样纹理，push constant 不超过 128 字节；8 个 storage buffer 高于规范下限的 4 个，不满足的设备在启动时由 `checkKernel` 报告出来。着色 kernel 正好用满 8 个（实例、顶点、索引、材质、灯光、可见实例、像素列表、阴影贴图），所以可见实例列表带上网格的首索引和首顶点，省掉网格表；阴影级联的矩阵放在阴影贴图 buffer 的开头，省掉一个参数 buffer；模型的像素列表每项是（像素、三角形），着色 kernel 因此不必再读逐像素的三角形 buffer，列表的表头（每个模型的长度和起点）放在同一个 buffer 的开头。透明混合 kernel 的第 8 个是片元链表，片元和它们的表头放在同一个 buffer 里。TAA 的运动 pass 要三个矩阵，超过 128 字节，所以放进一个小 buffer，由 pass 每帧上传。
+- 每帧变化的小块数据（阴影级联的矩阵）由 pass 写进帧图 buffer 的主机端副本，再 `uploadBuffer` 一段：帧图 buffer 按在途帧各取一份，上传在调用时拷走，所以不会和在途帧冲突。
 - HDR 中间目标用 `RGBA16F`，它在 GLES 3.1 和 Vulkan 上都是强制支持的存储格式，也能线性过滤。
 
 #### 回读
@@ -424,7 +446,7 @@ CO2_END
 
 ### examples：组合根
 
-`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 和 asset 还没有，目前显示演示场景）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口）。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
+`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 和 asset 还没有，目前显示演示场景；TAA 默认打开，T 键开关）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口；`--taa` 打开 TAA，默认关）。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
 
 ```cpp
 for (;;) {
@@ -478,7 +500,7 @@ IO       │          等 N 完成 ───────────────
 - 错误：
   - 可恢复的情况（资产缺失、解码失败）作为值返回（`AssetResult<T>`），走 `set_value`。
   - 设备错误（`tc::DeviceError`）是异常，可能出现在录制、提交、等待完成或收尾时。GPU 线程收到后让出错的帧和所有在途帧以这个错误完成，先放掉旧设备上建的一切（帧图资源、资源池、历史图像、`DeviceScene`、退役列表），再 `recreateDevice`，最后把设备代数加一。等待完成失败也按设备丢失处理，因为那时不知道设备还用不用这一帧的资源。
-  - 每一帧在渲染线程上准备时记下当时的设备代数。代数已经过时的帧（设备重建之前准备好的）不再录制，同样以那个错误完成；渲染线程发现代数变了，下一帧用 `RenderWorld::fullUpdate()` 从网格句柄重新编码整个场景（几何、各个槽、要追踪光线时重建 BVH），并让所有历史资源从头开始。这一帧之后的帧照常渲染。纹理还没有实现，以后在 `FrameResult` 里列出需要重新提交的纹理；宿主也可以选择换成 `cpu` 后端。新设备建不出来时，下一帧再试一次，还不行就以那个原因失败。
+  - 每一帧在渲染线程上准备时记下当时的设备代数。代数已经过时的帧（设备重建之前准备好的）不再录制，同样以那个错误完成；渲染线程发现代数变了，下一帧用 `RenderWorld::fullUpdate()` 从网格句柄重新编码整个场景（几何、各个槽、要追踪光线时重建 BVH），并让所有历史资源从头开始。这一帧之后的帧照常渲染。纹理的像素不在渲染线程上，没法重新上传：这一帧把放置过的纹理记为丢失，在 `FrameResult::lostTextures` 里列出，宿主重新 upsert 之前材质只用因子；宿主也可以选择换成 `cpu` 后端。新设备建不出来时，下一帧再试一次，还不行就以那个原因失败。
   - 测试里用一个录制时抛 `tc::DeviceError` 的 feature 模拟设备丢失。
   - 契约违规交给进程级处理器；co2 和 stackfull 都有这样的处理器，lrender 安装一个统一的。
 - 开启异常编译：co2、lexec 的 co2 桥和 tc 的错误报告都依赖异常。
@@ -522,7 +544,7 @@ lrender/
   core/      include/lr/core/                     lr::core     INTERFACE
   runtime/   include/lr/runtime/   src/           lr::runtime  lexec::runtime、stackfull
   gpu/       include/lr/gpu/       src/           lr::gpu      tc、tc_devices、stackfull::exec、stackfull::runtime
-  render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)
+  render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)；include/lr/render/kernels/ 是用户 kernel 也要用的公开 kernel 头文件
   present/   image_sequence/  sdl/  （android/）  lr::present_image  lr::present_sdl  （lr::present_android）
   asset/     include/lr/asset/     src/           lr::asset    stackfull::exec、cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    co2、lexec 的 co2 桥
@@ -542,7 +564,7 @@ lrender/
 | 模块 | 类型 | 验证方式 |
 |---|---|---|
 | core、RenderWorld、帧图编译 | 确定 | 单元测试 |
-| render kernel | 确定 | CPU 后端的金标准图像，加上跨后端等价测试；子组和 64 位原子的变体与回退变体互相比对；设备图像没有读回接口，纹理池的内容用采样 kernel 读进 buffer 再比对 |
+| render kernel | 确定 | CPU 后端的金标准图像，加上跨后端等价测试；子组和 64 位原子的变体与回退变体在同一个设备上互相比对（三角形、深度、可见实例列表、图像逐位相同）；自定义材质模型只改变自己的像素；TAA 与主机上的模拟和解析覆盖率比对，并测拖影、运动矢量和历史的重置；设备图像没有读回接口，纹理池的内容由着色 kernel 采样（自发光纹理贴满一个四边形，像素中心对准纹素中心），再用读 HDR 颜色的 feature 读进 buffer 比对；阴影、透明、环境光的镜面部分、法线贴图与路径追踪器或解析结果比对 |
 | Renderer 整体 | 确定 | cpu 后端，以及 llvmpipe、lavapipe 上的 GPU 后端（没有 sync file，走 `Submission` 的等待路径）：连续提交的帧按序完成、累积结果与逐帧提交相同、在途帧不超过上限（用一个数录制而未收尾帧数的 feature）、多视图、窗口目标交给测试用的 Presenter、缩放、设备丢失恢复（用一个录制时抛 `tc::DeviceError` 的 feature）；`ImageSequencePresenter` 写出的文件与离屏目标的图像逐像素相同 |
 | scene、ScriptHost | 确定 | 手动 tick 的单元测试；`Deterministic` 模式下的时间线逐帧比对 |
 | asset | 半确定 | 用内存源做单元测试；`asset_probe` 读真实文件、测热重载与取消 |
@@ -554,7 +576,7 @@ lrender/
 2. **M1** 渲染核心：`RenderWorld` 增量、帧图、可见性缓冲管线的最小版本（GPU 剔除与间接 dispatch、两遍可见性缓冲、基础 PBR 着色、色调映射），在 cpu 后端上配合 `lrender_cli` 建立金标准测试。
 3. **M2** 参考路径追踪，作为画质参照；Vulkan、OpenGL、GLES 与 CPU 的等价测试；打开设备计时器，定下每张表的布局和编码。
 4. **M3** 完整的 Renderer 接口：渲染线程、GPU 线程、异步提交与 IO 上的完成等待、回读 buffer、在途帧、多视图、缩放、设备丢失恢复、SDL 窗口目标与图片序列；`lrender_view`。`gpu_probe` 和 `present_probe` 还没有写。
-5. **M4** 画质：阴影、透明、材质分类与间接着色、TAA、设备端纹理池（mip、流式写入）、一遍写入的可见性缓冲和子组变体。
+5. **M4** 画质。M4a：设备端纹理池（mip、流式写入、压缩格式与解码回退、设备丢失后列出丢失的纹理）、带纹理的材质（法线贴图、UV 变换、alpha 遮罩）、级联阴影、逐像素链表的顺序无关透明、均匀环境光的镜面部分；路径追踪器同样采样纹理，混合材质按随机不透明处理。M4b：启动时的 kernel 检查与变体选择、一遍写入的可见性缓冲和子组变体、材质分类与间接着色（应用可以加自己的材质模型）、TAA。
 6. **M5** asset：流式加载、取消、热重载、KTX2 与按设备选择压缩格式，以及开发期的 kernel 重新加载。
 7. **M6** scene 与脚本：生命周期、确定性模式。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。

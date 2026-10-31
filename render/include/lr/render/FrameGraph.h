@@ -5,6 +5,7 @@
 
 #include <lr/core/Math.h>
 #include <lr/core/Scene.h>
+#include <lr/render/Capabilities.h>
 #include <lr/render/GpuTypes.h>
 #include <lr/render/View.h>
 
@@ -14,6 +15,7 @@
 #include <cstdint>
 #include <functional>
 #include <memory>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <string_view>
@@ -21,6 +23,7 @@
 #include <typeinfo>
 #include <unordered_map>
 #include <utility>
+#include <vector>
 
 namespace lr::render {
 
@@ -86,9 +89,11 @@ struct PassContext {
         device().execute(kernel, workGroups);
         dispatched(K::fileLocation);
     }
+    // With the workgroup counts arguments[index] holds when the device gets there.
     template <class K>
-    void dispatchIndirect(K &kernel, BufferRef<tc::DispatchIndirectCommand> const arguments) {
-        device().executeIndirect(kernel, buffer(arguments));
+    void dispatchIndirect(K &kernel, BufferRef<tc::DispatchIndirectCommand> const arguments,
+                          std::size_t const index = 0) {
+        device().executeIndirect(kernel, buffer(arguments), index);
         dispatched(K::fileLocation);
     }
 
@@ -251,6 +256,27 @@ private:
     }
 };
 
+// The directional light the visibility pipeline gives shadows to.
+struct ShadowLight {
+    std::uint32_t index = 0;   // in the light table
+    core::vec3 direction{0.0f}; // that the light travels, unit length
+};
+
+// A view whose pipeline jitters (FeatureRequirements::temporalJitter) and whose settings
+// ask for temporal anti-aliasing: ViewContext::viewProjection moves where points land by
+// `jitter` pixels this frame.
+struct TemporalView {
+    core::vec2 jitter{0.0f};   // pixels, right and down; within half a pixel
+    std::uint32_t sample = 0;  // frames since the view's history started over
+    core::mat4 viewProjection{1.0f};         // this frame's, without the jitter
+    core::mat4 previousViewProjection{1.0f}; // the previous frame's, without its jitter
+    // The previous frame rendered the view, jittered, at this extent and the camera did not
+    // cut: its history still shows the scene.
+    bool continues = false;
+};
+
+struct MaterialModel;
+
 // What a feature knows about the view it sets up.
 struct ViewContext {
     ViewId view;
@@ -260,12 +286,22 @@ struct ViewContext {
     core::EnvironmentDesc environment;
     core::mat4 viewMatrix{1.0f};
     core::mat4 projection{1.0f};
+    // Jittered where `temporal` is set.
     core::mat4 viewProjection{1.0f};
     core::mat4 inverseViewProjection{1.0f};
+    std::optional<TemporalView> temporal;
+    RendererCapabilities capabilities;
+    // The renderer's material models when the frame was prepared, by MaterialModelId.
+    std::vector<std::shared_ptr<MaterialModel>> materialModels;
     std::uint32_t instanceCount = 0;
     std::uint32_t lightCount = 0;
-    // Changes whenever a frame's delta changes meshes, materials, instances, lights or
-    // the environment.
+    // Instances whose material blends.
+    std::uint32_t transparentInstanceCount = 0;
+    // Of every instance; min > max when there are none.
+    core::Aabb sceneBounds;
+    std::optional<ShadowLight> shadowLight;
+    // Changes whenever a frame's delta changes meshes, textures, materials, instances,
+    // lights or the environment.
     std::uint64_t sceneVersion = 0;
     // Shading writes HDR radiance here; post-processing reads and rewrites it.
     ImageRef<HdrFormat> sceneColor;
@@ -276,16 +312,21 @@ struct ViewContext {
 
 enum class FeatureStage : std::uint8_t {
     Visibility,
+    Shadow,
     Shading,
+    Transparent,
     PostProcess,
     Output,
 };
 
-// What a feature needs of the scene beyond the tables SceneTables always has.
-struct SceneRequirements {
+// What a feature needs of the scene and the view beyond what every feature gets.
+struct FeatureRequirements {
     // The hierarchies of SceneTables. Built from the first frame with a view that needs
     // them, then kept up to date.
     bool rayTracing = false;
+    // A projection jittered anew every frame (ViewContext::temporal) for views whose
+    // settings ask for temporal anti-aliasing.
+    bool temporalJitter = false;
 };
 
 // A pipeline is a list of features, set up in stage order (and, within a stage, in the
@@ -294,7 +335,7 @@ struct RenderFeature {
     virtual ~RenderFeature() = default;
 
     virtual FeatureStage stage() const noexcept = 0;
-    virtual SceneRequirements requirements() const noexcept { return SceneRequirements{}; }
+    virtual FeatureRequirements requirements() const noexcept { return FeatureRequirements{}; }
     virtual void setup(FrameGraphBuilder &graph, ViewContext const &view) = 0;
 };
 

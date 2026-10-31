@@ -10,8 +10,9 @@ struct DemoScene {
     core::CameraDesc camera;
 };
 
-// A ground plane with a box and spheres of different materials, a sun, a point light and
-// a sky.
+// A checkered ground plane with a textured, normal-mapped box, a gold, a glowing and a
+// glass-like (blended) sphere and a lattice cut out by alpha, a sun that casts shadows,
+// a point light and a sky. The textures are made here.
 DemoScene makeDemoScene();
 
 } // namespace lr::examples

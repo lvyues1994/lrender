@@ -34,6 +34,8 @@ struct PreparedFrame {
     SceneUpdate scene;
     std::vector<PreparedView> views;
     std::vector<std::uint64_t> releasedHistories;
+    // Textures a lost device took with it, for FrameResult::lostTextures.
+    std::vector<core::TextureId> lostTextures;
     // What the frame's FrameSender waits for.
     stackfull::sync::Completion<FrameResult> completion;
 };

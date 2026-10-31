@@ -51,29 +51,6 @@ render::ViewDesc pathTraced(RenderHarness &harness, core::RenderTargetId const t
     return view;
 }
 
-// The CPU backend, then each GPU backend on Mesa's software devices, which have no sync
-// files. GPU backends that cannot start are skipped, unless LRENDER_TEST_REQUIRE_GPU is set.
-template <class Fn>
-void forEachBackend(test::HarnessOptions options, Fn const &fn) {
-    auto const requireGpu = std::getenv("LRENDER_TEST_REQUIRE_GPU") != nullptr;
-    for (auto const &backend : tc::availableBackends()) {
-        CAPTURE(backend);
-        options.backend = backend;
-        options.device = backend == "cpu" ? "" : "llvmpipe";
-        auto harness = std::unique_ptr<RenderHarness>{};
-        try {
-            harness = std::make_unique<RenderHarness>(options);
-        } catch (tc::DeviceError const &error) {
-            if (requireGpu) {
-                FAIL(error.what());
-            }
-            MESSAGE("skipped: " << error.what());
-            continue;
-        }
-        fn(*harness);
-    }
-}
-
 struct Outcome {
     std::size_t submitted = 0; // the position of the frame among those submitted together
     std::optional<render::FrameResult> result;
@@ -121,7 +98,7 @@ bool failedWith(std::exception_ptr const &failure) {
 constexpr auto kOrderedFrames = 12u;
 
 TEST_CASE("frames submitted back to back are rendered and completed in order, on every backend") {
-    forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
+    test::forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
         auto const view = pathTraced(harness, imageTarget(harness, core::ivec2{8, 8}));
         auto frames = std::vector<render::FrameDesc>{};
         for (auto frame = 0u; frame < kOrderedFrames; ++frame) {
@@ -160,7 +137,7 @@ TEST_CASE("accumulating frames back to back gives the image accumulating them on
         }
         return *last.views[0].image;
     };
-    forEachBackend(test::HarnessOptions{}, [&finalImage](RenderHarness &harness) {
+    test::forEachBackend(test::HarnessOptions{}, [&finalImage](RenderHarness &harness) {
         auto options = test::HarnessOptions{};
         options.backend = harness.renderer->deviceInfo().backend;
         options.device = options.backend == "cpu" ? "" : "llvmpipe";
@@ -203,7 +180,7 @@ TEST_CASE("no more than framesInFlight frames are recorded and not yet finished,
         CAPTURE(limit);
         auto options = test::HarnessOptions{};
         options.framesInFlight = limit;
-        forEachBackend(options, [limit](RenderHarness &harness) {
+        test::forEachBackend(options, [limit](RenderHarness &harness) {
             auto &pipelines = harness.renderer->pipelines();
             auto const probe = std::make_shared<InFlightProbe>();
             auto view = test::viewOf(imageTarget(harness), frontCamera());
@@ -344,34 +321,14 @@ TEST_CASE("frames submitted before a window target is destroyed still reach its 
     CHECK_THROWS_AS(harness.renderer->submit(render::FrameDesc{{}, {view}}), std::invalid_argument);
 }
 
-// Throws tc::DeviceError when its pass is recorded for the `failingCall`th time, as tc
-// does when the device is lost while a frame is recorded.
-struct DeviceLossInjector final : render::RenderFeature {
-    explicit DeviceLossInjector(int const failingCall) : callsLeft(std::make_shared<std::atomic<int>>(failingCall)) {}
-
-    render::FeatureStage stage() const noexcept override { return render::FeatureStage::PostProcess; }
-
-    void setup(render::FrameGraphBuilder &graph, render::ViewContext const &view) override {
-        auto &pass = graph.addPass("lose the device");
-        pass.read(view.sceneColor);
-        pass.write(view.sceneColor);
-        pass.record([callsLeft = callsLeft](render::PassContext &) {
-            if (callsLeft->fetch_sub(1) == 1) {
-                throw tc::DeviceError{"lr::test: the device is lost"};
-            }
-        });
-    }
-
-    std::shared_ptr<std::atomic<int>> callsLeft;
-};
-
 TEST_CASE("a lost device fails its frame, and the next frame renders the whole scene on a new device, on every backend") {
-    forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
+    test::forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
         auto &pipelines = harness.renderer->pipelines();
         auto const visibility = test::viewOf(imageTarget(harness), frontCamera(), core::ViewId{0});
         auto const traced = pathTraced(harness, imageTarget(harness), core::ViewId{1});
         auto lossy = visibility;
-        lossy.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {std::make_shared<DeviceLossInjector>(1)}});
+        lossy.pipeline = pipelines.create(
+            render::PipelineDesc{pipelines.visibility(), {std::make_shared<test::DeviceLossInjector>(1)}});
 
         auto const first = harness.render(render::FrameDesc{quadScene(), {visibility, traced}});
         CHECK(harness.render(render::FrameDesc{{}, {visibility, traced}}).views.at(1).stats.accumulatedSamples == 2);
@@ -393,7 +350,8 @@ TEST_CASE("the frames in flight when the device is lost fail with it, and the fr
     auto &pipelines = harness.renderer->pipelines();
     auto view = test::viewOf(imageTarget(harness), frontCamera());
     view.pipeline = pipelines.create(
-        render::PipelineDesc{pipelines.visibility(), {std::make_shared<DeviceLossInjector>(static_cast<int>(kLostIn) + 1)}});
+        render::PipelineDesc{pipelines.visibility(),
+                             {std::make_shared<test::DeviceLossInjector>(static_cast<int>(kLostIn) + 1)}});
     auto frames = std::vector<render::FrameDesc>{};
     for (auto frame = 0u; frame < kFrames; ++frame) {
         frames.push_back(render::FrameDesc{frame == 0 ? quadScene() : core::RenderWorldDelta{}, {view}});

@@ -41,6 +41,7 @@ void FrameQueue::clear() noexcept {
     pool.clear();
     historyImages.clear();
     deviceScene = DeviceScene{};
+    textures.clear();
 }
 
 void FrameQueue::advance(gpu::GpuContext &context) noexcept {
@@ -62,6 +63,7 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
     frame.submitted = prepared.submitted;
     frame.completion = prepared.completion;
     frame.result.frameIndex = prepared.index;
+    frame.result.lostTextures = std::move(prepared.lostTextures);
     for (auto const &view : prepared.views) {
         auto result = ViewResult{};
         result.view = view.view;
@@ -88,7 +90,9 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
 // frame keeps its resources until the device is done with it.
 void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFlight &frame) {
     auto &device = *context.device;
-    deviceScene.apply(device, prepared.scene, frame.retired);
+    textures.apply(device, prepared.scene, frame.retired);
+    textures.stream(device, frame.retired);
+    deviceScene.apply(device, prepared.scene, textures, frame.retired);
     historyImages.release(prepared.releasedHistories, frame.retired);
     try {
         recordViews(device, prepared, frame);
@@ -108,7 +112,8 @@ void FrameQueue::recordViews(tc::Device &device, PreparedFrame &prepared, InFlig
             std::rethrow_exception(view.failure);
         }
     }
-    auto const tables = deviceScene.tables();
+    auto tables = deviceScene.tables();
+    tables.textures = textures.textures();
     frame.runs.reserve(prepared.views.size());
     for (auto &view : prepared.views) {
         frame.runs.emplace_back(std::move(*view.graph), pool, historyImages, device);
@@ -156,14 +161,23 @@ void FrameQueue::finishCompleted(gpu::GpuContext &context) {
         {
             auto frame = std::move(inFlight.front());
             inFlight.pop_front();
+            auto lostTextures = std::move(frame.result.lostTextures);
             try {
-                outcomes.push_back(Outcome{frame.completion, finish(context, frame), nullptr});
+                auto result = finish(context, frame);
+                result.lostTextures = std::move(unreportedLostTextures);
+                unreportedLostTextures.clear();
+                result.lostTextures.insert(result.lostTextures.end(), lostTextures.begin(), lostTextures.end());
+                outcomes.push_back(Outcome{frame.completion, std::move(result), nullptr});
             } catch (tc::DeviceError const &) {
                 lost = std::current_exception();
                 outcomes.push_back(Outcome{frame.completion, {}, lost});
             } catch (...) {
                 outcomes.push_back(Outcome{frame.completion, {}, std::current_exception()});
             }
+            if (not outcomes.back().failure) {
+                lostTextures.clear();
+            }
+            unreportedLostTextures.insert(unreportedLostTextures.end(), lostTextures.begin(), lostTextures.end());
         }
         // After the frame's resources went back to the pool, which this empties.
         if (lost) {
@@ -197,11 +211,14 @@ FrameResult FrameQueue::finish(gpu::GpuContext &context, InFlight &frame) {
 void FrameQueue::loseDevice(gpu::GpuContext &context, std::exception_ptr const &failure) {
     for (auto &frame : inFlight) {
         outcomes.push_back(Outcome{frame.completion, {}, failure});
+        auto const &lostTextures = frame.result.lostTextures;
+        unreportedLostTextures.insert(unreportedLostTextures.end(), lostTextures.begin(), lostTextures.end());
     }
     inFlight.clear();
     pool.clear();
     historyImages.clear();
     deviceScene = DeviceScene{};
+    textures.clear();
     lostWith = failure;
     try {
         recreateDevice(context);
@@ -213,6 +230,9 @@ void FrameQueue::loseDevice(gpu::GpuContext &context, std::exception_ptr const &
 
 void FrameQueue::recreateDevice(gpu::GpuContext &context) {
     config.gpu->recreateDevice(context);
+    if (config.checkDevice) {
+        config.checkDevice(*context.device);
+    }
     if (config.timers) {
         context.device->enableTimers(true);
     }

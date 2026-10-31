@@ -1,7 +1,9 @@
 #pragma once
 
 #include <lr/core/RenderWorldDelta.h>
+#include <lr/render/Capabilities.h>
 #include <lr/render/FrameGraph.h>
+#include <lr/render/MaterialModel.h>
 #include <lr/render/Presenter.h>
 #include <lr/render/View.h>
 #include <lr/runtime/Runtime.h>
@@ -11,6 +13,7 @@
 #include <tc/device.hpp>
 
 #include <chrono>
+#include <cstddef>
 #include <cstdint>
 #include <exception>
 #include <memory>
@@ -50,7 +53,8 @@ struct PipelineDesc {
 struct PipelineRegistry {
     virtual ~PipelineRegistry() = default;
 
-    // The real-time pipeline: visibility buffer, shading, tone mapping.
+    // The real-time pipeline: visibility buffer, shadow map, shading, transparency, tone
+    // mapping.
     virtual PipelineId visibility() const noexcept = 0;
     // The reference: a path tracer that adds a sample per pixel each frame of a view and
     // shows their mean, tone mapped (ViewStats::accumulatedSamples).
@@ -68,6 +72,9 @@ struct FrameResult {
     std::vector<ViewResult> views;
     // From submit() until the frame was finished, after the device.
     std::chrono::duration<double, std::milli> wallTime{0.0};
+    // Textures the device held when it was lost: upsert them again. Until then materials
+    // use their factors alone. Frames that fail leave the list to the next one that does not.
+    std::vector<core::TextureId> lostTextures;
 };
 
 using FrameSender = lexec::any_sender_of<lexec::set_value_t(FrameResult), lexec::set_error_t(std::exception_ptr),
@@ -83,14 +90,26 @@ struct RendererConfig {
     // Frames recorded for the device and not finished yet, at most; later frames wait,
     // prepared, until an earlier one finishes.
     std::uint32_t framesInFlight = 2;
+    // Texture data copied to the device per frame, at most; new textures stream in over
+    // as many frames as that takes, and a single mip level larger than this goes alone.
+    std::size_t textureStreamingBytes = std::size_t{8} << 20;
+    // Larger textures are scaled down on the host (also to what the device allows).
+    std::uint32_t maxTextureSize = 2048;
+    // Optional kernel variants (RendererCapabilities), each used where the device runs it
+    // unless turned off here.
+    VariantUse subgroups = VariantUse::Auto;
+    VariantUse singlePassVisibility = VariantUse::Auto;
 };
 
 struct Renderer {
     virtual ~Renderer() = default;
 
     virtual tc::DeviceInfo const &deviceInfo() const noexcept = 0;
+    // The kernel variants chosen for the device; the same after the device is recreated.
+    virtual RendererCapabilities const &capabilities() const noexcept = 0;
     virtual RenderTargets &targets() noexcept = 0;
     virtual PipelineRegistry &pipelines() noexcept = 0;
+    virtual MaterialModels &materialModels() noexcept = 0;
 
     // Returns at once; any thread may call it. Frames are numbered and processed in the
     // order of the calls, whether or not their senders are started, and the senders
@@ -101,7 +120,8 @@ struct Renderer {
     virtual FrameSender submit(FrameDesc frame) = 0;
 };
 
-// Throws tc::DeviceError when the device cannot be created.
+// Throws tc::DeviceError when the device cannot be created, or cannot run one of the
+// kernels every frame may need (the message names them).
 std::unique_ptr<Renderer> makeRenderer(RendererConfig const &config);
 
 } // namespace lr::render

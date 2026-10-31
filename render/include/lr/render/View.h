@@ -20,19 +20,39 @@ enum class ToneMapping : std::uint8_t {
     Aces,  // exposure, then the ACES filmic curve
 };
 
+// The visibility pipeline's cascaded shadow map for the shadowed directional light.
+struct ShadowSettings {
+    std::uint32_t cascades = 3;      // 1 to 4, splitting the distance from the near plane
+    std::uint32_t resolution = 1024; // texels on a side of each cascade
+    float distance = 40.0f;          // from the camera; nothing farther receives shadows
+};
+
+enum class AntiAliasing : std::uint8_t {
+    None,
+    // Temporal: the visibility pipeline moves its projection by a different sub-pixel
+    // offset every frame and blends each frame into the view's history, reprojected along
+    // the motion of the surfaces. The path tracer ignores it; it averages anyway.
+    Taa,
+};
+
 struct ViewSettings {
     float exposure = 1.0f;
     ToneMapping toneMapping = ToneMapping::Aces;
+    ShadowSettings shadows;
+    AntiAliasing antiAliasing = AntiAliasing::None;
 };
 
-// A view keeps history (the path tracer's accumulation) by its id across frames, until
-// it goes unrendered for a while or its target is destroyed.
+// A view keeps history (the path tracer's accumulation, temporal anti-aliasing) by its id
+// across frames, until it goes unrendered for a while or its target is destroyed.
 struct ViewDesc {
     ViewId id;
     RenderTargetId target;
     PipelineId pipeline; // an invalid id selects the visibility pipeline
     core::CameraDesc camera;
     ViewSettings settings;
+    // The camera jumped since the view's previous frame: temporal anti-aliasing starts over
+    // instead of reprojecting what the view showed before.
+    bool cameraCut = false;
 };
 
 // sRGB-encoded RGBA8, one std::uint32_t per pixel with red in the low byte, rows from the top.

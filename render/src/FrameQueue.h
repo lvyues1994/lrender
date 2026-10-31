@@ -4,6 +4,7 @@
 #include "FrameGraphImpl.h"
 #include "PreparedFrame.h"
 #include "RetireList.h"
+#include "TexturePool.h"
 
 #include <lr/gpu/GpuQueue.h>
 #include <lr/render/Renderer.h>
@@ -17,6 +18,7 @@
 #include <cstdint>
 #include <deque>
 #include <exception>
+#include <functional>
 #include <vector>
 
 namespace lr::render {
@@ -30,6 +32,9 @@ struct FrameQueueConfig {
     std::atomic<std::uint64_t> *deviceGeneration = nullptr;
     std::uint32_t framesInFlight = 2;
     bool timers = false;
+    std::size_t textureStreamingBytes = std::size_t{8} << 20;
+    // Throws tc::DeviceError when a recreated device cannot run the kernels frames use.
+    std::function<void(tc::Device &)> checkDevice;
 };
 
 // The GPU thread's frames. Prepared frames are recorded in order, at most framesInFlight
@@ -38,7 +43,9 @@ struct FrameQueueConfig {
 // it held), and its sender completes then, so senders complete in frame order. Runs only
 // on the GPU thread, so it needs no locks.
 struct FrameQueue {
-    explicit FrameQueue(FrameQueueConfig const &config_) noexcept : config(config_) {}
+    explicit FrameQueue(FrameQueueConfig const &config_) noexcept
+        : config(config_),
+          textures(TexturePoolConfig{config_.textureStreamingBytes, config_.framesInFlight}) {}
 
     void accept(gpu::GpuContext &context, PreparedFrame frame) noexcept;
     // Drops every resource the GPU thread holds; at shutdown, once no frame is left.
@@ -80,12 +87,15 @@ private:
 
     FrameQueueConfig config;
     DeviceScene deviceScene;
+    TexturePool textures;
     ResourcePool pool;
     HistoryResources historyImages;
     std::deque<PreparedFrame> waiting;
     std::deque<InFlight> inFlight;
     std::vector<Outcome> outcomes;
     std::exception_ptr lostWith; // what the frames prepared for a lost device fail with
+    // Lost textures of frames that failed, for the next frame that succeeds to report.
+    std::vector<core::TextureId> unreportedLostTextures;
 };
 
 } // namespace lr::render

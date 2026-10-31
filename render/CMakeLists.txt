@@ -11,8 +11,10 @@ target_link_libraries(lr_render
 tc_add_kernels(lr_render HEADERS
     kernels/Visibility.h
     kernels/Shading.h
+    kernels/Temporal.h
     kernels/PathTrace.h
-    kernels/Post.h)
+    kernels/Post.h
+    kernels/Textures.h)
 
 # Each transpiled kernel registers itself from a static initializer that nothing refers
 # to, so consumers link the whole archive or the linker drops the registrations.

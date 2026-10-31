@@ -1,11 +1,13 @@
 // lrender_cli: renders the demo scene offline and writes it to a PPM file.
 //
 //   lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
-//               [--pipeline visibility|pathtrace] [--samples <n>] [--timers on|off]
+//               [--pipeline visibility|pathtrace] [--taa] [--samples <n>] [--timers on|off]
 //               [--out <file> | --sequence <directory>]
 //
 // The path tracer renders --samples frames, one sample per pixel each, and writes the last
 // to --out; with --sequence every frame goes to <directory>/frame<index>.ppm instead.
+// --taa turns on the visibility pipeline's temporal anti-aliasing, which then renders
+// --samples frames (16 unless given) of the still scene.
 
 #include <lr/examples/CommandLine.h>
 #include <lr/examples/DemoScene.h>
@@ -27,16 +29,26 @@
 
 namespace {
 
+constexpr auto kTaaFrames = std::uint32_t{16};
+
 struct Options {
     std::string backend = "cpu";
     std::string device;
     lr::core::ivec2 size{960, 540};
     bool pathTrace = false;
-    std::uint32_t samples = 1;
+    bool taa = false;
+    std::optional<std::uint32_t> samples;
     bool timers = false;
     std::string out = "lrender.ppm";
     std::string sequence; // a directory: every frame through a window target
 };
+
+std::uint32_t framesOf(Options const &options) {
+    if (options.pathTrace) {
+        return options.samples.value_or(1u);
+    }
+    return options.taa ? options.samples.value_or(kTaaFrames) : 1u;
+}
 
 // Applies one flag and its value; false when either is not understood.
 bool apply(Options &options, std::string const &flag, std::string const &value) {
@@ -52,9 +64,8 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         options.pathTrace = value == "pathtrace";
         return value == "pathtrace" or value == "visibility";
     } else if (flag == "--samples") {
-        auto const samples = lr::examples::parseCount(value);
-        options.samples = samples.value_or(0u);
-        return samples.has_value();
+        options.samples = lr::examples::parseCount(value);
+        return options.samples.has_value();
     } else if (flag == "--timers") {
         options.timers = value == "on";
         return value == "on" or value == "off";
@@ -69,14 +80,17 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
 }
 
 std::optional<Options> parse(int const argc, char **const argv) {
-    if (argc % 2 == 0) {
-        return std::nullopt;
-    }
     auto options = Options{};
-    for (auto index = 1; index + 1 < argc; index += 2) {
-        if (not apply(options, argv[index], argv[index + 1])) {
+    for (auto index = 1; index < argc; ++index) {
+        auto const flag = std::string{argv[index]};
+        if (flag == "--taa") {
+            options.taa = true;
+            continue;
+        }
+        if (index + 1 == argc or not apply(options, flag, argv[index + 1])) {
             return std::nullopt;
         }
+        ++index;
     }
     return options;
 }
@@ -131,7 +145,10 @@ int run(Options const &options) {
     config.runtime = runtime.get();
     config.gpuTimers = options.timers;
     auto renderer = lr::render::makeRenderer(config);
-    std::printf("backend %s: %s\n", renderer->deviceInfo().backend.c_str(), renderer->deviceInfo().deviceName.c_str());
+    auto const &capabilities = renderer->capabilities();
+    std::printf("backend %s: %s; subgroups %s, single-pass visibility %s\n", renderer->deviceInfo().backend.c_str(),
+                renderer->deviceInfo().deviceName.c_str(), capabilities.subgroups ? "on" : "off",
+                capabilities.singlePassVisibility ? "on" : "off");
 
     auto scene = lr::examples::makeDemoScene();
     auto view = lr::render::ViewDesc{};
@@ -139,9 +156,10 @@ int run(Options const &options) {
     view.target = targetOf(*renderer, options, sequence);
     view.pipeline = options.pathTrace ? renderer->pipelines().pathTraceReference() : renderer->pipelines().visibility();
     view.camera = scene.camera;
+    view.settings.antiAliasing = options.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
     auto delta = std::move(scene.delta);
 
-    auto const frames = options.pathTrace ? options.samples : 1u;
+    auto const frames = framesOf(options);
     auto last = lr::render::FrameResult{};
     auto const start = std::chrono::steady_clock::now();
     for (auto frame = 0u; frame < frames; ++frame) {
@@ -159,8 +177,8 @@ int run(Options const &options) {
     if (options.pathTrace) {
         std::printf(", %u samples per pixel", result.stats.accumulatedSamples);
     } else {
-        std::printf(", %u instances and %u triangles visible", result.stats.visibleInstances,
-                    result.stats.visibleTriangles);
+        std::printf(", %u instances and %u triangles visible%s", result.stats.visibleInstances,
+                    result.stats.visibleTriangles, options.taa ? ", temporally anti-aliased" : "");
     }
     auto const written = writeOutput(options, result, sequence.get());
     std::printf("\n");
@@ -179,7 +197,7 @@ int main(int argc, char **argv) {
     if (not options) {
         std::fprintf(stderr, "usage: lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
-                             "                   [--pipeline visibility|pathtrace] [--samples <n>] "
+                             "                   [--pipeline visibility|pathtrace] [--taa] [--samples <n>] "
                              "[--timers on|off]\n"
                              "                   [--out <file> | --sequence <directory>]\n");
         return 2;

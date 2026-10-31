@@ -28,6 +28,8 @@ using LightId = Id<struct LightTag>;
 using ViewId = Id<struct ViewTag>;
 using RenderTargetId = Id<struct RenderTargetTag>;
 using PipelineId = Id<struct PipelineTag>;
+// Given out by the renderer that shades with the model; 0 is its built-in model.
+using MaterialModelId = Id<struct MaterialModelTag>;
 
 } // namespace lr::core
 

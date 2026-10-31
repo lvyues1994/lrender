@@ -4,7 +4,8 @@
 //                [--pipeline visibility|pathtrace] [--frames <n>]
 //
 // Drag with the left mouse button to orbit and scroll to zoom. Tab switches between the
-// visibility and the path tracing pipelines (1 and 2 pick one); Esc or Q quits. With
+// visibility and the path tracing pipelines (1 and 2 pick one); T turns the visibility
+// pipeline's temporal anti-aliasing off and on (on to begin with); Esc or Q quits. With
 // --frames it quits after that many frames, for runs nobody watches
 // (SDL_VIDEODRIVER=offscreen).
 
@@ -109,6 +110,7 @@ lr::core::CameraDesc cameraOf(Orbit const &orbit, lr::core::CameraDesc camera) {
 struct ViewerInput {
     Orbit orbit;
     bool pathTrace = false;
+    bool taa = true;
     bool quit = false;
     bool resized = false;
 };
@@ -118,6 +120,8 @@ void handleKey(SDL_Keycode const key, ViewerInput &input) {
         input.quit = true;
     } else if (key == SDLK_TAB) {
         input.pathTrace = not input.pathTrace;
+    } else if (key == SDLK_t) {
+        input.taa = not input.taa;
     } else if (key == SDLK_1) {
         input.pathTrace = false;
     } else if (key == SDLK_2) {
@@ -239,6 +243,7 @@ void submitFrame(Session const &session, ViewerInput const &input, lr::core::Ren
     view.target = session.target;
     view.pipeline = input.pathTrace ? pipelines.pathTraceReference() : pipelines.visibility();
     view.camera = cameraOf(input.orbit, session.camera);
+    view.settings.antiAliasing = input.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
     lexec::spawn(session.renderer.submit(lr::render::FrameDesc{std::move(delta), {view}})
                      | lexec::then([&reports](lr::render::FrameResult const &result) noexcept { reports.finished(result); })
                      | lexec::upon_error([&reports](std::exception_ptr const &error) noexcept { reports.failed(error); })
@@ -250,7 +255,7 @@ void submitFrame(Session const &session, ViewerInput const &input, lr::core::Ren
 
 void showStatus(Session const &session, ViewerInput const &input, FrameReports const &reports) {
     auto const title = input.pathTrace ? "lrender: path tracing, " + std::to_string(reports.samples.load()) + " samples"
-                                       : std::string{"lrender: visibility buffer"};
+                                       : std::string{"lrender: visibility buffer, TAA "} + (input.taa ? "on" : "off");
     SDL_SetWindowTitle(session.window, title.c_str());
 }
 
@@ -258,7 +263,7 @@ void showStatus(Session const &session, ViewerInput const &input, FrameReports c
 // waiting for a frame.
 LoopResult runLoop(Session const &session, Options const &options, lr::core::RenderWorldDelta scene,
                    FrameReports &reports, lexec::counting_scope &scope) {
-    auto input = ViewerInput{orbitOf(session.camera), options.pathTrace, false, false};
+    auto input = ViewerInput{orbitOf(session.camera), options.pathTrace, true, false, false};
     auto result = LoopResult{};
     auto delta = std::move(scene);
     while (not input.quit and not reports.firstFailure()) {

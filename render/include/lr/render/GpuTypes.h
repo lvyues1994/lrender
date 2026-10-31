@@ -5,6 +5,9 @@
 
 #include <tc/tc.hpp>
 
+#include <array>
+#include <cstdint>
+
 namespace lr::render {
 
 // Table layouts, chosen with probes/layout_probe; host tables and kernel bindings must use
@@ -37,6 +40,9 @@ struct GpuInstance {
     tc::Encoded<tc::mat4, tc::Affine3x4> worldToObject;
     tc::uint mesh;
     tc::uint material;
+    // Where the previous frame had the instance, for motion vectors; objectToWorld when it
+    // did not move or is new.
+    tc::Encoded<tc::mat4, tc::Affine3x4> previousObjectToWorld;
 };
 
 struct GpuMaterial {
@@ -45,7 +51,16 @@ struct GpuMaterial {
     float metallic;
     float roughness;
     float alphaCutoff;
-    tc::uint flags; // materialDoubleSided()
+    tc::uint flags; // materialDoubleSided(), materialAlphaMask(), materialAlphaBlend()
+    float normalScale;
+    // Base colour, metallic-roughness, emissive and normal: textureRef() of each, or
+    // noTexture() while it is absent.
+    tc::uvec4 textures;
+    // The texture coordinates every texture reads: (dot(uvRow0, (u, v, 1)), dot(uvRow1, ...)).
+    tc::vec3 uvRow0;
+    tc::vec3 uvRow1;
+    tc::uint model; // the material model that shades it; 0 is metallic-roughness
+    tc::vec4 parameters; // MaterialDesc::modelParameters
 };
 
 struct GpuLight {
@@ -71,6 +86,8 @@ struct GpuBvhTriangle {
 
 // Constants as functions: the transpiler turns free functions into GLSL functions.
 inline tc::uint materialDoubleSided() { return 1u; }
+inline tc::uint materialAlphaMask() { return 2u; }
+inline tc::uint materialAlphaBlend() { return 4u; }
 inline tc::uint lightDirectional() { return 0u; }
 inline tc::uint lightPoint() { return 1u; }
 // The visibility buffer of a pixel no triangle covers.
@@ -80,6 +97,55 @@ inline tc::uint noBvhNode() { return 0xFFFFFFFFu; }
 // Hierarchies are at most this many levels deep below the root, so traversal fits in a
 // stack of bvhMaxDepth() + 1 entries.
 inline constexpr tc::uint bvhMaxDepth() { return 31u; }
+
+// Textures live in pools, 2D array images of one format and one square power-of-two size
+// with full mip chains, sampled through a fixed set of bindings: colorPoolSlots() RGBA8
+// pools (texels in the texture's own encoding, sRGB or linear) and compressedPoolSlots()
+// pools of block-compressed formats.
+inline constexpr tc::uint colorPoolSlots() { return 8u; }
+inline constexpr tc::uint compressedPoolSlots() { return 4u; }
+inline constexpr tc::uint texturePoolSlots() { return colorPoolSlots() + compressedPoolSlots(); }
+inline tc::uint wrapRepeat() { return 0u; }
+inline tc::uint wrapClampToEdge() { return 1u; }
+inline tc::uint wrapMirroredRepeat() { return 2u; }
+inline tc::uint noTexture() { return 0xFFFFFFFFu; }
+
+// Where a texture is: bits 0-3 its pool slot, 4-15 its layer, 16-19 log2 of its size, 20
+// whether its texels are sRGB-encoded, 21-22 and 23-24 how it wraps in u and in v.
+inline tc::uint textureRef(tc::uint slot, tc::uint layer, tc::uint sizeLog2, bool srgb, tc::uint wrapU,
+                           tc::uint wrapV) {
+    return slot | layer << 4u | sizeLog2 << 16u | (srgb ? 1u : 0u) << 20u | wrapU << 21u | wrapV << 23u;
+}
+inline tc::uint textureSlot(tc::uint ref) { return ref & 15u; }
+inline tc::uint textureLayer(tc::uint ref) { return (ref >> 4u) & 4095u; }
+inline tc::uint textureSizeLog2(tc::uint ref) { return (ref >> 16u) & 15u; }
+inline bool textureIsSrgb(tc::uint ref) { return ((ref >> 20u) & 1u) != 0u; }
+inline tc::uint textureWrapU(tc::uint ref) { return (ref >> 21u) & 3u; }
+inline tc::uint textureWrapV(tc::uint ref) { return (ref >> 23u) & 3u; }
+
+// The shadow map buffer: a header of shadowHeaderWords() words, then per cascade
+// resolution^2 depths (floatBitsToUint of the nearest depth, 0xFFFFFFFF where nothing
+// was drawn). Header words: [0] cascades, [1] resolution, then per cascade c from
+// shadowCascadeWord(c): its world-to-shadow matrix (16 floats, column-major, mapping to
+// texture coordinates in x and y and depth in z) and the world size of one of its texels.
+inline constexpr tc::uint maxShadowCascades() { return 4u; }
+inline constexpr tc::uint shadowHeaderWords() { return 128u; }
+inline tc::uint shadowCascadeWord(tc::uint cascade) { return 8u + 20u * cascade; }
+
+// Material models a renderer holds at most, the built-in one included.
+inline constexpr tc::uint maxMaterialModels() { return 16u; }
+// The pixels each material model shades, in one buffer of uvec2: entry m < maxMaterialModels()
+// is (pixels of model m, where its list starts), and entry maxMaterialModels() + start + i
+// is (pixel index, visible triangle) of the model's i-th pixel.
+inline tc::uint modelListEntry(tc::uint start, tc::uint i) { return maxMaterialModels() + start + i; }
+
+// The transparent fragment lists of a view of `pixels` pixels, in one buffer of words: the
+// head of each pixel's list (noFragment() for none), the number of fragments pushed, then
+// from fragmentWords(pixels) three words per fragment: floatBitsToUint of its depth, the
+// next fragment of its pixel, its visible triangle.
+inline tc::uint noFragment() { return 0xFFFFFFFFu; }
+inline tc::uint fragmentCount(tc::uint pixels) { return pixels; }
+inline tc::uint fragmentWords(tc::uint pixels) { return (pixels + 4u) & ~3u; }
 
 template <tc::uint B>
 using VertexTable = tc::TableBinding<GpuVertex, B, VertexLayout>;
@@ -103,6 +169,27 @@ using HdrPixel = typename tc::GPUFormatTraits<HdrFormat>::StoragePixel;
 using AccumulationFormat = tc::gpu::RGBA32F;
 using AccumulationPixel = typename tc::GPUFormatTraits<AccumulationFormat>::StoragePixel;
 
+using ColorPoolFormat = tc::gpu::RGBA8;
+using ColorPoolPixel = tc::cpu::RGBA8;
+using ColorPoolImage = tc::DeviceImage<ColorPoolFormat, tc::Dim::D2Array, ColorPoolPixel>;
+using CompressedPoolImage = tc::DeviceCompressedImage<tc::Dim::D2Array>;
+// What a GGX lobe with Schlick's Fresnel reflects of a uniform environment, F0 A + B, as
+// (A, B) over (n . v, roughness) on texel centres.
+using EnvironmentBrdfFormat = tc::gpu::RG16F;
+using EnvironmentBrdfPixel = tc::cpu::RG16F;
+using EnvironmentBrdfImage = tc::DeviceImage<EnvironmentBrdfFormat, tc::Dim::D2, EnvironmentBrdfPixel>;
+inline constexpr tc::uint environmentBrdfSize() { return 32u; }
+
+// What kernels that sample materials bind besides the tables. Slots without a pool hold a
+// small image nothing reads.
+struct MaterialTextures {
+    std::array<ColorPoolImage const *, colorPoolSlots()> colorPools{};
+    std::array<CompressedPoolImage const *, compressedPoolSlots()> compressedPools{};
+    EnvironmentBrdfImage const *environmentBrdf = nullptr;
+    // Changes whenever textures finish streaming in or go away.
+    std::uint64_t residency = 0;
+};
+
 // The scene as the GPU thread holds it, for passes to bind (attach() takes non-const
 // resources; passes do not change them). Counts are the live elements; the tables may be
 // larger.
@@ -117,7 +204,7 @@ struct SceneTables {
     tc::uint lightCount = 0;
 
     // Two levels of hierarchies, null until a pipeline that traces rays has run (see
-    // SceneRequirements): one per mesh over its triangles, rooted at blasRoots[mesh] in
+    // FeatureRequirements): one per mesh over its triangles, rooted at blasRoots[mesh] in
     // blasNodes with leaves indexing blasTriangles, and one over the instances, rooted at
     // tlasNodes[0] with one instance index per leaf.
     tc::TableResource<GpuBvhNode> *blasNodes = nullptr;
@@ -125,6 +212,8 @@ struct SceneTables {
     tc::BufferResource<tc::uint> *blasRoots = nullptr;
     tc::TableResource<GpuBvhNode> *tlasNodes = nullptr;
     tc::uint tlasNodeCount = 0;
+
+    MaterialTextures textures;
 };
 
 } // namespace lr::render

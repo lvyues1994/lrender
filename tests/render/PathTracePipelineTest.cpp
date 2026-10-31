@@ -1,8 +1,9 @@
+#include "EnvironmentBrdf.h"
 #include "RenderTestSupport.h"
-#include "kernels/Lighting.h"
 
 #include <lr/core/Primitives.h>
 #include <lr/render/Renderer.h>
+#include <lr/render/kernels/Lighting.h>
 
 #include <tc/devices.hpp>
 
@@ -154,6 +155,135 @@ TEST_CASE("a rough sphere in a uniform sky reflects what its BRDF integrates to 
     CHECK(std::abs(mean) < 0.005);
     CHECK(spread < 0.02);
     CHECK(worst < 0.05f);
+}
+
+// What reflectedLight()'s specular term integrates to over the hemisphere for F0 = 0 and
+// F0 = 1, by the midpoint rule on a fine grid: the reference for the importance-sampled
+// table. Low roughness needs a finer grid around the mirror direction, so the test stays
+// at roughness 0.4 and up.
+core::vec2 specularAlbedo(float const nDotV, float const roughness) {
+    constexpr auto kSteps = 200;
+    auto const normal = core::vec3{0.0f, 0.0f, 1.0f};
+    auto const toViewer = core::vec3{std::sqrt(1.0f - nDotV * nDotV), 0.0f, nDotV};
+    auto const step = kPi / 2.0f / kSteps;
+    auto white = 0.0;
+    auto black = 0.0;
+    for (auto i = 0; i < kSteps; ++i) {
+        auto const theta = (static_cast<float>(i) + 0.5f) * step;
+        for (auto j = 0; j < 4 * kSteps; ++j) {
+            auto const phi = (static_cast<float>(j) + 0.5f) * step;
+            auto const toLight =
+                core::vec3{std::sin(theta) * std::cos(phi), std::sin(theta) * std::sin(phi), std::cos(theta)};
+            auto const weight = static_cast<double>(std::sin(theta) * step * step);
+            white += weight * render::kernels::reflectedLight(normal, toViewer, toLight, core::vec3{1.0f},
+                                                              core::vec3{1.0f}, 1.0f, roughness)
+                                  .x;
+            black += weight * render::kernels::reflectedLight(normal, toViewer, toLight, core::vec3{1.0f},
+                                                              core::vec3{0.0f}, 1.0f, roughness)
+                                  .x;
+        }
+    }
+    return core::vec2{static_cast<float>(white - black), static_cast<float>(black)};
+}
+
+// The raster pipeline's ambient specular reads (A, B) from a table built by importance
+// sampling; against brute force it is good to a fraction of a percent of F0 A + B.
+TEST_CASE("the environment table holds what the shading BRDF integrates to") {
+    auto worst = 0.0f;
+    for (auto const roughness : {0.4f, 1.0f}) {
+        for (auto const nDotV : {0.25f, 0.6f, 1.0f}) {
+            CAPTURE(roughness);
+            CAPTURE(nDotV);
+            auto const exact = specularAlbedo(nDotV, roughness);
+            auto const table = render::environmentBrdf(nDotV, roughness);
+            for (auto const f0 : {0.04f, 1.0f}) {
+                auto const expected = f0 * exact.x + exact.y;
+                auto const relative = std::abs(f0 * table.x + table.y - expected) / expected;
+                worst = std::max(worst, relative);
+                CHECK(relative < 0.01f);
+            }
+        }
+    }
+    MESSAGE("environment table: largest relative error " << worst);
+}
+
+// One sphere in a uniform sky, as in the white furnace above. Being convex, it never sees
+// itself, so the path tracer's mean is the directional albedo of the BRDF, which the
+// raster pipeline's ambient term reads from the table: diffuse exactly, specular as
+// F0 A + B. The table is good to 0.25% (above) and the path tracer's mean over some 300
+// pixel channels to about 0.1%, so the mean difference stays within 0.5% (measured 0.04%
+// for the metal, 0.06% for the dielectric). Single pixels scatter by the path tracer's
+// noise at 256 samples, about 1.5% (1 sigma) for the dielectric, whose paths pick between
+// the diffuse and the specular lobe.
+TEST_CASE("the visibility pipeline reflects a uniform sky as the path tracer does, for a metal and a dielectric") {
+    constexpr auto kPixels = 24;
+    constexpr auto kSamples = 256;
+    auto metal = core::MaterialDesc{};
+    metal.baseColor = core::vec4{0.95f, 0.64f, 0.54f, 1.0f};
+    metal.metallic = 1.0f;
+    metal.roughness = 0.35f;
+    auto dielectric = grey(0.5f);
+    dielectric.roughness = 0.6f;
+    for (auto const &material : {metal, dielectric}) {
+        CAPTURE(material.metallic);
+        auto options = test::HarnessOptions{};
+        options.framePoolThreads = 4;
+        auto harness = RenderHarness{options};
+        auto &pipelines = harness.renderer->pipelines();
+        auto const camera = test::cameraAt(core::vec3{0.0f, 0.0f, 4.0f}, core::vec3{0.0f});
+        auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kPixels, kPixels}});
+        auto const rasterProbe = std::make_shared<test::HdrProbe>();
+        auto const tracedProbe = std::make_shared<test::HdrProbe>();
+        auto raster = test::viewOf(target, camera);
+        raster.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {rasterProbe}});
+        auto traced = test::viewOf(target, camera, core::ViewId{1});
+        traced.pipeline = pipelines.create(render::PipelineDesc{pipelines.pathTraceReference(), {tracedProbe}});
+        auto delta = core::RenderWorldDelta{};
+        delta.meshes = {{core::MeshId{0}, test::share(core::makeSphere(1.0f, 64, 32))}};
+        delta.materials = {{core::MaterialId{0}, material}};
+        delta.instances = {{core::InstanceId{0}, core::MeshId{0}, core::MaterialId{0}, core::mat4{1.0f}}};
+        delta.environment = core::EnvironmentDesc{core::vec3{1.0f}};
+
+        harness.render(render::FrameDesc{std::move(delta), {raster, traced}});
+        for (auto frame = 1; frame < kSamples; ++frame) {
+            harness.render(frameOf({}, traced));
+        }
+
+        auto sphere = 0;
+        auto worst = 0.0f;
+        auto sum = 0.0;
+        auto squares = 0.0;
+        for (auto y = 0; y < kPixels; ++y) {
+            for (auto x = 0; x < kPixels; ++x) {
+                auto const direction = centreRay(camera, x, y, kPixels);
+                auto const along = -tc::dot(camera.position, direction);
+                auto const miss = std::sqrt(std::max(tc::dot(camera.position, camera.position) - along * along, 0.0f));
+                auto const hit = camera.position + direction * (along - std::sqrt(std::max(1.0f - miss * miss, 0.0f)));
+                // Pixels nearer the rim than that cover some sky in the path tracer's samples.
+                if (miss >= 1.0f or -tc::dot(hit, direction) < 0.5f) {
+                    continue;
+                }
+                auto const index = static_cast<std::size_t>(y * kPixels + x);
+                for (auto c = 0; c < 3; ++c) {
+                    auto const expected = (*tracedProbe->pixels)[index][c];
+                    auto const relative = ((*rasterProbe->pixels)[index][c] - expected) / expected;
+                    worst = std::max(worst, std::abs(relative));
+                    sum += static_cast<double>(relative);
+                    squares += static_cast<double>(relative * relative);
+                }
+                ++sphere;
+            }
+        }
+        auto const mean = sum / (3.0 * sphere);
+        auto const spread = std::sqrt(squares / (3.0 * sphere));
+        CAPTURE(mean);
+        CAPTURE(spread);
+        CAPTURE(worst);
+        CHECK(sphere > 80);
+        CHECK(std::abs(mean) < 0.005);
+        CHECK(spread < 0.02);
+        CHECK(worst < 0.07f);
+    }
 }
 
 // A rough dielectric plane seen and lit straight from above: the normal, the view and the
@@ -347,6 +477,7 @@ bool allTimed(render::ViewResult const &view) {
 TEST_CASE("with device timers on, every pass reports the time of its dispatches") {
     auto options = test::HarnessOptions{};
     options.gpuTimers = true;
+    options.singlePassVisibility = render::VariantUse::Off;
     auto harness = RenderHarness{options};
     auto &pipelines = harness.renderer->pipelines();
     auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{16, 16}});
@@ -356,14 +487,35 @@ TEST_CASE("with device timers on, every pass reports the time of its dispatches"
     auto const result = harness.render(render::FrameDesc{litPlane(core::DirectionalLight{}), {raster, traced}});
 
     REQUIRE(result.views.size() == 2);
-    CHECK(passNames(result.views[0])
-          == std::vector<std::string>{"clear visibility", "cull instances", "compact visible instances",
-                                      "rasterize depth", "rasterize triangles", "visibility statistics",
-                                      "shade visibility", "tonemap"});
+    auto const shading = std::vector<std::string>{"visibility statistics",
+                                                  "clear shadow map",
+                                                  "clear material model counts",
+                                                  "classify pixels",
+                                                  "allocate material model lists",
+                                                  "scatter material model pixels",
+                                                  "shade lr_shade_metallic_roughness",
+                                                  "tonemap"};
+    auto twoPass = std::vector<std::string>{"clear visibility", "cull instances", "compact visible instances",
+                                            "rasterize depth", "rasterize triangles"};
+    twoPass.insert(twoPass.end(), shading.begin(), shading.end());
+    CHECK(passNames(result.views[0]) == twoPass);
     CHECK(result.views[0].passTimings[0].dispatches == 2);
     CHECK(passNames(result.views[1]) == std::vector<std::string>{"path trace", "tonemap"});
     CHECK(allTimed(result.views[0]));
     CHECK(allTimed(result.views[1]));
+
+    options.singlePassVisibility = render::VariantUse::Auto;
+    auto onePassHarness = RenderHarness{options};
+    REQUIRE(onePassHarness.renderer->capabilities().singlePassVisibility);
+    auto const onePassTarget =
+        onePassHarness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{16, 16}});
+    auto onePass = std::vector<std::string>{"cull instances", "compact visible instances", "clear packed visibility",
+                                            "rasterize visibility", "unpack visibility"};
+    onePass.insert(onePass.end(), shading.begin(), shading.end());
+    auto const onePassResult = onePassHarness.render(
+        frameOf(litPlane(core::DirectionalLight{}), test::viewOf(onePassTarget, overheadCamera())));
+    CHECK(passNames(onePassResult.views[0]) == onePass);
+    CHECK(allTimed(onePassResult.views[0]));
 
     auto untimed = RenderHarness{};
     auto const untimedTarget = untimed.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{16, 16}});

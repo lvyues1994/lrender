@@ -42,4 +42,26 @@ struct TC_KERNEL ReadHdr {
     }
 };
 
+// Copies the first `count` elements of one buffer into another.
+template <class T>
+struct TC_KERNEL CopyBuffer {
+    static constexpr char const *fileLocation = tc::instanceName<CopyBuffer>();
+    uvec3 local_size{64, 1, 1};
+
+    BufferBinding<T, 0> source;
+    BufferBinding<T, 1> target;
+    Uniform<uint, 0> count{};
+
+    void main() {
+        uint i = gl_GlobalInvocationID.x;
+        if (i < count.value) {
+            target[i] = source[i];
+        }
+    }
+};
+
+TC_KERNEL_INSTANCE("lr_test_copy_words", CopyBuffer<uint>);
+TC_KERNEL_INSTANCE("lr_test_copy_quads", CopyBuffer<uvec4>);
+TC_KERNEL_INSTANCE("lr_test_copy_pairs", CopyBuffer<vec2>);
+
 } // namespace lr::test

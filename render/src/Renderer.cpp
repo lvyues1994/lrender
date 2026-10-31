@@ -2,11 +2,15 @@
 
 #include "FrameGraphImpl.h"
 #include "FrameQueue.h"
+#include "KernelVariants.h"
 #include "PreparedFrame.h"
 #include "RenderWorld.h"
+#include "Temporal.h"
+#include "kernels/Shading.h"
 
 #include <lr/gpu/GpuQueue.h>
 #include <lr/render/Features.h>
+#include <lr/render/MaterialModel.h>
 #include <lr/runtime/SerialThread.h>
 
 #include <lexec/scopes/counting_scope.hpp>
@@ -21,6 +25,7 @@
 #include <optional>
 #include <stdexcept>
 #include <string>
+#include <string_view>
 #include <system_error>
 #include <unordered_map>
 #include <utility>
@@ -100,10 +105,13 @@ private:
 };
 
 using FeatureList = std::vector<std::shared_ptr<RenderFeature>>;
+using ModelList = std::vector<std::shared_ptr<MaterialModel>>;
 
 struct PipelinesImpl final : PipelineRegistry {
     PipelinesImpl() {
-        pipelines.push_back(FeatureList{makeVisibilityFeature(), makeShadingFeature(), makeTonemapFeature()});
+        pipelines.push_back(FeatureList{makeVisibilityFeature(), makeShadowFeature(), makeShadingFeature(),
+                                        makeTransparencyFeature(), makeTemporalAntiAliasingFeature(),
+                                        makeTonemapFeature()});
         pipelines.push_back(FeatureList{makePathTraceFeature(), makeTonemapFeature()});
     }
 
@@ -144,6 +152,70 @@ private:
     std::vector<FeatureList> pipelines;
 };
 
+// Why the device cannot run `program`; on the GPU thread. Without a device (it was lost
+// and could not be recreated yet) only the limits of the first one tell.
+std::optional<std::string> whyDeviceCannotRun(gpu::GpuQueue const &gpu, gpu::GpuContext const &context,
+                                              std::string const &program) {
+    if (context.device != nullptr) {
+        return context.device->checkKernel(program);
+    }
+    auto const found = tc::ProgramRegistry::instance().find(program);
+    if (not found) {
+        return "kernel '" + program + "' was not transpiled";
+    }
+    return tc::exceedsLimits(*found, gpu.info().limits);
+}
+
+struct MaterialModelsImpl final : MaterialModels {
+    explicit MaterialModelsImpl(gpu::GpuQueue &gpu_) : gpu(gpu_) {
+        models.push_back(makeMaterialModel<kernels::MetallicRoughness>());
+    }
+
+    core::MaterialModelId add(std::shared_ptr<MaterialModel> model) override {
+        if (model == nullptr) {
+            throw std::invalid_argument{"lr::render: a material model is null"};
+        }
+        auto const program = std::string{model->program()};
+        auto const checked = lexec::sync_wait(gpu.record(
+            [this, program](gpu::GpuContext &context) { return whyDeviceCannotRun(gpu, context, program); }));
+        if (auto const &reason = std::get<0>(checked.value())) {
+            throw tc::DeviceError{"lr::render: the device cannot run material model kernel " + program + " (" + *reason
+                                  + ")"};
+        }
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        if (models.size() >= maxMaterialModels()) {
+            throw std::length_error{"lr::render: a renderer holds at most " + std::to_string(maxMaterialModels())
+                                    + " material models"};
+        }
+        models.push_back(std::move(model));
+        return core::MaterialModelId{static_cast<std::uint32_t>(models.size() - 1)};
+    }
+
+    std::uint32_t count() const override {
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        return static_cast<std::uint32_t>(models.size());
+    }
+
+    ModelList snapshot() const {
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        return models;
+    }
+
+    std::vector<std::string_view> programs() const {
+        auto const lock = std::lock_guard<std::mutex>{mutex};
+        auto result = std::vector<std::string_view>{};
+        for (auto const &model : models) {
+            result.push_back(model->program());
+        }
+        return result;
+    }
+
+private:
+    gpu::GpuQueue &gpu;
+    mutable std::mutex mutex;
+    ModelList models;
+};
+
 // What submit() captures of a view: its target and the pipeline's features as they are
 // at the call.
 struct ViewPlan {
@@ -157,6 +229,20 @@ bool tracesRays(std::vector<ViewPlan> const &plans) {
         return std::any_of(plan.features.begin(), plan.features.end(),
                            [](auto const &feature) { return feature->requirements().rayTracing; });
     });
+}
+
+bool jitters(ViewPlan const &plan) {
+    return plan.desc.settings.antiAliasing == AntiAliasing::Taa
+       and std::any_of(plan.features.begin(), plan.features.end(),
+                       [](auto const &feature) { return feature->requirements().temporalJitter; });
+}
+
+RendererCapabilities chooseFor(gpu::GpuQueue &gpu, RendererConfig const &config) {
+    auto const choices = VariantChoices{config.subgroups, config.singlePassVisibility, gpu.info().limits.subgroupSize};
+    auto const chosen = lexec::sync_wait(gpu.record([choices](gpu::GpuContext &context) {
+        return chooseCapabilities(*makeKernelCheck(*context.device), choices);
+    }));
+    return std::get<0>(chosen.value());
 }
 
 ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
@@ -174,6 +260,9 @@ ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     context.inverseViewProjection = tc::inverse(context.viewProjection);
     context.instanceCount = world.instanceCount();
     context.lightCount = world.lightCount();
+    context.transparentInstanceCount = world.transparentInstanceCount();
+    context.sceneBounds = world.bounds();
+    context.shadowLight = world.shadowLight();
     context.sceneVersion = world.version();
     return context;
 }
@@ -219,7 +308,13 @@ struct RendererImpl final : Renderer {
         : framesInFlight(checkedFramesInFlight(config)),
           gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
           timers(config.gpuTimers and gpu->info().timers),
-          frames(FrameQueueConfig{gpu.get(), &scope, &deviceGeneration, framesInFlight, timers}) {
+          chosen(chooseFor(*gpu, config)),
+          models(*gpu),
+          world(textureLimitsOf(gpu->info().limits, config.maxTextureSize)),
+          frames(FrameQueueConfig{gpu.get(), &scope, &deviceGeneration, framesInFlight, timers,
+                                  config.textureStreamingBytes, [this](tc::Device &device) {
+                                      verifyCapabilities(*makeKernelCheck(device), chosen, models.programs());
+                                  }}) {
         if (timers) {
             static_cast<void>(
                 lexec::sync_wait(gpu->record([](gpu::GpuContext &context) { context.device->enableTimers(true); })));
@@ -232,8 +327,10 @@ struct RendererImpl final : Renderer {
     }
 
     tc::DeviceInfo const &deviceInfo() const noexcept override { return gpu->info(); }
+    RendererCapabilities const &capabilities() const noexcept override { return chosen; }
     RenderTargets &targets() noexcept override { return targetSet; }
     PipelineRegistry &pipelines() noexcept override { return pipelineSet; }
+    MaterialModels &materialModels() noexcept override { return models; }
 
     // The frame's work runs whether or not its sender is started: the render thread and
     // the GPU thread see every frame, in order, and the sender only waits for the result.
@@ -270,6 +367,12 @@ private:
     // then uploads whole.
     PreparedFrame prepare(PreparedFrame frame, core::RenderWorldDelta const &delta, std::vector<ViewPlan> const &plans) {
         frame.deviceGeneration = deviceGeneration.load(std::memory_order_acquire);
+        // Before the delta's textures, which go to the new device.
+        if (frame.deviceGeneration != sceneGeneration) {
+            world.loseTextures();
+        }
+        auto const modelList = models.snapshot();
+        world.allowMaterialModels(static_cast<std::uint32_t>(modelList.size()));
         try {
             frame.scene = world.apply(delta);
         } catch (...) {
@@ -277,7 +380,7 @@ private:
             return frame;
         }
         try {
-            prepareViews(frame, plans);
+            prepareViews(frame, plans, modelList);
         } catch (...) {
             sceneGeneration = kSceneOutOfStep;
             frame.failure = std::current_exception();
@@ -287,28 +390,49 @@ private:
         return frame;
     }
 
-    void prepareViews(PreparedFrame &frame, std::vector<ViewPlan> const &plans) {
+    void prepareViews(PreparedFrame &frame, std::vector<ViewPlan> const &plans, ModelList const &modelList) {
         if (frame.deviceGeneration != sceneGeneration) {
-            frame.scene = world.fullUpdate();
+            auto full = world.fullUpdate();
+            full.pools = std::move(frame.scene.pools);
+            full.removedTextures = std::move(frame.scene.removedTextures);
+            full.textureUploads = std::move(frame.scene.textureUploads);
+            frame.scene = std::move(full);
             histories.restart();
+            temporalViews.restart();
         }
+        frame.lostTextures = world.takeLostTextures();
         if (tracesRays(plans)) {
             world.keepHierarchies(frame.scene);
         }
         for (auto const &plan : plans) {
-            frame.views.push_back(prepareView(plan, frame.index));
+            frame.views.push_back(prepareView(plan, frame.index, modelList));
         }
         frame.releasedHistories =
             histories.expire(frame.index, [this](RenderTargetId const target) { return targetSet.exists(target); });
+        temporalViews.expire(frame.index);
         sceneGeneration = frame.deviceGeneration;
     }
 
+    ViewContext viewContextOf(ViewPlan const &plan, std::uint64_t const frameIndex, ModelList const &modelList) {
+        auto context = makeViewContext(plan, world);
+        context.capabilities = chosen;
+        context.materialModels = modelList;
+        if (jitters(plan)) {
+            auto const temporal = temporalViews.advance(TemporalRequest{plan.desc.id, frameIndex, context.extent,
+                                                                        context.viewProjection, plan.desc.cameraCut});
+            context.viewProjection = jitteredViewProjection(context.viewProjection, temporal.jitter, context.extent);
+            context.inverseViewProjection = tc::inverse(context.viewProjection);
+            context.temporal = temporal;
+        }
+        return context;
+    }
+
     // A view whose graph fails to build fails the frame on the GPU thread.
-    PreparedView prepareView(ViewPlan const &plan, std::uint64_t const frameIndex) {
+    PreparedView prepareView(ViewPlan const &plan, std::uint64_t const frameIndex, ModelList const &modelList) {
         auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr};
         try {
             auto builder = GraphBuilder{GraphOwner{&histories, plan.desc.id, plan.desc.target, frameIndex}};
-            auto context = makeViewContext(plan, world);
+            auto context = viewContextOf(plan, frameIndex, modelList);
             auto const extent = plan.target.extent;
             auto const pixels = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y);
             context.sceneColor = builder.createImage<HdrFormat>("scene colour", extent);
@@ -327,11 +451,14 @@ private:
     std::uint32_t framesInFlight;
     std::unique_ptr<gpu::GpuQueue> gpu;
     bool timers;
+    RendererCapabilities chosen;
+    MaterialModelsImpl models;
     runtime::SerialThread renderThread;
     TargetsImpl targetSet;
     PipelinesImpl pipelineSet;
-    RenderWorld world;                            // render thread
-    FrameHistories histories{kHistoryKeepFrames}; // render thread
+    RenderWorld world;                                 // render thread
+    FrameHistories histories{kHistoryKeepFrames};      // render thread
+    TemporalViews temporalViews{kHistoryKeepFrames};   // render thread
     std::uint64_t sceneGeneration = 0;            // render thread: the device the GPU copy is for
     std::atomic<std::uint64_t> deviceGeneration{0};
     std::mutex submitMutex;

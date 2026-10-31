@@ -45,13 +45,15 @@ lr_add_test(lr_gpu_tests
 lr_add_test(lr_render_tests
     SOURCES render/RenderWorldTest.cpp render/FrameGraphTest.cpp render/BvhTest.cpp
             render/VisibilityPipelineTest.cpp render/PathTracePipelineTest.cpp render/RendererTest.cpp
-    KERNELS render/TestKernels.h
+            render/TextureTest.cpp render/ShadowTest.cpp render/TransparencyTest.cpp
+            render/VariantTest.cpp render/MaterialModelTest.cpp render/TemporalTest.cpp
+    KERNELS render/TestKernels.h render/TestMaterialModels.h
     LIBRARIES lr::render tc_devices)
 # White-box tests of the render module's internals, and of its kernels' functions on the host.
 target_include_directories(lr_render_tests PRIVATE "${PROJECT_SOURCE_DIR}/render/src" "${PROJECT_SOURCE_DIR}/render")
 
 set(lr_present_test_sources present/ImageSequencePresenterTest.cpp)
-set(lr_present_test_libraries lr::present_image)
+set(lr_present_test_libraries lr::present_image tc_devices)
 if(TARGET lr::present_sdl)
     list(APPEND lr_present_test_sources present/SdlPresenterTest.cpp)
     list(APPEND lr_present_test_libraries lr::present_sdl)

@@ -1,3 +1,4 @@
+#include "EnvironmentBrdf.h"
 #include "RenderTestSupport.h"
 #include "TestKernels.h"
 
@@ -29,6 +30,13 @@ core::vec3 const kSky{0.1f, 0.2f, 0.3f};
 
 // A camera on +z looking at the origin, and quads facing it.
 core::CameraDesc frontCamera() { return test::cameraAt(core::vec3{0.0f, 0.0f, 5.0f}, core::vec3{0.0f}); }
+
+// What an emissive quad facing the camera shows: its emission and the sky its black
+// dielectric surface reflects (F0 = 0.04 at the default roughness 0.5), some 2% of it.
+std::uint32_t seenFacing(core::vec3 const &emission) {
+    auto const scaleBias = render::environmentBrdf(1.0f, 0.5f);
+    return test::rgba8(emission + kSky * (0.04f * scaleBias.x + scaleBias.y));
+}
 
 core::RenderWorldDelta quadScene() {
     auto delta = core::RenderWorldDelta{};
@@ -82,13 +90,13 @@ TEST_CASE("a quad covers exactly the pixels whose centres its projection contain
 
     auto const &image = *result.views[0].image;
     auto const span = coveredPixels(0.5f, 5.0f);
-    auto const red = test::rgba8(kRedRadiance);
+    auto const red = seenFacing(kRedRadiance);
     auto const sky = test::rgba8(kSky);
     auto wrong = 0;
     for (auto y = 0; y < kSize; ++y) {
         for (auto x = 0; x < kSize; ++x) {
             auto const inside = x >= span.first and x <= span.last and y >= span.first and y <= span.last;
-            wrong += test::pixelAt(image, x, y) == (inside ? red : sky) ? 0 : 1;
+            wrong += test::nearPixel(test::pixelAt(image, x, y), inside ? red : sky) ? 0 : 1;
         }
     }
     CHECK(span.last - span.first + 1 == 16);
@@ -112,9 +120,9 @@ TEST_CASE("the nearer of two overlapping quads wins") {
     auto const &image = *result.views[0].image;
     auto const front = coveredPixels(0.25f, 4.0f);
     auto const back = coveredPixels(0.5f, 5.0f);
-    CHECK(test::pixelAt(image, kSize / 2, kSize / 2) == test::rgba8(kBlueRadiance));
-    CHECK(test::pixelAt(image, front.first, front.first) == test::rgba8(kBlueRadiance));
-    CHECK(test::pixelAt(image, back.first, kSize / 2) == test::rgba8(kRedRadiance));
+    CHECK(test::nearPixel(test::pixelAt(image, kSize / 2, kSize / 2), seenFacing(kBlueRadiance)));
+    CHECK(test::nearPixel(test::pixelAt(image, front.first, front.first), seenFacing(kBlueRadiance)));
+    CHECK(test::nearPixel(test::pixelAt(image, back.first, kSize / 2), seenFacing(kRedRadiance)));
 }
 
 TEST_CASE("instances outside the view are culled") {
@@ -129,7 +137,7 @@ TEST_CASE("instances outside the view are culled") {
 
     CHECK(result.views[0].stats.visibleInstances == 1);
     CHECK(result.views[0].stats.visibleTriangles == 2);
-    CHECK(test::pixelAt(*result.views[0].image, kSize / 2, kSize / 2) == test::rgba8(kRedRadiance));
+    CHECK(test::nearPixel(test::pixelAt(*result.views[0].image, kSize / 2, kSize / 2), seenFacing(kRedRadiance)));
 }
 
 // A rough dielectric plane seen and lit straight from above: the normal, the view and the
@@ -194,19 +202,19 @@ TEST_CASE("later deltas move, remove and add instances") {
     auto const view = test::viewOf(target, frontCamera());
     auto first = quadScene();
     first.instances = {{core::InstanceId{7}, kQuad, kRed, core::mat4{1.0f}}};
-    auto const red = test::rgba8(kRedRadiance);
+    auto const red = seenFacing(kRedRadiance);
     auto const sky = test::rgba8(kSky);
     auto const centre = [](render::FrameResult const &result) {
         return test::pixelAt(*result.views[0].image, kSize / 2, kSize / 2);
     };
 
-    CHECK(centre(harness.render(frameOf(std::move(first), view))) == red);
+    CHECK(test::nearPixel(centre(harness.render(frameOf(std::move(first), view))), red));
 
     auto moved = core::RenderWorldDelta{};
     moved.instances = {{core::InstanceId{7}, kQuad, kRed, test::translation(core::vec3{1.0f, 0.0f, 0.0f})}};
     auto const afterMove = harness.render(frameOf(std::move(moved), view));
     CHECK(centre(afterMove) == sky);
-    CHECK(test::pixelAt(*afterMove.views[0].image, kSize / 2 + 14, kSize / 2) == red);
+    CHECK(test::nearPixel(test::pixelAt(*afterMove.views[0].image, kSize / 2 + 14, kSize / 2), red));
 
     auto removed = core::RenderWorldDelta{};
     removed.removed.instances = {core::InstanceId{7}};
@@ -216,7 +224,7 @@ TEST_CASE("later deltas move, remove and add instances") {
 
     auto added = core::RenderWorldDelta{};
     added.instances = {{core::InstanceId{8}, kQuad, kBlue, core::mat4{1.0f}}};
-    CHECK(centre(harness.render(frameOf(std::move(added), view))) == test::rgba8(kBlueRadiance));
+    CHECK(test::nearPixel(centre(harness.render(frameOf(std::move(added), view))), seenFacing(kBlueRadiance)));
 }
 
 TEST_CASE("one frame renders several views into their own targets") {
@@ -237,7 +245,7 @@ TEST_CASE("one frame renders several views into their own targets") {
     CHECK(result.views[0].image->extent.y == 24);
     CHECK(result.views[1].view == core::ViewId{2});
     CHECK(result.views[1].image->extent.x == 32);
-    CHECK(test::pixelAt(*result.views[1].image, 16, 16) == test::rgba8(kRedRadiance));
+    CHECK(test::nearPixel(test::pixelAt(*result.views[1].image, 16, 16), seenFacing(kRedRadiance)));
 }
 
 TEST_CASE("resizing a target changes the size of the next frame") {
@@ -307,8 +315,8 @@ TEST_CASE("a frame that refers to an unknown mesh fails, and the next frame stil
 
     auto fine = quadScene();
     fine.instances = {{core::InstanceId{0}, kQuad, kRed, core::mat4{1.0f}}};
-    CHECK(test::pixelAt(*harness.render(frameOf(std::move(fine), view)).views[0].image, kSize / 2, kSize / 2)
-          == test::rgba8(kRedRadiance));
+    CHECK(test::nearPixel(test::pixelAt(*harness.render(frameOf(std::move(fine), view)).views[0].image, kSize / 2, kSize / 2),
+                          seenFacing(kRedRadiance)));
 }
 
 TEST_CASE("submitting a view of an unknown target throws at once") {
@@ -360,6 +368,156 @@ TEST_CASE("every GPU backend renders what the CPU backend renders") {
         }
         CHECK(test::maxChannelDifference(renderWith(*harness), reference) <= 2);
     }
+}
+
+core::ImageHandle solidBc1Chain(std::uint16_t const colour, int const size) {
+    auto image = core::ImageData{};
+    image.extent = core::ivec2{size, size};
+    image.compressed = tc::CompressedFormat::Bc1;
+    for (auto level = 0u; level < core::fullLevelCount(image.extent); ++level) {
+        auto &blocks = image.levels.emplace_back();
+        // Endpoints differ, and the indices pick every colour of the block in turn.
+        auto const other = static_cast<std::uint16_t>(colour ^ 0x18E3u);
+        auto const high = std::max(colour, other);
+        auto const low = std::min(colour, other);
+        for (auto block = std::size_t{0}; block < core::levelBytes(image, level) / 8; ++block) {
+            for (auto const byte : {high & 0xFF, high >> 8, low & 0xFF, low >> 8, 0x1B, 0xE4, 0x1B, 0xE4}) {
+                blocks.push_back(static_cast<std::uint8_t>(byte));
+            }
+        }
+    }
+    return test::share(std::move(image));
+}
+
+// Textures (RGBA8 and BC1, a normal map), an alpha-masked lattice, a blended sphere, a
+// sun with shadows, a point light and a sky.
+core::RenderWorldDelta texturedScene() {
+    auto delta = core::RenderWorldDelta{};
+    delta.meshes = {{core::MeshId{0}, test::share(core::makePlane(core::vec2{4.0f}))},
+                    {core::MeshId{1}, test::share(core::makeBox(core::vec3{0.4f}))},
+                    {core::MeshId{2}, test::share(core::makeSphere(0.4f, 24, 12))},
+                    {core::MeshId{3}, test::share(core::makeQuad(core::vec2{0.6f}))}};
+    delta.textures = {
+        {core::TextureId{0}, test::rgba8Image(core::ivec2{64, 64}, core::ColorEncoding::Srgb,
+                                              [](int const x, int const y) {
+                                                  auto const light = (x / 8 + y / 8) % 2 == 0;
+                                                  return light ? tc::ivec4{220, 210, 190, 255} : tc::ivec4{60, 70, 90, 255};
+                                              }),
+         {}},
+        {core::TextureId{1}, solidBc1Chain(0xC3A6u, 16), {}},
+        {core::TextureId{2}, test::rgba8Image(core::ivec2{16, 16}, core::ColorEncoding::Linear,
+                                              [](int const x, int) {
+                                                  return tc::ivec4{x < 8 ? 90 : 165, 128, 240, 255};
+                                              }),
+         {}},
+        {core::TextureId{3}, test::rgba8Image(core::ivec2{32, 32}, core::ColorEncoding::Srgb,
+                                              [](int const x, int const y) {
+                                                  auto const hole = (x / 4 + y / 4) % 3 == 0;
+                                                  return tc::ivec4{80, 160, 90, hole ? 0 : 255};
+                                              }),
+         {}}};
+    auto ground = core::MaterialDesc{};
+    ground.baseColorTexture = core::TextureId{0};
+    ground.uvTransform.scale = core::vec2{3.0f};
+    ground.roughness = 0.8f;
+    auto crate = core::MaterialDesc{};
+    crate.baseColorTexture = core::TextureId{1};
+    crate.normalTexture = core::TextureId{2};
+    auto glass = core::MaterialDesc{};
+    glass.baseColor = core::vec4{0.7f, 0.85f, 1.0f, 0.35f};
+    glass.alphaMode = core::AlphaMode::Blend;
+    glass.roughness = 0.1f;
+    auto lattice = core::MaterialDesc{};
+    lattice.baseColorTexture = core::TextureId{3};
+    lattice.alphaMode = core::AlphaMode::Mask;
+    lattice.doubleSided = true;
+    delta.materials = {{core::MaterialId{0}, ground},
+                       {core::MaterialId{1}, crate},
+                       {core::MaterialId{2}, glass},
+                       {core::MaterialId{3}, lattice}};
+    auto turned = core::Transform{};
+    turned.translation = core::vec3{-0.8f, 0.4f, 0.0f};
+    turned.rotation = core::Rotation::axisAngle(core::vec3{0.0f, 1.0f, 0.0f}, 0.5f);
+    delta.instances = {{core::InstanceId{0}, core::MeshId{0}, core::MaterialId{0}, core::mat4{1.0f}},
+                       {core::InstanceId{1}, core::MeshId{1}, core::MaterialId{1}, core::matrixOf(turned)},
+                       {core::InstanceId{2}, core::MeshId{2}, core::MaterialId{2},
+                        test::translation(core::vec3{0.5f, 0.4f, 0.6f})},
+                       {core::InstanceId{3}, core::MeshId{3}, core::MaterialId{3},
+                        test::translation(core::vec3{0.4f, 0.6f, -0.8f})}};
+    auto sun = core::DirectionalLight{};
+    sun.direction = core::vec3{-0.4f, -1.0f, -0.5f};
+    sun.illuminance = 2.5f;
+    sun.castsShadows = true;
+    auto lamp = core::PointLight{};
+    lamp.position = core::vec3{0.6f, 1.4f, 1.2f};
+    lamp.intensity = 2.0f;
+    delta.lights = {{core::LightId{0}, sun}, {core::LightId{1}, lamp}};
+    delta.environment = core::EnvironmentDesc{core::vec3{0.1f, 0.15f, 0.25f}};
+    return delta;
+}
+
+struct ImageComparison {
+    std::uint32_t largest = 0;
+    double meanDifference = 0.0; // per colour channel
+    double farFraction = 0.0;    // of the pixels with a channel more than 2 apart
+};
+
+ImageComparison compare(render::ImageRgba8 const &a, render::ImageRgba8 const &b) {
+    auto result = ImageComparison{};
+    auto total = 0.0;
+    auto far = 0;
+    for (auto index = std::size_t{0}; index < a.pixels.size(); ++index) {
+        auto worst = 0u;
+        for (auto c = 0u; c < 3u; ++c) {
+            auto const difference = test::channelDifference(a.pixels[index], b.pixels[index], c);
+            worst = std::max(worst, difference);
+            total += difference;
+        }
+        result.largest = std::max(result.largest, worst);
+        far += worst > 2 ? 1 : 0;
+    }
+    result.meanDifference = total / (3.0 * static_cast<double>(a.pixels.size()));
+    result.farFraction = static_cast<double>(far) / static_cast<double>(a.pixels.size());
+    return result;
+}
+
+// Both pipelines on each GPU backend against the CPU backend. Sampling, filtering and
+// BC1 decoding round differently on each device, by a level here and there (the demo
+// scene at 960x540 differs by 0.06 levels on average on llvmpipe); rounding can also
+// move a pixel to the other side of an edge, a mask's cutoff or a shadow's, which changes
+// it by much more, so a few such pixels are allowed.
+TEST_CASE("every GPU backend renders a textured, shadowed, transparent scene as the CPU backend does") {
+    constexpr auto kPixels = 48;
+    constexpr auto kSamples = 4;
+    auto const camera = test::cameraAt(core::vec3{0.3f, 1.8f, 3.0f}, core::vec3{0.0f, 0.3f, 0.0f});
+    auto renderWith = [&camera, extent = core::ivec2{kPixels, kPixels}](RenderHarness &harness) {
+        auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{extent});
+        auto raster = test::viewOf(target, camera);
+        auto traced = test::viewOf(target, camera, core::ViewId{1});
+        traced.pipeline = harness.renderer->pipelines().pathTraceReference();
+        auto first = harness.render(render::FrameDesc{texturedScene(), {raster, traced}});
+        auto last = first;
+        for (auto frame = 1; frame < kSamples; ++frame) {
+            last = harness.render(frameOf({}, traced));
+        }
+        return std::pair{std::move(*first.views[0].image), std::move(*last.views[0].image)};
+    };
+    auto cpu = RenderHarness{};
+    auto const reference = renderWith(cpu);
+
+    test::forEachBackend(test::HarnessOptions{}, [&](RenderHarness &harness) {
+        if (harness.renderer->deviceInfo().backend == "cpu") {
+            return;
+        }
+        auto const images = renderWith(harness);
+        for (auto const &difference : {compare(images.first, reference.first), compare(images.second, reference.second)}) {
+            CAPTURE(difference.largest);
+            CAPTURE(difference.meanDifference);
+            CAPTURE(difference.farFraction);
+            CHECK(difference.meanDifference < 0.25);
+            CHECK(difference.farFraction < 0.01);
+        }
+    });
 }
 
 } // namespace
