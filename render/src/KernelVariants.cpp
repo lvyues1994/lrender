@@ -60,14 +60,16 @@ LrenderPrograms const &lrenderPrograms() {
     using namespace kernels;
     static auto const programs = LrenderPrograms{
         {ClearUint::fileLocation, CullInstances::fileLocation, CompactVisible::fileLocation,
-         RasterVisibility::fileLocation, CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
+         RasterVisibility::fileLocation, RasterVisibilityTiles::fileLocation, ScanLargeTriangles::fileLocation,
+         CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
          AllocateModelLists::fileLocation, ScatterModelPixels::fileLocation,
          ShadeMaterialModel<MetallicRoughness>::fileLocation, BlendTransparent::fileLocation, CopyHdr::fileLocation,
          TemporalMotion::fileLocation, TemporalResolve::fileLocation, ShowResolved::fileLocation,
          PathTrace::fileLocation, Tonemap::fileLocation, DownsampleTexture::fileLocation,
          CopyTextureLayer::fileLocation},
         {CompactVisibleSubgroups::fileLocation, ClassifyPixelsSubgroups::fileLocation},
-        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation, UnpackVisibility::fileLocation},
+        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation,
+         RasterPackedVisibilityTiles::fileLocation, UnpackVisibility::fileLocation},
         {PathTraceRayQuery::fileLocation, CopyPositions::fileLocation, WriteTopLevelInstances::fileLocation}};
     return programs;
 }

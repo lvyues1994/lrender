@@ -132,10 +132,36 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
     return drawn;
 }
 
+// The large triangles one raster pass lists for its tile stage (see largeTriangleWord()),
+// and that stage's workgroup counts.
+struct LargeTriangles {
+    BufferRef<tc::uint> list;
+    BufferRef<tc::DispatchIndirectCommand> arguments;
+};
+
+LargeTriangles largeTrianglesOf(FrameGraphBuilder &graph, std::string const &pass) {
+    return LargeTriangles{graph.createBuffer<tc::uint>(pass + ": large triangles", kernels::largeTriangleWords()),
+                          graph.createBuffer<tc::DispatchIndirectCommand>(pass + ": tile arguments", 1)};
+}
+
+// What a raster pass reads and writes besides its targets.
+void declareRaster(PassBuilder &pass, VisibleSet const &drawn, LargeTriangles const &large) {
+    pass.read(drawn.visible);
+    pass.read(drawn.arguments);
+    pass.write(large.list);
+    pass.write(large.arguments);
+}
+
+struct RasterInputs {
+    VisibleSet drawn;
+    LargeTriangles large;
+    core::mat4 viewProjection{1.0f};
+    core::ivec2 size{0};
+};
+
 // The bindings and uniforms of LR_TRIANGLE_RASTERIZER.
 template <class K>
-void bindRasterizer(PassContext &context, K &kernel, VisibleSet const &drawn, core::mat4 const &viewProjection,
-                    core::ivec2 const size) {
+void bindRasterizer(PassContext &context, K &kernel, RasterInputs const &inputs) {
     auto &device = context.device();
     auto const &scene = context.scene();
     bindMaterialTextures(device, kernel, scene.textures);
@@ -143,15 +169,56 @@ void bindRasterizer(PassContext &context, K &kernel, VisibleSet const &drawn, co
     bind(device, kernel.vertices, *scene.vertices);
     bind(device, kernel.indices, *scene.indices);
     bind(device, kernel.materials, *scene.materials);
-    bind(device, kernel.visible, context.buffer(drawn.visible));
-    set(device, kernel.viewProjection, viewProjection);
-    set(device, kernel.size, size);
+    bind(device, kernel.visible, context.buffer(inputs.drawn.visible));
+    bind(device, kernel.large, context.buffer(inputs.large.list));
+    set(device, kernel.viewProjection, inputs.viewProjection);
+    set(device, kernel.size, inputs.size);
 }
 
+// Both stages of a rasterizer (see largeTriangleArea()): the triangle stage K and the tile
+// stage T; `bindTargets(kernel)` binds what they add to LR_TRIANGLE_RASTERIZER.
+template <class K, class T, class BindTargets>
+void recordRasterStages(PassContext &context, RasterInputs const &inputs, BindTargets const &bindTargets) {
+    auto &device = context.device();
+    clearWords(context, inputs.large.list, 0, 2, 0u);
+    auto triangles = K{};
+    device.useKernel(triangles);
+    bindRasterizer(context, triangles, inputs);
+    bindTargets(triangles);
+    context.dispatchIndirect(triangles, inputs.drawn.arguments);
+
+    auto scan = kernels::ScanLargeTriangles{};
+    device.useKernel(scan);
+    bind(device, scan.large, context.buffer(inputs.large.list));
+    bind(device, scan.tileArguments, context.buffer(inputs.large.arguments));
+    context.dispatch(scan, tc::uvec3{1, 1, 1});
+
+    auto tiles = T{};
+    device.useKernel(tiles);
+    bindRasterizer(context, tiles, inputs);
+    bindTargets(tiles);
+    context.dispatchIndirect(tiles, inputs.large.arguments);
+}
+
+// What RasterVisibility and RasterVisibilityTiles add.
+struct VisibilityTargets {
+    PassContext &context;
+    WordRange depth;
+    WordRange triangles;
+    tc::uint mode = 0;
+    tc::uint fragmentCapacity = 0;
+
+    template <class K>
+    void operator()(K &kernel) const {
+        bindRange(context, kernel.depth, depth);
+        bindRange(context, kernel.triangles, triangles);
+        set(context.device(), kernel.mode, mode);
+        set(context.device(), kernel.fragmentCapacity, fragmentCapacity);
+    }
+};
+
 struct RasterRequest {
-    VisibleSet drawn;
-    core::mat4 viewProjection{1.0f};
-    core::ivec2 size{0};
+    RasterInputs inputs;
     tc::uint mode = 0;
     WordRange depth;
     WordRange triangles;
@@ -159,15 +226,9 @@ struct RasterRequest {
 };
 
 void recordRaster(PassContext &context, RasterRequest const &request) {
-    auto &device = context.device();
-    auto kernel = kernels::RasterVisibility{};
-    device.useKernel(kernel);
-    bindRasterizer(context, kernel, request.drawn, request.viewProjection, request.size);
-    bindRange(context, kernel.depth, request.depth);
-    bindRange(context, kernel.triangles, request.triangles);
-    set(device, kernel.mode, request.mode);
-    set(device, kernel.fragmentCapacity, request.fragmentCapacity);
-    context.dispatchIndirect(kernel, request.drawn.arguments);
+    recordRasterStages<kernels::RasterVisibility, kernels::RasterVisibilityTiles>(
+        context, request.inputs,
+        VisibilityTargets{context, request.depth, request.triangles, request.mode, request.fragmentCapacity});
 }
 
 // What shading kernels of a view take besides the scene.
@@ -270,9 +331,10 @@ private:
     static void rasterizeTwice(FrameGraphBuilder &graph, ViewContext const &view, VisibleSet const &drawn,
                                VisibilityOutputs const &outputs) {
         for (auto const mode : {kernels::rasterDepth(), kernels::rasterTriangles()}) {
-            auto &raster = graph.addPass(mode == kernels::rasterDepth() ? "rasterize depth" : "rasterize triangles");
-            raster.read(drawn.visible);
-            raster.read(drawn.arguments);
+            auto const name = std::string{mode == kernels::rasterDepth() ? "rasterize depth" : "rasterize triangles"};
+            auto const large = largeTrianglesOf(graph, name);
+            auto &raster = graph.addPass(name);
+            declareRaster(raster, drawn, large);
             raster.read(outputs.depth);
             if (mode == kernels::rasterDepth()) {
                 raster.write(outputs.depth);
@@ -281,9 +343,7 @@ private:
                 raster.write(outputs.triangles);
             }
             auto request = RasterRequest{};
-            request.drawn = drawn;
-            request.viewProjection = view.viewProjection;
-            request.size = view.extent;
+            request.inputs = RasterInputs{drawn, large, view.viewProjection, view.extent};
             request.mode = mode;
             request.depth = WordRange{outputs.depth};
             request.triangles = WordRange{outputs.triangles};
@@ -309,18 +369,15 @@ private:
             context.dispatch(kernel, tc::uvec3{groupsFor(pixels, 64), 1, 1});
         });
 
+        auto const large = largeTrianglesOf(graph, "rasterize visibility");
         auto &raster = graph.addPass("rasterize visibility");
-        raster.read(drawn.visible);
-        raster.read(drawn.arguments);
+        declareRaster(raster, drawn, large);
         raster.read(packed);
         raster.write(packed);
-        raster.record([drawn, packed, viewProjection = view.viewProjection, size = view.extent](PassContext &context) {
-            auto &device = context.device();
-            auto kernel = kernels::RasterPackedVisibility{};
-            device.useKernel(kernel);
-            bindRasterizer(context, kernel, drawn, viewProjection, size);
-            bind(device, kernel.packed, context.buffer(packed));
-            context.dispatchIndirect(kernel, drawn.arguments);
+        raster.record([inputs = RasterInputs{drawn, large, view.viewProjection, view.extent},
+                       packed](PassContext &context) {
+            recordRasterStages<kernels::RasterPackedVisibility, kernels::RasterPackedVisibilityTiles>(
+                context, inputs, [&](auto &kernel) { bind(context.device(), kernel.packed, context.buffer(packed)); });
         });
 
         auto &unpack = graph.addPass("unpack visibility");
@@ -405,15 +462,14 @@ struct ShadowFeature final : RenderFeature {
             auto const drawn = cullAndCompact(graph, view, CullRequest{"cull shadow casters " + name,
                                                                       "compact shadow casters " + name,
                                                                       cascades[index].viewProjection, false});
+            auto const large = largeTrianglesOf(graph, "rasterize shadow cascade " + name);
             auto &raster = graph.addPass("rasterize shadow cascade " + name);
-            raster.read(drawn.visible);
-            raster.read(drawn.arguments);
+            declareRaster(raster, drawn, large);
             raster.read(map);
             raster.write(map);
             auto rasterRequest = RasterRequest{};
-            rasterRequest.drawn = drawn;
-            rasterRequest.viewProjection = cascades[index].viewProjection;
-            rasterRequest.size = core::ivec2{static_cast<int>(resolution), static_cast<int>(resolution)};
+            rasterRequest.inputs = RasterInputs{drawn, large, cascades[index].viewProjection,
+                                                core::ivec2{static_cast<int>(resolution), static_cast<int>(resolution)}};
             rasterRequest.mode = kernels::rasterDepth();
             rasterRequest.depth = WordRange{map, shadowHeaderWords() + index * texels, texels};
             rasterRequest.triangles = rasterRequest.depth;
@@ -594,16 +650,14 @@ struct TransparencyFeature final : RenderFeature {
         auto const drawn = cullAndCompact(graph, view,
                                           CullRequest{"cull transparent instances", "compact transparent instances",
                                                       view.viewProjection, true});
+        auto const large = largeTrianglesOf(graph, "rasterize transparent");
         auto &raster = graph.addPass("rasterize transparent");
-        raster.read(drawn.visible);
-        raster.read(drawn.arguments);
+        declareRaster(raster, drawn, large);
         raster.read(visibility.depth);
         raster.read(lists);
         raster.write(lists);
         auto rasterRequest = RasterRequest{};
-        rasterRequest.drawn = drawn;
-        rasterRequest.viewProjection = view.viewProjection;
-        rasterRequest.size = view.extent;
+        rasterRequest.inputs = RasterInputs{drawn, large, view.viewProjection, view.extent};
         rasterRequest.mode = kernels::rasterTransparent();
         rasterRequest.depth = WordRange{visibility.depth};
         rasterRequest.triangles = WordRange{lists};

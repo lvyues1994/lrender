@@ -1,6 +1,7 @@
 #include "EnvironmentBrdf.h"
 #include "RenderTestSupport.h"
 #include "TestKernels.h"
+#include "kernels/Visibility.h"
 
 #include <lr/core/Primitives.h>
 #include <lr/render/Renderer.h>
@@ -10,6 +11,7 @@
 #include <doctest/doctest.h>
 
 #include <cmath>
+#include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
 
@@ -539,6 +541,51 @@ TEST_CASE("every GPU backend renders a textured, shadowed, transparent scene as 
             CHECK(difference.meanDifference < 0.25);
             CHECK(difference.farFraction < 0.01);
         }
+    });
+}
+
+// A grid of quads of 17 x 16 pixels, red and blue like a chequerboard, two triangles each
+// whose pixel box is past render::kernels::largeTriangleArea(), and more triangles than a
+// raster pass lists for its tile stage: every pixel still shows its own quad.
+TEST_CASE("more large triangles than the tile stage lists are all rasterized") {
+    constexpr auto kColumns = 128;
+    constexpr auto kRows = 65;
+    constexpr auto kWidth = 17;
+    constexpr auto kHeight = 16;
+    static_assert(2 * kColumns * kRows > render::kernels::largeTriangleCapacity());
+    auto const extent = core::ivec2{kColumns * kWidth, kRows * kHeight};
+    auto const pixel = 2.0f * 5.0f * std::tan(0.4f) / static_cast<float>(extent.y); // at the origin, seen from z 5
+    auto delta = quadScene();
+    for (auto row = 0; row < kRows; ++row) {
+        for (auto column = 0; column < kColumns; ++column) {
+            auto const centre = core::vec2{static_cast<float>(2 * column * kWidth + kWidth - extent.x),
+                                           static_cast<float>(extent.y - 2 * row * kHeight - kHeight)} * 0.5f;
+            auto const place = core::Transform{core::vec3{centre * pixel, 0.0f}, {},
+                                               core::vec3{kWidth * pixel, kHeight * pixel, 1.0f}};
+            delta.instances.push_back({core::InstanceId{static_cast<std::uint32_t>(row * kColumns + column)}, kQuad,
+                                       (row + column) % 2 == 0 ? kRed : kBlue, core::matrixOf(place)});
+        }
+    }
+    auto const red = seenFacing(kRedRadiance);
+    auto const blue = seenFacing(kBlueRadiance);
+    test::forEachBackend(test::HarnessOptions{}, [&](RenderHarness &harness) {
+        // The CPU backend runs the same code, but would take most of a minute over these
+        // 2.2 million pixels in a debug build.
+        if (harness.renderer->deviceInfo().backend == "cpu") {
+            return;
+        }
+        auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{extent});
+        auto const result = harness.render(frameOf(delta, test::viewOf(target, frontCamera())));
+        auto const &image = *result.views.at(0).image;
+        auto wrong = 0;
+        for (auto y = 0; y < extent.y; ++y) {
+            for (auto x = 0; x < extent.x; ++x) {
+                auto const expected = (y / kHeight + x / kWidth) % 2 == 0 ? red : blue;
+                wrong += test::nearPixel(test::pixelAt(image, x, y), expected) ? 0 : 1;
+            }
+        }
+        CHECK(wrong == 0);
+        CHECK(result.views[0].stats.visibleTriangles == 2 * kColumns * kRows);
     });
 }
 
