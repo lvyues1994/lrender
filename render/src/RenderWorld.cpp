@@ -261,8 +261,9 @@ void RenderWorld::upsertMesh(core::MeshUpsert const &upsert, SceneUpdate &update
     indexEnd += static_cast<std::uint32_t>(geometry.indices.size());
 
     auto const bounds = core::boundsOf(data);
-    auto const gpu = GpuMesh{geometry.firstVertex, geometry.firstIndex,
-                             static_cast<std::uint32_t>(data.indices.size() / 3), bounds.min, bounds.max};
+    auto const gpu =
+        GpuMesh{geometry.firstVertex, geometry.firstIndex, static_cast<std::uint32_t>(data.indices.size() / 3),
+                bounds.min,           bounds.max,          static_cast<std::uint32_t>(geometry.vertices.size())};
     meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}};
     update.geometry.push_back(std::move(geometry));
     update.meshes.push_back(Indexed<GpuMesh>{slot, gpu});
@@ -407,11 +408,12 @@ void RenderWorld::buildBlas(MeshRecord &record, SceneUpdate &update) {
     }
     auto const firstVertex = record.gpu.firstVertex;
     for (auto index = std::size_t{0}; index < bvh.order.size(); ++index) {
-        auto const first = std::size_t{bvh.order[index]} * 3;
+        auto const primitive = bvh.order[index];
+        auto const first = std::size_t{primitive} * 3;
         auto const corners = tc::uvec3{firstVertex + data.indices[first], firstVertex + data.indices[first + 1],
                                        firstVertex + data.indices[first + 2]};
-        update.blasTriangles.push_back(
-            Indexed<GpuBvhTriangle>{blasTriangleEnd + static_cast<std::uint32_t>(index), GpuBvhTriangle{corners}});
+        update.blasTriangles.push_back(Indexed<GpuBvhTriangle>{blasTriangleEnd + static_cast<std::uint32_t>(index),
+                                                               GpuBvhTriangle{corners, primitive}});
     }
     blasNodeEnd += static_cast<std::uint32_t>(bvh.nodes.size());
     blasTriangleEnd += static_cast<std::uint32_t>(bvh.order.size());
@@ -544,6 +546,7 @@ SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     }
     for (auto const id : delta.removed.meshes) {
         freeMeshSlots.push_back(meshes.at(id).slot);
+        update.removedMeshes.push_back(meshes.at(id).slot);
         meshes.erase(id);
     }
     for (auto const id : delta.removed.materials) {

@@ -238,7 +238,8 @@ bool jitters(ViewPlan const &plan) {
 }
 
 RendererCapabilities chooseFor(gpu::GpuQueue &gpu, RendererConfig const &config) {
-    auto const choices = VariantChoices{config.subgroups, config.singlePassVisibility, gpu.info().limits.subgroupSize};
+    auto const choices = VariantChoices{config.subgroups, config.singlePassVisibility, gpu.info().limits.subgroupSize,
+                                        config.rayQueries};
     auto const chosen = lexec::sync_wait(gpu.record([choices](gpu::GpuContext &context) {
         return chooseCapabilities(*makeKernelCheck(*context.device), choices);
     }));
@@ -408,7 +409,11 @@ private:
         }
         frame.lostTextures = world.takeLostTextures();
         if (tracesRays(plans)) {
-            world.keepHierarchies(frame.scene);
+            if (chosen.rayQueries) {
+                frame.tracesWithRayQueries = true;
+            } else {
+                world.keepHierarchies(frame.scene);
+            }
         }
         for (auto const &plan : plans) {
             frame.views.push_back(prepareView(plan, frame.index, modelList));

@@ -649,4 +649,93 @@ TEST_CASE("every GPU backend path traces what the CPU backend path traces") {
     }
 }
 
+core::mat4 placed(core::vec3 const &at, float const turn, core::vec3 const &scale = core::vec3{1.0f}) {
+    return core::matrixOf(
+        core::Transform{at, core::Rotation::axisAngle(core::vec3{0.0f, 1.0f, 0.0f}, turn), scale});
+}
+
+// smallScene() behind the cases traversal treats apart: first an instance of a mesh
+// without triangles, then quads that are masked (one kept, one cut out), blended, mirrored
+// (single-sided, facing the camera and away), and double-sided seen from behind.
+core::RenderWorldDelta traversalScene() {
+    auto delta = smallScene();
+    delta.meshes.push_back({core::MeshId{10}, test::share(core::MeshData{})});
+    delta.meshes.push_back({core::MeshId{11}, test::share(core::makeQuad(core::vec2{0.3f}))});
+    auto const partial = [](core::AlphaMode const mode, float const alpha) {
+        auto material = grey(0.7f);
+        material.baseColor = core::vec4{0.2f, 0.6f, 0.9f, alpha};
+        material.alphaMode = mode;
+        return material;
+    };
+    delta.materials.push_back({core::MaterialId{4}, partial(core::AlphaMode::Mask, 0.7f)});
+    delta.materials.push_back({core::MaterialId{5}, partial(core::AlphaMode::Mask, 0.3f)});
+    delta.materials.push_back({core::MaterialId{6}, partial(core::AlphaMode::Blend, 0.5f)});
+    delta.materials.push_back({core::MaterialId{7}, grey(0.5f, true)});
+    auto const pi = 3.14159265f;
+    auto const mirrored = core::vec3{-1.0f, 1.0f, 1.0f};
+    delta.instances.insert(delta.instances.begin(),
+                           {core::InstanceId{10}, core::MeshId{10}, core::MaterialId{0}, core::mat4{1.0f}});
+    delta.instances.push_back({core::InstanceId{11}, core::MeshId{11}, core::MaterialId{4}, placed({-0.9f, 0.9f, 1.6f}, 0.0f)});
+    delta.instances.push_back({core::InstanceId{12}, core::MeshId{11}, core::MaterialId{5}, placed({-0.3f, 0.9f, 1.6f}, 0.0f)});
+    delta.instances.push_back({core::InstanceId{13}, core::MeshId{11}, core::MaterialId{6}, placed({0.3f, 0.9f, 1.6f}, 0.0f)});
+    delta.instances.push_back(
+        {core::InstanceId{14}, core::MeshId{11}, core::MaterialId{0}, placed({0.9f, 0.9f, 1.6f}, 0.0f, mirrored)});
+    delta.instances.push_back(
+        {core::InstanceId{15}, core::MeshId{11}, core::MaterialId{0}, placed({-0.9f, 1.5f, 1.0f}, pi, mirrored)});
+    delta.instances.push_back({core::InstanceId{16}, core::MeshId{11}, core::MaterialId{7}, placed({0.0f, 1.5f, 1.0f}, pi)});
+    return delta;
+}
+
+// Then the sphere moves, the lit box and the empty mesh go away, the quads grow and a
+// second sphere comes in.
+core::RenderWorldDelta traversalChanges() {
+    auto delta = core::RenderWorldDelta{};
+    delta.meshes = {{core::MeshId{11}, test::share(core::makeQuad(core::vec2{0.4f}))}};
+    delta.instances = {{core::InstanceId{1}, core::MeshId{1}, core::MaterialId{1}, test::translation(core::vec3{0.4f, 0.7f, 0.1f})},
+                       {core::InstanceId{17}, core::MeshId{1}, core::MaterialId{2}, placed({-0.6f, 0.4f, -0.8f}, 0.0f, core::vec3{0.5f})}};
+    delta.removed.instances = {core::InstanceId{3}, core::InstanceId{10}};
+    delta.removed.meshes = {core::MeshId{10}};
+    return delta;
+}
+
+// On each device with ray queries, against lrender's own hierarchies on the same device.
+TEST_CASE("the path tracer traces the same paths with ray queries as through lrender's hierarchies") {
+    auto const camera = test::cameraAt(core::vec3{0.0f, 2.0f, 4.0f}, core::vec3{0.0f, 0.6f, 0.0f});
+    auto const extent = core::ivec2{kEquivalencePixels, kEquivalencePixels};
+    test::forEachBackend(test::HarnessOptions{}, [&](RenderHarness &harness) {
+        if (not harness.renderer->capabilities().rayQueries) {
+            MESSAGE("no ray queries on " << harness.renderer->deviceInfo().deviceName);
+            return;
+        }
+        auto options = test::HarnessOptions{};
+        options.backend = harness.renderer->deviceInfo().backend;
+        options.device = test::deviceFor(options.backend);
+        options.rayQueries = render::VariantUse::Off;
+        auto hierarchies = RenderHarness{options};
+        REQUIRE_FALSE(hierarchies.renderer->capabilities().rayQueries);
+        auto const traced = pathTraced(harness, harness.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        auto const walked =
+            pathTraced(hierarchies, hierarchies.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        for (auto const &delta : {traversalScene(), traversalChanges()}) {
+            auto rayQueried = harness.render(frameOf(delta, traced));
+            auto walkedResult = hierarchies.render(frameOf(delta, walked));
+            for (auto frame = 1u; frame < kEquivalenceSamples; ++frame) {
+                rayQueried = harness.render(frameOf({}, traced));
+                walkedResult = hierarchies.render(frameOf({}, walked));
+            }
+            CHECK(rayQueried.views.at(0).stats.accumulatedSamples == kEquivalenceSamples);
+            auto const difference = compare(*rayQueried.views[0].image, *walkedResult.views.at(0).image);
+            CAPTURE(difference.largest);
+            CAPTURE(difference.meanDifference);
+            CAPTURE(difference.farFraction);
+            MESSAGE(options.backend << ": mean difference " << difference.meanDifference << " levels, "
+                                    << difference.farFraction * 100.0 << "% of pixels more than 2 apart");
+            // The same random numbers decide the same paths: only where the two intersect a
+            // ray with a triangle differently by rounding does a path go elsewhere.
+            CHECK(difference.meanDifference < 0.25);
+            CHECK(difference.farFraction < 0.005);
+        }
+    });
+}
+
 } // namespace

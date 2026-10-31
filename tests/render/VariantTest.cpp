@@ -43,24 +43,29 @@ TEST_CASE("each device gets the variants it runs, and none it is told not to use
         auto const &info = harness.renderer->deviceInfo();
         auto const &chosen = harness.renderer->capabilities();
         MESSAGE(info.backend << " on " << info.deviceName << ": subgroups " << chosen.subgroups << " (of "
-                             << chosen.subgroupSize << "), single-pass visibility " << chosen.singlePassVisibility);
+                             << chosen.subgroupSize << "), single-pass visibility " << chosen.singlePassVisibility
+                             << ", ray queries " << chosen.rayQueries);
         CHECK(chosen.subgroups == tc::uses(info.limits.features, tc::KernelFeature::Subgroups));
         CHECK(chosen.singlePassVisibility == tc::uses(info.limits.features, tc::KernelFeature::Int64Atomics));
         CHECK(chosen.subgroupSize == info.limits.subgroupSize);
-        // Mesa's llvmpipe has neither on OpenGL and OpenGL ES; lavapipe has both.
+        CHECK(chosen.rayQueries == tc::uses(info.limits.features, tc::KernelFeature::RayQuery));
+        // Mesa's llvmpipe has none of them on OpenGL and OpenGL ES; lavapipe has all.
         if (info.backend == "cpu" or info.deviceName.find("llvmpipe") != std::string::npos) {
-            auto const both = info.backend == "cpu" or info.backend == "vulkan";
-            CHECK(chosen.subgroups == both);
-            CHECK(chosen.singlePassVisibility == both);
+            auto const all = info.backend == "cpu" or info.backend == "vulkan";
+            CHECK(chosen.subgroups == all);
+            CHECK(chosen.singlePassVisibility == all);
+            CHECK(chosen.rayQueries == all);
         }
     });
 
     auto options = test::HarnessOptions{};
     options.subgroups = render::VariantUse::Off;
     options.singlePassVisibility = render::VariantUse::Off;
+    options.rayQueries = render::VariantUse::Off;
     auto const forced = RenderHarness{options};
     CHECK_FALSE(forced.renderer->capabilities().subgroups);
     CHECK_FALSE(forced.renderer->capabilities().singlePassVisibility);
+    CHECK_FALSE(forced.renderer->capabilities().rayQueries);
 }
 
 TEST_CASE("a device short of what a kernel needs is refused, with the kernels named") {
@@ -70,12 +75,14 @@ TEST_CASE("a device short of what a kernel needs is refused, with the kernels na
     auto const everything = render::chooseCapabilities(LimitsCheck{limits}, render::VariantChoices{});
     CHECK(everything.subgroups);
     CHECK(everything.singlePassVisibility);
+    CHECK(everything.rayQueries);
 
     auto plain = limits;
     plain.features = 0;
     auto const fallback = render::chooseCapabilities(LimitsCheck{plain}, render::VariantChoices{});
     CHECK_FALSE(fallback.subgroups);
     CHECK_FALSE(fallback.singlePassVisibility);
+    CHECK_FALSE(fallback.rayQueries);
 
     auto cramped = limits;
     cramped.storageBuffers = 4;
@@ -104,6 +111,7 @@ TEST_CASE("the renderer checks every program of lrender's") {
     auto listed = std::set<std::string_view>{programs.required.begin(), programs.required.end()};
     listed.insert(programs.subgroups.begin(), programs.subgroups.end());
     listed.insert(programs.singlePassVisibility.begin(), programs.singlePassVisibility.end());
+    listed.insert(programs.rayQueries.begin(), programs.rayQueries.end());
     for (auto const name : listed) {
         CAPTURE(name);
         CHECK(tc::ProgramRegistry::instance().find(name).has_value());

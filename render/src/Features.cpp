@@ -660,46 +660,80 @@ struct PathTraceFeature final : RenderFeature {
         pass.read(accumulation.previous);
         pass.write(accumulation.current);
         pass.write(view.sceneColor);
-        pass.record([accumulation, continues, total, counts = sampleCounts, viewId = view.view, color = view.sceneColor,
-                     extent = view.extent, inverseViewProjection = view.inverseViewProjection,
-                     environment = tc::vec4{view.environment.radiance, 0.0f},
-                     lightCount = static_cast<tc::uint>(view.lightCount)](PassContext &context) {
+        auto inputs = TracerInputs{accumulation,
+                                   view.sceneColor,
+                                   view.extent,
+                                   view.inverseViewProjection,
+                                   tc::vec4{view.environment.radiance, 0.0f},
+                                   static_cast<tc::uint>(view.lightCount),
+                                   0u};
+        pass.record([inputs, continues, total, counts = sampleCounts, viewId = view.view,
+                     rayQueries = view.capabilities.rayQueries](PassContext &context) mutable {
             auto &device = context.device();
             auto const &scene = context.scene();
-            if (scene.tlasNodes == nullptr) {
+            if (rayQueries ? scene.topLevel == nullptr : scene.tlasNodes == nullptr) {
                 throw std::logic_error{"lr::render: the path tracer ran before the scene had hierarchies"};
             }
             auto &count = (*counts)[viewId];
             auto const samples = continues and count.residency == scene.textures.residency ? count.samples : 0u;
             count = SampleCount{samples + 1, scene.textures.residency};
             *total = samples + 1;
+            inputs.samples = samples;
 
+            if (rayQueries) {
+                auto kernel = kernels::PathTraceRayQuery{};
+                device.useKernel(kernel);
+                bindTracerInputs(context, kernel, inputs);
+                bind(device, kernel.scene, *scene.topLevel);
+                bind(device, kernel.meshes, *scene.meshes);
+                bind(device, kernel.indices, *scene.indices);
+                context.dispatch(kernel, groupsCovering(inputs.extent));
+                return;
+            }
             auto kernel = kernels::PathTrace{};
             device.useKernel(kernel);
-            bind(device, kernel.previous, context.image(accumulation.previous));
-            bind(device, kernel.current, context.image(accumulation.current));
-            bind(device, kernel.color, context.image(color));
-            bindMaterialTextures(device, kernel, scene.textures);
-            bind(device, kernel.instances, *scene.instances);
-            bind(device, kernel.vertices, *scene.vertices);
-            bind(device, kernel.materials, *scene.materials);
-            bind(device, kernel.lights, *scene.lights);
+            bindTracerInputs(context, kernel, inputs);
             bind(device, kernel.tlasNodes, *scene.tlasNodes);
             bind(device, kernel.blasNodes, *scene.blasNodes);
             bind(device, kernel.blasTriangles, *scene.blasTriangles);
             bind(device, kernel.blasRoots, *scene.blasRoots);
-            set(device, kernel.inverseViewProjection, inverseViewProjection);
-            set(device, kernel.environment, environment);
-            set(device, kernel.size, extent);
-            set(device, kernel.lightCount, lightCount);
             set(device, kernel.tlasNodeCount, scene.tlasNodeCount);
-            set(device, kernel.sampleIndex, samples);
-            context.dispatch(kernel, groupsCovering(extent));
+            context.dispatch(kernel, groupsCovering(inputs.extent));
         });
         graph.onFinish([total](ViewResult &result) { result.stats.accumulatedSamples = *total; });
     }
 
 private:
+    // What the bindings and uniforms of LR_PATH_TRACER_INPUTS take, besides the scene.
+    struct TracerInputs {
+        HistoryImage<AccumulationFormat> accumulation;
+        ImageRef<HdrFormat> color;
+        core::ivec2 extent;
+        tc::mat4 inverseViewProjection;
+        tc::vec4 environment; // radiance in xyz
+        tc::uint lightCount;
+        tc::uint samples; // averaged in accumulation.previous
+    };
+
+    template <class K>
+    static void bindTracerInputs(PassContext &context, K &kernel, TracerInputs const &inputs) {
+        auto &device = context.device();
+        auto const &scene = context.scene();
+        bind(device, kernel.previous, context.image(inputs.accumulation.previous));
+        bind(device, kernel.current, context.image(inputs.accumulation.current));
+        bind(device, kernel.color, context.image(inputs.color));
+        bindMaterialTextures(device, kernel, scene.textures);
+        bind(device, kernel.instances, *scene.instances);
+        bind(device, kernel.vertices, *scene.vertices);
+        bind(device, kernel.materials, *scene.materials);
+        bind(device, kernel.lights, *scene.lights);
+        set(device, kernel.inverseViewProjection, inputs.inverseViewProjection);
+        set(device, kernel.environment, inputs.environment);
+        set(device, kernel.size, inputs.extent);
+        set(device, kernel.lightCount, inputs.lightCount);
+        set(device, kernel.sampleIndex, inputs.samples);
+    }
+
     // What the samples averaged so far show, on the render thread.
     struct Accumulation {
         core::CameraDesc camera;

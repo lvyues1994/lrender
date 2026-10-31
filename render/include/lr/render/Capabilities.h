@@ -21,6 +21,9 @@ struct RendererCapabilities {
     bool singlePassVisibility = false;
     // Invocations per subgroup on the device; 0 without subgroups.
     std::uint32_t subgroupSize = 0;
+    // The path tracer traces the device's acceleration structures with ray queries, built
+    // on the device; otherwise lrender's own hierarchies, built on the render thread.
+    bool rayQueries = false;
 };
 
 } // namespace lr::render

@@ -70,6 +70,7 @@ struct SceneUpdate {
     SceneCapacity capacity;
     std::vector<GeometryUpload> geometry;
     std::vector<Indexed<GpuMesh>> meshes;
+    std::vector<std::uint32_t> removedMeshes; // slots, after the writes to `meshes`
     std::vector<Indexed<GpuInstance>> instances;
     std::vector<Indexed<MaterialEncoding>> materials;
     std::vector<Indexed<GpuLight>> lights;

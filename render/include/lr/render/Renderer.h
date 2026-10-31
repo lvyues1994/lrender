@@ -105,6 +105,7 @@ struct RendererConfig {
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;
     VariantUse singlePassVisibility = VariantUse::Auto;
+    VariantUse rayQueries = VariantUse::Auto;
 };
 
 struct Renderer {

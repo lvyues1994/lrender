@@ -1,27 +1,49 @@
 #include "FrameQueue.h"
 
+#include "kernels/PathTrace.h"
+#include "kernels/Textures.h"
+
 #include <algorithm>
+#include <cstddef>
+#include <optional>
 #include <stdexcept>
+#include <string>
 #include <utility>
 
 namespace lr::render {
 
 namespace {
 
-// Whether the timings are those of the runs' dispatches: the device lists them in
-// execution order, the runs in recording order, and the two agree unless a pass
-// dispatched behind PassContext's back.
-bool timingsMatch(std::vector<GraphRun> const &runs, std::vector<tc::KernelTiming> const &timings) {
-    auto next = std::size_t{0};
+// The frame queue's own dispatches, recorded before the views (pool growth, acceleration
+// structures) or after them (mip levels of textures that arrived).
+bool ownProgram(std::string const &program) {
+    using namespace kernels;
+    return program == CopyTextureLayer::fileLocation or program == DownsampleTexture::fileLocation
+        or program == CopyPositions::fileLocation or program == WriteTopLevelInstances::fileLocation;
+}
+
+// Where the runs' dispatches start among the frame's timings. The device lists them in
+// execution order, the runs in recording order, and between the frame queue's own
+// dispatches the two agree unless a pass dispatched behind PassContext's back; nullopt
+// then.
+std::optional<std::size_t> firstViewTiming(std::vector<GraphRun> const &runs,
+                                           std::vector<tc::KernelTiming> const &timings) {
+    auto first = std::size_t{0};
+    while (first < timings.size() and ownProgram(timings[first].program)) {
+        ++first;
+    }
+    auto next = first;
     for (auto const &run : runs) {
         for (auto const &dispatch : run.dispatches()) {
             if (next == timings.size() or timings[next].program != dispatch.program) {
-                return false;
+                return std::nullopt;
             }
             ++next;
         }
     }
-    return next == timings.size();
+    auto const rest = std::all_of(timings.begin() + static_cast<std::ptrdiff_t>(next), timings.end(),
+                                  [](tc::KernelTiming const &timing) { return ownProgram(timing.program); });
+    return rest ? std::optional<std::size_t>{first} : std::nullopt;
 }
 
 std::exception_ptr waitStopped() noexcept {
@@ -41,6 +63,7 @@ void FrameQueue::clear() noexcept {
     pool.clear();
     historyImages.clear();
     deviceScene = DeviceScene{};
+    accelerations = AccelerationScene{};
     textures.clear();
     lastSubmission = tc::Submission{};
 }
@@ -94,6 +117,10 @@ void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFli
     textures.apply(device, prepared.scene, frame.retired);
     textures.send(device, lastSubmission, frame.retired);
     deviceScene.apply(device, prepared.scene, textures, frame.retired);
+    accelerations.apply(prepared.scene);
+    if (prepared.tracesWithRayQueries) {
+        accelerations.build(device, deviceScene.tables(), frame.retired);
+    }
     historyImages.release(prepared.releasedHistories, frame.retired);
     try {
         recordViews(device, prepared, frame);
@@ -116,6 +143,7 @@ void FrameQueue::recordViews(tc::Device &device, PreparedFrame &prepared, InFlig
         }
     }
     auto tables = deviceScene.tables();
+    tables.topLevel = accelerations.topLevel();
     tables.textures = textures.textures();
     frame.runs.reserve(prepared.views.size());
     for (auto &view : prepared.views) {
@@ -196,11 +224,11 @@ FrameResult FrameQueue::finish(gpu::GpuContext &context, InFlight &frame) {
     if (frame.failure) {
         std::rethrow_exception(frame.failure);
     }
-    auto const timed = config.timers and timingsMatch(frame.runs, timings);
-    auto firstTiming = std::size_t{0};
+    auto const first = config.timers ? firstViewTiming(frame.runs, timings) : std::nullopt;
+    auto firstTiming = first.value_or(0);
     for (auto index = std::size_t{0}; index < frame.runs.size(); ++index) {
         auto &view = frame.result.views[index];
-        if (timed) {
+        if (first) {
             view.passTimings = frame.runs[index].passTimings(timings, firstTiming);
             firstTiming += frame.runs[index].dispatches().size();
         }
@@ -221,6 +249,7 @@ void FrameQueue::loseDevice(gpu::GpuContext &context, std::exception_ptr const &
     pool.clear();
     historyImages.clear();
     deviceScene = DeviceScene{};
+    accelerations = AccelerationScene{};
     textures.clear();
     lastSubmission = tc::Submission{};
     lostWith = failure;

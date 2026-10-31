@@ -1,5 +1,6 @@
 #pragma once
 
+#include "AccelerationScene.h"
 #include "DeviceScene.h"
 #include "FrameGraphImpl.h"
 #include "PreparedFrame.h"
@@ -87,6 +88,7 @@ private:
 
     FrameQueueConfig config;
     DeviceScene deviceScene;
+    AccelerationScene accelerations;
     TexturePool textures;
     ResourcePool pool;
     HistoryResources historyImages;

@@ -29,6 +29,7 @@ struct LrenderPrograms {
     std::vector<std::string_view> required;
     std::vector<std::string_view> subgroups;
     std::vector<std::string_view> singlePassVisibility;
+    std::vector<std::string_view> rayQueries;
 };
 LrenderPrograms const &lrenderPrograms();
 
@@ -36,6 +37,7 @@ struct VariantChoices {
     VariantUse subgroups = VariantUse::Auto;
     VariantUse singlePassVisibility = VariantUse::Auto;
     std::uint32_t subgroupSize = 0; // of the device
+    VariantUse rayQueries = VariantUse::Auto;
 };
 
 // Each variant the choices allow and the device runs. Throws tc::DeviceError naming every

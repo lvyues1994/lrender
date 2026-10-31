@@ -32,6 +32,9 @@ struct PreparedFrame {
     // The frame failed before anything was made of it.
     std::exception_ptr failure;
     SceneUpdate scene;
+    // A view traces rays with ray queries: the GPU thread brings the acceleration
+    // structures up to date before recording it.
+    bool tracesWithRayQueries = false;
     std::vector<PreparedView> views;
     std::vector<std::uint64_t> releasedHistories;
     // Textures a lost device took with it, for FrameResult::lostTextures.

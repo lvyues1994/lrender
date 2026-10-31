@@ -7,8 +7,10 @@
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
 #include <filesystem>
 #include <fstream>
+#include <set>
 #include <string>
 
 namespace {
@@ -20,12 +22,15 @@ struct KernelCopy {
     std::size_t programs = 0;
 };
 
-// The build's kernel directory copied, with a comment appended to every GLSL file: each
-// program then differs from what the registry holds, and behaves the same.
+// The build's kernel directory copied, with a comment appended to every OpenGL GLSL file:
+// each program with one then differs from what the registry holds, and behaves the same.
+// Programs only Vulkan runs (ray queries) have none and stay as they are.
 KernelCopy editedCopyOf(std::string const &kernels, int const edit) {
     auto copy = KernelCopy{std::filesystem::path{LR_TEST_OUTPUT_DIR} / ("kernel-reload-" + std::to_string(edit)), 0};
     std::filesystem::remove_all(copy.directory);
     std::filesystem::create_directories(copy.directory);
+    auto edited = std::set<std::string>{};
+    auto registered = std::set<std::string>{};
     for (auto const &entry : std::filesystem::directory_iterator{kernels}) {
         auto const target = copy.directory / entry.path().filename();
         std::filesystem::copy_file(entry.path(), target);
@@ -34,13 +39,16 @@ KernelCopy editedCopyOf(std::string const &kernels, int const edit) {
                       and name.find(".vk.") == std::string::npos;
         if (glsl) {
             std::ofstream{target, std::ios::app} << "\n// edited " << edit << "\n";
+            edited.insert(name.substr(0, name.find('.')));
         }
         // Builds leave the files of kernels since renamed behind; reloading skips them.
         if (entry.path().extension() == ".interface"
             and tc::ProgramRegistry::instance().find(entry.path().stem().string())) {
-            ++copy.programs;
+            registered.insert(entry.path().stem().string());
         }
     }
+    copy.programs = static_cast<std::size_t>(std::count_if(
+        registered.begin(), registered.end(), [&edited](std::string const &program) { return edited.count(program) != 0; }));
     return copy;
 }
 

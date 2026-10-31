@@ -1,8 +1,11 @@
 #pragma once
 
-// The reference path tracer: one path per pixel per frame through two levels of
-// hierarchies, shaded with the visibility pipeline's surface model and lights
-// (Lighting.h), averaged into the view's accumulation history.
+// The reference path tracer: one path per pixel per frame through the scene, shaded with
+// the visibility pipeline's surface model and lights (Lighting.h), averaged into the view's
+// accumulation history. PathTrace walks two levels of hierarchies the render thread builds;
+// PathTraceRayQuery traces the device's acceleration structures (RendererCapabilities::
+// rayQueries). Both expand the same macros around their trace(), so a ray that hits the
+// same triangle at the same point continues the same way in both.
 //
 // Paths gather emission and the environment where they end, and the lights by next-event
 // estimation with shadow rays at every vertex; they continue by sampling the diffuse or
@@ -182,7 +185,7 @@ inline TriangleHit intersectTriangle(vec3 origin, vec3 direction, vec3 a, vec3 b
 struct RayHit {
     float distance;
     uint instance; // noHit() when the ray hit nothing
-    uint triangle; // into the triangle table
+    uvec3 corners; // of the triangle, in the vertex table
     float u;       // barycentrics of corners 1 and 2
     float v;
 };
@@ -194,57 +197,198 @@ struct SurfacePoint {
     MaterialSample material;
 };
 
+} // namespace lr::render::kernels
+
+// What both path tracers have: bindings 0 to 18 and uniforms 0 to 3 and 5, and whether a
+// ray that meets a masked or blended surface at barycentrics (u, v) stops there. `seed`
+// decides for blended ones, independently for each triangle of each instance (instances
+// of one mesh share its triangles).
+#define LR_PATH_TRACER_INPUTS                                                                                          \
+    ImageBinding<AccumulationFormat, Dim::D2, AccumulationPixel, 0> previous;                                          \
+    ImageBinding<AccumulationFormat, Dim::D2, AccumulationPixel, 1> current;                                           \
+    ImageBinding<HdrFormat, Dim::D2, HdrPixel, 2> color;                                                               \
+    LR_MATERIAL_TEXTURES(3u)                                                                                           \
+    InstanceTable<15> instances;                                                                                       \
+    VertexTable<16> vertices;                                                                                          \
+    MaterialTable<17> materials;                                                                                       \
+    LightTable<18> lights;                                                                                             \
+    Uniform<mat4, 0> inverseViewProjection{};                                                                          \
+    Uniform<vec4, 1> environment{}; /* radiance in xyz */                                                              \
+    Uniform<ivec2, 2> size{};                                                                                          \
+    Uniform<uint, 3> lightCount{};                                                                                     \
+    Uniform<uint, 5> sampleIndex{}; /* the samples `previous` averages */                                              \
+                                                                                                                       \
+    bool stopsAt(GpuMaterial material, uvec3 corners, float u, float v, uint primitive, uint instance, uint seed) {    \
+        vec2 uv = vertices[corners.x].uv.value * (1.0f - u - v) + vertices[corners.y].uv.value * u                     \
+                + vertices[corners.z].uv.value * v;                                                                    \
+        float alpha = material.baseColor.w                                                                             \
+                    * sampleTexture(material.textures.x, materialUv(material, uv), 0.0f, vec4(1.0f)).w;                \
+        if ((material.flags & materialAlphaMask()) != 0u) {                                                            \
+            return alpha >= material.alphaCutoff;                                                                      \
+        }                                                                                                              \
+        return unitFloat(pcgHash(seed + pcgHash(primitive + pcgHash(instance)))) < alpha;                              \
+    }
+
+// The paths, through trace(origin, direction, far, anyHit, seed), which a kernel defines
+// between LR_PATH_TRACER_INPUTS and this: the nearest hit closer than `far`, or with
+// `anyHit` the first one found. Single-sided materials hide back faces, which wind
+// clockwise in world space.
+#define LR_PATH_TRACER_PATHS                                                                                           \
+    /* As the visibility pipeline shades it: interpolated and normal-mapped normals, and                               \
+       surfaces seen from behind (double-sided materials only) facing the other way. */                                \
+    SurfacePoint surfaceAt(RayHit hit, vec3 origin, vec3 direction) {                                                  \
+        uvec3 corners = hit.corners;                                                                                   \
+        mat4 objectToWorld = instances[hit.instance].objectToWorld.value;                                              \
+        mat4 worldToObject = instances[hit.instance].worldToObject.value;                                              \
+        GpuMaterial material = materials[instances[hit.instance].material];                                            \
+        vec3 a = (objectToWorld * vec4(vertices[corners.x].position, 1.0f)).xyz();                                     \
+        vec3 b = (objectToWorld * vec4(vertices[corners.y].position, 1.0f)).xyz();                                     \
+        vec3 c = (objectToWorld * vec4(vertices[corners.z].position, 1.0f)).xyz();                                     \
+        vec2 uvA = materialUv(material, vertices[corners.x].uv.value);                                                 \
+        vec2 uvB = materialUv(material, vertices[corners.y].uv.value);                                                 \
+        vec2 uvC = materialUv(material, vertices[corners.z].uv.value);                                                 \
+        float w = 1.0f - hit.u - hit.v;                                                                                \
+        MaterialSample sampled = sampleMaterial(material, uvA * w + uvB * hit.u + uvC * hit.v, 0.0f);                  \
+        vec3 objectNormal = vertices[corners.x].normal.value * w + vertices[corners.y].normal.value * hit.u            \
+                          + vertices[corners.z].normal.value * hit.v;                                                  \
+        vec3 normal = normalize(transpose(mat3(worldToObject)) * objectNormal);                                        \
+        normal = perturbNormal(normal, uvAxes(b - a, c - a, uvB - uvA, uvC - uvA), sampled.normal);                    \
+        vec3 geometric = normalize(cross(b - a, c - a));                                                               \
+        if (dot(geometric, direction) > 0.0f) {                                                                        \
+            normal = -normal;                                                                                          \
+            geometric = -geometric;                                                                                    \
+        }                                                                                                              \
+        return SurfacePoint{origin + direction * hit.distance, normal, geometric, sampled};                            \
+    }                                                                                                                  \
+                                                                                                                       \
+    /* The light the scene's lights reflect towards the viewer where nothing shadows them. */                          \
+    vec3 directLight(SurfacePoint surface, vec3 toViewer, vec3 above, uint pixelIndex, uint sampleNumber,              \
+                     uint bounce) {                                                                                    \
+        vec3 reflected = vec3(0.0f);                                                                                   \
+        vec3 baseColor = surface.material.baseColor.xyz();                                                             \
+        for (uint i = 0u; i < lightCount.value; ++i) {                                                                 \
+            IncidentLight light = incidentLight(lights[i], surface.position);                                          \
+            vec3 contribution = reflectedLight(surface.normal, toViewer, light.toLight, light.irradiance, baseColor,   \
+                                               surface.material.metallic, surface.material.roughness);                 \
+            if (contribution != vec3(0.0f)) {                                                                          \
+                uint seed = randomBits(pixelIndex, sampleNumber, traceDimension(bounce, 1u + i));                      \
+                if (trace(above, light.toLight, light.distance * 0.9999f, true, seed).instance == noHit()) {           \
+                    reflected += contribution;                                                                         \
+                }                                                                                                      \
+            }                                                                                                          \
+        }                                                                                                              \
+        return reflected;                                                                                              \
+    }                                                                                                                  \
+                                                                                                                       \
+    vec3 worldPoint(vec2 ndc, float depth) {                                                                           \
+        vec4 point = inverseViewProjection.value * vec4(ndc, depth, 1.0f);                                             \
+        return point.xyz() / point.w;                                                                                  \
+    }                                                                                                                  \
+                                                                                                                       \
+    vec3 tracePath(ivec2 pixel, uint pixelIndex, uint sampleNumber) {                                                  \
+        float pi = 3.14159265f;                                                                                        \
+        vec2 jitter = vec2{randomNumber(pixelIndex, sampleNumber, 0u), randomNumber(pixelIndex, sampleNumber, 1u)};    \
+        vec2 ndc = vec2{(float(pixel.x) + jitter.x) / float(size.value.x) * 2.0f - 1.0f,                               \
+                        1.0f - (float(pixel.y) + jitter.y) / float(size.value.y) * 2.0f};                              \
+        vec3 origin = worldPoint(ndc, 0.0f);                                                                           \
+        vec3 direction = normalize(worldPoint(ndc, 1.0f) - origin);                                                    \
+        vec3 radiance = vec3(0.0f);                                                                                    \
+        vec3 throughput = vec3(1.0f);                                                                                  \
+        for (uint bounce = 0u; bounce < maxBounces(); ++bounce) {                                                      \
+            RayHit hit = trace(origin, direction, infiniteDistance(), false,                                           \
+                               randomBits(pixelIndex, sampleNumber, traceDimension(bounce, 0u)));                      \
+            if (hit.instance == noHit()) {                                                                             \
+                radiance += throughput * environment.value.xyz();                                                      \
+                break;                                                                                                 \
+            }                                                                                                          \
+            SurfacePoint surface = surfaceAt(hit, origin, direction);                                                  \
+            vec3 toViewer = -direction;                                                                                \
+            /* Rays leave from just above the triangle, so they do not hit it again. */                                \
+            vec3 above = surface.position                                                                              \
+                       + surface.geometric * (1e-4f * (1.0f + maxComponent(abs(surface.position))));                   \
+            radiance += throughput                                                                                     \
+                      * (surface.material.emissive                                                                     \
+                         + directLight(surface, toViewer, above, pixelIndex, sampleNumber, bounce));                   \
+                                                                                                                       \
+            vec3 baseColor = surface.material.baseColor.xyz();                                                         \
+            float metallic = surface.material.metallic;                                                                \
+            float roughness = surface.material.roughness;                                                              \
+            float alpha = max(roughness * roughness, 0.001f);                                                          \
+            float chance = specularChance(baseColor, metallic, dot(surface.normal, toViewer));                         \
+            uint dimension = 2u + 4u * bounce;                                                                         \
+            float u1 = randomNumber(pixelIndex, sampleNumber, dimension + 1u);                                         \
+            float u2 = randomNumber(pixelIndex, sampleNumber, dimension + 2u);                                         \
+            vec3 toLight = randomNumber(pixelIndex, sampleNumber, dimension) < chance                                  \
+                             ? reflect(direction, ggxHalfVector(surface.normal, alpha, u1, u2))                        \
+                             : cosineDirection(surface.normal, u1, u2);                                                \
+            float nDotL = dot(surface.normal, toLight);                                                                \
+            float density = mix(max(nDotL, 0.0f) / pi, ggxDensity(surface.normal, toViewer, toLight, alpha), chance);  \
+            if (nDotL <= 0.0f or density <= 0.0f or dot(toLight, surface.geometric) <= 0.0f) {                         \
+                break;                                                                                                 \
+            }                                                                                                          \
+            throughput *=                                                                                              \
+                reflectedLight(surface.normal, toViewer, toLight, vec3(1.0f), baseColor, metallic, roughness)          \
+                / density;                                                                                             \
+            if (bounce >= 2u) {                                                                                        \
+                float survival = min(maxComponent(throughput), 0.95f);                                                 \
+                if (randomNumber(pixelIndex, sampleNumber, dimension + 3u) >= survival) {                              \
+                    break;                                                                                             \
+                }                                                                                                      \
+                throughput = throughput / survival;                                                                    \
+            }                                                                                                          \
+            origin = above;                                                                                            \
+            direction = toLight;                                                                                       \
+        }                                                                                                              \
+        return radiance;                                                                                               \
+    }                                                                                                                  \
+                                                                                                                       \
+    void main() {                                                                                                      \
+        ivec2 pixel = ivec2(gl_GlobalInvocationID.xy());                                                               \
+        if (pixel.x >= size.value.x or pixel.y >= size.value.y) {                                                      \
+            return;                                                                                                    \
+        }                                                                                                              \
+        uint sampleNumber = sampleIndex.value;                                                                         \
+        vec3 radiance = tracePath(pixel, uint(pixel.y * size.value.x + pixel.x), sampleNumber);                        \
+        /* One broken sample would stay in the mean for good. */                                                       \
+        if (any(isnan(radiance)) or any(isinf(radiance))) {                                                            \
+            radiance = vec3(0.0f);                                                                                     \
+        }                                                                                                              \
+        vec4 mean = vec4(radiance, 1.0f);                                                                              \
+        if (sampleNumber > 0u) {                                                                                       \
+            vec4 before = imageLoad(previous, pixel);                                                                  \
+            mean = before + (mean - before) / float(sampleNumber + 1u);                                                \
+        }                                                                                                              \
+        imageStore(current, pixel, mean);                                                                              \
+        imageStore(color, pixel, vec4(mean.xyz(), 1.0f));                                                              \
+    }
+
+namespace lr::render::kernels {
+
 struct TC_KERNEL PathTrace {
     static constexpr char fileLocation[] = "lr_path_trace";
     uvec3 local_size{8, 8, 1};
 
-    ImageBinding<AccumulationFormat, Dim::D2, AccumulationPixel, 0> previous;
-    ImageBinding<AccumulationFormat, Dim::D2, AccumulationPixel, 1> current;
-    ImageBinding<HdrFormat, Dim::D2, HdrPixel, 2> color;
-    LR_MATERIAL_TEXTURES(3u)
-    InstanceTable<15> instances;
-    VertexTable<16> vertices;
-    MaterialTable<17> materials;
-    LightTable<18> lights;
+    LR_PATH_TRACER_INPUTS
     BvhNodeTable<19> tlasNodes;
     BvhNodeTable<20> blasNodes;
     BvhTriangleTable<21> blasTriangles;
     BufferBinding<uint, 22> blasRoots;
-    Uniform<mat4, 0> inverseViewProjection{};
-    Uniform<vec4, 1> environment{}; // radiance in xyz
-    Uniform<ivec2, 2> size{};
-    Uniform<uint, 3> lightCount{};
     Uniform<uint, 4> tlasNodeCount{};
-    Uniform<uint, 5> sampleIndex{}; // the samples `previous` averages
 
-    // Whether a ray that meets a masked or blended surface at barycentrics (u, v) stops
-    // there; `seed` decides for blended ones, independently for each triangle of each
-    // instance (instances of one mesh share its triangles).
-    bool stopsAt(GpuMaterial material, uvec3 corners, float u, float v, uint triangle, uint instance, uint seed) {
-        vec2 uv = vertices[corners.x].uv.value * (1.0f - u - v) + vertices[corners.y].uv.value * u
-                + vertices[corners.z].uv.value * v;
-        float alpha = material.baseColor.w
-                    * sampleTexture(material.textures.x, materialUv(material, uv), 0.0f, vec4(1.0f)).w;
-        if ((material.flags & materialAlphaMask()) != 0u) {
-            return alpha >= material.alphaCutoff;
-        }
-        return unitFloat(pcgHash(seed + pcgHash(triangle + pcgHash(instance)))) < alpha;
-    }
-
-    // The ray is in the object space of `instance`. Single-sided materials hide back
-    // faces, which wind clockwise in world space: a mirroring transform reverses the
+    // The ray is in the object space of `instance`. A mirroring transform reverses the
     // winding of object space.
     void testTriangle(uint triangle, uint instance, vec3 origin, vec3 direction, GpuMaterial material, float mirror,
                       uint seed, RayHit &hit) {
-        uvec3 corners = blasTriangles[triangle].corners;
+        GpuBvhTriangle tested = blasTriangles[triangle];
+        uvec3 corners = tested.corners;
         TriangleHit found = intersectTriangle(origin, direction, vertices[corners.x].position,
                                               vertices[corners.y].position, vertices[corners.z].position);
         bool doubleSided = (material.flags & materialDoubleSided()) != 0u;
         bool partial = (material.flags & (materialAlphaMask() | materialAlphaBlend())) != 0u;
         if (found.distance > 0.0f and found.distance < hit.distance
             and (doubleSided or found.determinant * mirror > 0.0f)
-            and (not partial or stopsAt(material, corners, found.u, found.v, triangle, instance, seed))) {
-            hit = RayHit{found.distance, instance, triangle, found.u, found.v};
+            and (not partial or stopsAt(material, corners, found.u, found.v, tested.primitive, instance, seed))) {
+            hit = RayHit{found.distance, instance, corners, found.u, found.v};
         }
     }
 
@@ -301,9 +445,8 @@ struct TC_KERNEL PathTrace {
         }
     }
 
-    // The nearest hit closer than `far`, or with `anyHit` the first one found.
     RayHit trace(vec3 origin, vec3 direction, float far, bool anyHit, uint seed) {
-        RayHit hit = RayHit{far, noHit(), 0u, 0.0f, 0.0f};
+        RayHit hit = RayHit{far, noHit(), uvec3(0u), 0.0f, 0.0f};
         if (tlasNodeCount.value == 0u) {
             return hit;
         }
@@ -347,131 +490,116 @@ struct TC_KERNEL PathTrace {
         return hit;
     }
 
-    // As the visibility pipeline shades it: interpolated and normal-mapped normals, and
-    // surfaces seen from behind (double-sided materials only) facing the other way.
-    SurfacePoint surfaceAt(RayHit hit, vec3 origin, vec3 direction) {
-        uvec3 corners = blasTriangles[hit.triangle].corners;
-        mat4 objectToWorld = instances[hit.instance].objectToWorld.value;
-        mat4 worldToObject = instances[hit.instance].worldToObject.value;
-        GpuMaterial material = materials[instances[hit.instance].material];
-        vec3 a = (objectToWorld * vec4(vertices[corners.x].position, 1.0f)).xyz();
-        vec3 b = (objectToWorld * vec4(vertices[corners.y].position, 1.0f)).xyz();
-        vec3 c = (objectToWorld * vec4(vertices[corners.z].position, 1.0f)).xyz();
-        vec2 uvA = materialUv(material, vertices[corners.x].uv.value);
-        vec2 uvB = materialUv(material, vertices[corners.y].uv.value);
-        vec2 uvC = materialUv(material, vertices[corners.z].uv.value);
-        float w = 1.0f - hit.u - hit.v;
-        MaterialSample sampled = sampleMaterial(material, uvA * w + uvB * hit.u + uvC * hit.v, 0.0f);
-        vec3 objectNormal = vertices[corners.x].normal.value * w + vertices[corners.y].normal.value * hit.u
-                          + vertices[corners.z].normal.value * hit.v;
-        vec3 normal = normalize(transpose(mat3(worldToObject)) * objectNormal);
-        normal = perturbNormal(normal, uvAxes(b - a, c - a, uvB - uvA, uvC - uvA), sampled.normal);
-        vec3 geometric = normalize(cross(b - a, c - a));
-        if (dot(geometric, direction) > 0.0f) {
-            normal = -normal;
-            geometric = -geometric;
-        }
-        return SurfacePoint{origin + direction * hit.distance, normal, geometric, sampled};
+    LR_PATH_TRACER_PATHS
+};
+
+struct TC_KERNEL PathTraceRayQuery {
+    static constexpr char fileLocation[] = "lr_path_trace_ray_query";
+    uvec3 local_size{8, 8, 1};
+
+    LR_PATH_TRACER_INPUTS
+    AccelerationStructureBinding<19> scene;
+    MeshTable<20> meshes;
+    BufferBinding<uint, 21> indices;
+
+    uvec3 cornersOf(uint instance, uint primitive) {
+        GpuMesh mesh = meshes[instances[instance].mesh];
+        uint first = mesh.firstIndex + 3u * primitive;
+        return uvec3{indices[first], indices[first + 1u], indices[first + 2u]} + uvec3(mesh.firstVertex);
     }
 
-    // The light the scene's lights reflect towards the viewer where nothing shadows them.
-    vec3 directLight(SurfacePoint surface, vec3 toViewer, vec3 above, uint pixelIndex, uint sampleNumber, uint bounce) {
-        vec3 reflected = vec3(0.0f);
-        vec3 baseColor = surface.material.baseColor.xyz();
-        for (uint i = 0u; i < lightCount.value; ++i) {
-            IncidentLight light = incidentLight(lights[i], surface.position);
-            vec3 contribution = reflectedLight(surface.normal, toViewer, light.toLight, light.irradiance, baseColor,
-                                               surface.material.metallic, surface.material.roughness);
-            if (contribution != vec3(0.0f)) {
-                uint seed = randomBits(pixelIndex, sampleNumber, traceDimension(bounce, 1u + i));
-                if (trace(above, light.toLight, light.distance * 0.9999f, true, seed).instance == noHit()) {
-                    reflected += contribution;
-                }
+    // WriteTopLevelInstances turns culling off for double-sided materials, flips the facing
+    // of mirrored instances and leaves only those of masked and blended materials to the
+    // loop here.
+    RayHit trace(vec3 origin, vec3 direction, float far, bool anyHit, uint seed) {
+        uint flags = gl_RayFlagsCullBackFacingTrianglesEXT | (anyHit ? gl_RayFlagsTerminateOnFirstHitEXT : 0u);
+        rayQueryEXT query;
+        rayQueryInitializeEXT(query, scene, flags, rayMaskScene(), origin, 0.0f, direction, far);
+        while (rayQueryProceedEXT(query)) {
+            uint instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, false));
+            uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, false));
+            vec2 barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, false);
+            if (stopsAt(materials[instances[instance].material], cornersOf(instance, primitive), barycentrics.x,
+                        barycentrics.y, primitive, instance, seed)) {
+                rayQueryConfirmIntersectionEXT(query);
             }
         }
-        return reflected;
-    }
-
-    vec3 worldPoint(vec2 ndc, float depth) {
-        vec4 point = inverseViewProjection.value * vec4(ndc, depth, 1.0f);
-        return point.xyz() / point.w;
-    }
-
-    vec3 tracePath(ivec2 pixel, uint pixelIndex, uint sampleNumber) {
-        float pi = 3.14159265f;
-        vec2 jitter = vec2{randomNumber(pixelIndex, sampleNumber, 0u), randomNumber(pixelIndex, sampleNumber, 1u)};
-        vec2 ndc = vec2{(float(pixel.x) + jitter.x) / float(size.value.x) * 2.0f - 1.0f,
-                        1.0f - (float(pixel.y) + jitter.y) / float(size.value.y) * 2.0f};
-        vec3 origin = worldPoint(ndc, 0.0f);
-        vec3 direction = normalize(worldPoint(ndc, 1.0f) - origin);
-        vec3 radiance = vec3(0.0f);
-        vec3 throughput = vec3(1.0f);
-        for (uint bounce = 0u; bounce < maxBounces(); ++bounce) {
-            RayHit hit =
-                trace(origin, direction, infiniteDistance(), false,
-                      randomBits(pixelIndex, sampleNumber, traceDimension(bounce, 0u)));
-            if (hit.instance == noHit()) {
-                radiance += throughput * environment.value.xyz();
-                break;
-            }
-            SurfacePoint surface = surfaceAt(hit, origin, direction);
-            vec3 toViewer = -direction;
-            // Rays leave from just above the triangle, so they do not hit it again.
-            vec3 above = surface.position
-                       + surface.geometric * (1e-4f * (1.0f + maxComponent(abs(surface.position))));
-            radiance += throughput
-                      * (surface.material.emissive
-                         + directLight(surface, toViewer, above, pixelIndex, sampleNumber, bounce));
-
-            vec3 baseColor = surface.material.baseColor.xyz();
-            float metallic = surface.material.metallic;
-            float roughness = surface.material.roughness;
-            float alpha = max(roughness * roughness, 0.001f);
-            float chance = specularChance(baseColor, metallic, dot(surface.normal, toViewer));
-            uint dimension = 2u + 4u * bounce;
-            float u1 = randomNumber(pixelIndex, sampleNumber, dimension + 1u);
-            float u2 = randomNumber(pixelIndex, sampleNumber, dimension + 2u);
-            vec3 toLight = randomNumber(pixelIndex, sampleNumber, dimension) < chance
-                             ? reflect(direction, ggxHalfVector(surface.normal, alpha, u1, u2))
-                             : cosineDirection(surface.normal, u1, u2);
-            float nDotL = dot(surface.normal, toLight);
-            float density = mix(max(nDotL, 0.0f) / pi, ggxDensity(surface.normal, toViewer, toLight, alpha), chance);
-            if (nDotL <= 0.0f or density <= 0.0f or dot(toLight, surface.geometric) <= 0.0f) {
-                break;
-            }
-            throughput *= reflectedLight(surface.normal, toViewer, toLight, vec3(1.0f), baseColor, metallic, roughness)
-                        / density;
-            if (bounce >= 2u) {
-                float survival = min(maxComponent(throughput), 0.95f);
-                if (randomNumber(pixelIndex, sampleNumber, dimension + 3u) >= survival) {
-                    break;
-                }
-                throughput = throughput / survival;
-            }
-            origin = above;
-            direction = toLight;
+        if (rayQueryGetIntersectionTypeEXT(query, true) != gl_RayQueryCommittedIntersectionTriangleEXT) {
+            return RayHit{far, noHit(), uvec3(0u), 0.0f, 0.0f};
         }
-        return radiance;
+        uint instance = uint(rayQueryGetIntersectionInstanceCustomIndexEXT(query, true));
+        uint primitive = uint(rayQueryGetIntersectionPrimitiveIndexEXT(query, true));
+        vec2 barycentrics = rayQueryGetIntersectionBarycentricsEXT(query, true);
+        return RayHit{rayQueryGetIntersectionTEXT(query, true), instance, cornersOf(instance, primitive),
+                      barycentrics.x, barycentrics.y};
     }
+
+    LR_PATH_TRACER_PATHS
+};
+
+// positions[target + i] is the position of vertex first + i, for i < count: corners in
+// the layout a bottom-level acceleration structure is built from.
+struct TC_KERNEL CopyPositions {
+    static constexpr char fileLocation[] = "lr_copy_positions";
+    uvec3 local_size{64, 1, 1};
+
+    VertexTable<0> vertices;
+    BufferBinding<vec4, 1> positions;
+    Uniform<uint, 0> first{};
+    Uniform<uint, 1> count{};
+    Uniform<uint, 2> target{};
 
     void main() {
-        ivec2 pixel = ivec2(gl_GlobalInvocationID.xy());
-        if (pixel.x >= size.value.x or pixel.y >= size.value.y) {
+        uint i = gl_GlobalInvocationID.x;
+        if (i >= count.value) {
             return;
         }
-        uint sampleNumber = sampleIndex.value;
-        vec3 radiance = tracePath(pixel, uint(pixel.y * size.value.x + pixel.x), sampleNumber);
-        // One broken sample would stay in the mean for good.
-        if (any(isnan(radiance)) or any(isinf(radiance))) {
-            radiance = vec3(0.0f);
+        positions[target.value + i] = vec4(vertices[first.value + i].position, 1.0f);
+    }
+};
+
+// Entry i of the top level, for i from `first` below `count`, is instance i: its
+// transform, custom index i, its mesh's bottom level from references (by mesh slot; (0, 0)
+// for a mesh without triangles, whose instances get `placeholder` and a mask no ray
+// traces) and flags from its material and transform.
+struct TC_KERNEL WriteTopLevelInstances {
+    static constexpr char fileLocation[] = "lr_write_top_level_instances";
+    uvec3 local_size{64, 1, 1};
+
+    InstanceTable<0> instances;
+    MaterialTable<1> materials;
+    BufferBinding<uvec2, 2> references;
+    BufferBinding<TopLevelInstance, 3> topLevel;
+    Uniform<uint, 0> count{};
+    Uniform<uvec2, 1> placeholder{};
+    Uniform<uint, 2> first{};
+
+    void main() {
+        uint i = first.value + gl_GlobalInvocationID.x;
+        if (i >= count.value) {
+            return;
         }
-        vec4 mean = vec4(radiance, 1.0f);
-        if (sampleNumber > 0u) {
-            vec4 before = imageLoad(previous, pixel);
-            mean = before + (mean - before) / float(sampleNumber + 1u);
+        mat4 objectToWorld = instances[i].objectToWorld.value;
+        GpuMaterial material = materials[instances[i].material];
+        uvec2 reference = references[instances[i].mesh];
+        bool empty = reference.x == 0u and reference.y == 0u;
+        bool partial = (material.flags & (materialAlphaMask() | materialAlphaBlend())) != 0u;
+        uint flags = partial ? instanceForceNoOpaque() : instanceForceOpaque();
+        if ((material.flags & materialDoubleSided()) != 0u) {
+            flags = flags | instanceCullDisable();
         }
-        imageStore(current, pixel, mean);
-        imageStore(color, pixel, vec4(mean.xyz(), 1.0f));
+        if (determinant(mat3(objectToWorld)) < 0.0f) {
+            flags = flags | instanceFlipFacing();
+        }
+        mat4 rows = transpose(objectToWorld);
+        TopLevelInstance instance;
+        instance.transform[0] = rows[0];
+        instance.transform[1] = rows[1];
+        instance.transform[2] = rows[2];
+        instance.customIndexAndMask = i | ((empty ? rayMaskGap() : rayMaskScene()) << 24u);
+        instance.offsetAndFlags = flags << 24u;
+        instance.reference = empty ? placeholder.value : reference;
+        topLevel[i] = instance;
     }
 };
 

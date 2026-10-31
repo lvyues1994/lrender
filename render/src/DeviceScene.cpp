@@ -192,7 +192,7 @@ SceneTables DeviceScene::tables() const noexcept {
     return SceneTables{vertices.get(),  indices.get(),       meshes.get(),    instances.get(),
                        materials.get(), lights.get(),        instanceCount,   lightCount,
                        blasNodes.get(), blasTriangles.get(), blasRoots.get(), tlasNodes.get(),
-                       tlasNodeCount,   MaterialTextures{}};
+                       tlasNodeCount,   nullptr,             MaterialTextures{}};
 }
 
 } // namespace lr::render

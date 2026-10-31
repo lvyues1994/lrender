@@ -33,6 +33,7 @@ struct GpuMesh {
     tc::uint triangleCount;
     tc::vec3 boundsMin;
     tc::vec3 boundsMax;
+    tc::uint vertexCount; // from firstVertex
 };
 
 struct GpuInstance {
@@ -79,9 +80,11 @@ struct GpuBvhNode {
     tc::uint count; // 0 for inner nodes
 };
 
-// A triangle of a mesh's hierarchy: its corners' places in the vertex table.
+// A triangle of a mesh's hierarchy: its corners' places in the vertex table, and which of
+// the mesh's triangles it is.
 struct GpuBvhTriangle {
     tc::uvec3 corners;
+    tc::uint primitive;
 };
 
 // Constants as functions: the transpiler turns free functions into GLSL functions.
@@ -97,6 +100,15 @@ inline tc::uint noBvhNode() { return 0xFFFFFFFFu; }
 // Hierarchies are at most this many levels deep below the root, so traversal fits in a
 // stack of bvhMaxDepth() + 1 entries.
 inline constexpr tc::uint bvhMaxDepth() { return 31u; }
+// The masks of ray-query instances: rays trace rayMaskScene(); instances of meshes without
+// triangles refer to a placeholder bottom level with rayMaskGap(), which no ray traces.
+inline tc::uint rayMaskScene() { return 1u; }
+inline tc::uint rayMaskGap() { return 2u; }
+// TopLevelInstance flags (VkGeometryInstanceFlagBitsKHR).
+inline tc::uint instanceCullDisable() { return 1u; }
+inline tc::uint instanceFlipFacing() { return 2u; }
+inline tc::uint instanceForceOpaque() { return 4u; }
+inline tc::uint instanceForceNoOpaque() { return 8u; }
 
 // Textures live in pools, 2D array images of one format and one square power-of-two size
 // with full mip chains, sampled through a fixed set of bindings: colorPoolSlots() RGBA8
@@ -203,8 +215,8 @@ struct SceneTables {
     tc::uint instanceCount = 0;
     tc::uint lightCount = 0;
 
-    // Two levels of hierarchies, null until a pipeline that traces rays has run (see
-    // FeatureRequirements): one per mesh over its triangles, rooted at blasRoots[mesh] in
+    // Without ray queries, two levels of hierarchies, null until a pipeline that traces rays
+    // has run (see FeatureRequirements): one per mesh over its triangles, rooted at blasRoots[mesh] in
     // blasNodes with leaves indexing blasTriangles, and one over the instances, rooted at
     // tlasNodes[0] with one instance index per leaf.
     tc::TableResource<GpuBvhNode> *blasNodes = nullptr;
@@ -212,6 +224,12 @@ struct SceneTables {
     tc::BufferResource<tc::uint> *blasRoots = nullptr;
     tc::TableResource<GpuBvhNode> *tlasNodes = nullptr;
     tc::uint tlasNodeCount = 0;
+
+    // With ray queries (RendererCapabilities::rayQueries) instead: the device's acceleration
+    // structure over the instances, null until a pipeline that traces rays has run. Its
+    // instances' custom indices are their places in the instance table, and the primitive
+    // index of a hit is the triangle of the instance's mesh.
+    tc::TopLevelAS const *topLevel = nullptr;
 
     MaterialTextures textures;
 };

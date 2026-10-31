@@ -19,6 +19,18 @@ void bind(tc::Device &device, tc::BufferBinding<T, B> &binding, tc::BufferResour
     device.bindBuffer(binding);
 }
 
+template <class T, tc::uint B>
+void bind(tc::Device &device, tc::BufferBinding<T, B> &binding, tc::DeviceBuffer<T> const &buffer) {
+    binding.attach(buffer);
+    device.bindBuffer(binding);
+}
+
+template <tc::uint B>
+void bind(tc::Device &device, tc::AccelerationStructureBinding<B> &binding, tc::TopLevelAS const &structure) {
+    binding.attach(structure);
+    device.bindAccelerationStructure(binding);
+}
+
 template <class G, class P, tc::uint B>
 void bind(tc::Device &device, tc::ImageBinding<G, tc::Dim::D2, P, B> &binding, tc::DeviceImage<G, tc::Dim::D2, P> &image) {
     binding.attach(image);

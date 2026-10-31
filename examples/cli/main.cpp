@@ -177,9 +177,10 @@ int run(Options const &options) {
     config.gpuTimers = options.timers;
     auto renderer = lr::render::makeRenderer(config);
     auto const &capabilities = renderer->capabilities();
-    std::printf("backend %s: %s; subgroups %s, single-pass visibility %s\n", renderer->deviceInfo().backend.c_str(),
-                renderer->deviceInfo().deviceName.c_str(), capabilities.subgroups ? "on" : "off",
-                capabilities.singlePassVisibility ? "on" : "off");
+    std::printf("backend %s: %s; subgroups %s, single-pass visibility %s, ray queries %s\n",
+                renderer->deviceInfo().backend.c_str(), renderer->deviceInfo().deviceName.c_str(),
+                capabilities.subgroups ? "on" : "off", capabilities.singlePassVisibility ? "on" : "off",
+                capabilities.rayQueries ? "on" : "off");
 
     auto scene = sceneOf(options, *renderer, *runtime);
     auto view = lr::render::ViewDesc{};

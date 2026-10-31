@@ -35,6 +35,7 @@ struct HarnessOptions {
     std::uint32_t maxTextureSize = 2048;
     render::VariantUse subgroups = render::VariantUse::Auto;
     render::VariantUse singlePassVisibility = render::VariantUse::Auto;
+    render::VariantUse rayQueries = render::VariantUse::Auto;
 };
 
 // A renderer with its own small runtime.
@@ -53,6 +54,7 @@ struct RenderHarness {
         config.maxTextureSize = options.maxTextureSize;
         config.subgroups = options.subgroups;
         config.singlePassVisibility = options.singlePassVisibility;
+        config.rayQueries = options.rayQueries;
         renderer = render::makeRenderer(config);
     }
 

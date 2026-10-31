@@ -67,7 +67,8 @@ LrenderPrograms const &lrenderPrograms() {
          PathTrace::fileLocation, Tonemap::fileLocation, DownsampleTexture::fileLocation,
          CopyTextureLayer::fileLocation},
         {CompactVisibleSubgroups::fileLocation, ClassifyPixelsSubgroups::fileLocation},
-        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation, UnpackVisibility::fileLocation}};
+        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation, UnpackVisibility::fileLocation},
+        {PathTraceRayQuery::fileLocation, CopyPositions::fileLocation, WriteTopLevelInstances::fileLocation}};
     return programs;
 }
 
@@ -79,6 +80,7 @@ RendererCapabilities chooseCapabilities(KernelCheck const &check, VariantChoices
     chosen.subgroups = choices.subgroups == VariantUse::Auto and runsAll(check, programs.subgroups);
     chosen.singlePassVisibility =
         choices.singlePassVisibility == VariantUse::Auto and runsAll(check, programs.singlePassVisibility);
+    chosen.rayQueries = choices.rayQueries == VariantUse::Auto and runsAll(check, programs.rayQueries);
     return chosen;
 }
 
@@ -91,6 +93,9 @@ void verifyCapabilities(KernelCheck const &check, RendererCapabilities const &ch
     }
     if (chosen.singlePassVisibility) {
         needed.insert(needed.end(), programs.singlePassVisibility.begin(), programs.singlePassVisibility.end());
+    }
+    if (chosen.rayQueries) {
+        needed.insert(needed.end(), programs.rayQueries.begin(), programs.rayQueries.end());
     }
     needed.insert(needed.end(), more.begin(), more.end());
     throwIfAny(failures(check, needed));

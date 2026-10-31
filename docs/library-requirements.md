@@ -2,7 +2,7 @@
 
 lrender 需要 tc 新增四项能力。前三项互相独立；第四项是 `hardware-raster.md` 里硬件光栅方案的前提。每一项写明 lrender 怎么用、为什么在 tc 的职责之内、接口草案（照 tc 现有的写法，命名只是建议）、各后端的语义与回退，以及验收方式。
 
-四项都已在 tc 里实现，接口以 tc 的 README 为准：只在设备上的 buffer、内存堆与资源别名是 `9cec48f`，传输队列是 `c3660eb`，外部 buffer 导入与设备 UUID 是 `93f30dc`，ray query 是 `317c74a`。lrender 用上了第 2 项里只在设备上的 buffer 和 `copyBuffer`，以及第 3 项的传输队列；ray query、堆与别名、外部 buffer 还没用上。
+四项都已在 tc 里实现，接口以 tc 的 README 为准：只在设备上的 buffer、内存堆与资源别名是 `9cec48f`，传输队列是 `c3660eb`，外部 buffer 导入与设备 UUID 是 `93f30dc`，ray query 是 `317c74a`。lrender 用上了第 1 项的 ray query（路径追踪器的变体），第 2 项里只在设备上的 buffer 和 `copyBuffer`，以及第 3 项的传输队列；堆与别名、外部 buffer 还没用上。实现中补了一处：CPU 后端原先不接受底层引用为 0 的实例（Vulkan 规定它不参与追踪），`fb599b6` 改成和 Vulkan 一样；lavapipe 在这种实例上有问题，见 tc 的 README。
 
 文中的设备能力是在本机查到的：RTX 5070 Ti（NVIDIA 595 驱动）和 lavapipe（Mesa 25.2.8）。
 
