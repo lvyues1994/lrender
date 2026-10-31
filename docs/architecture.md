@@ -651,4 +651,4 @@ Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设�
 7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
 
-还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了 ray query、只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`。
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了 ray query、只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。
