@@ -114,6 +114,10 @@ struct RendererConfig {
     // Larger textures are scaled down on the host (also to what the device allows).
     std::uint32_t maxTextureSize = 2048;
     ConversionDelivery textureConversions = ConversionDelivery::AsSoonAsReady;
+    // A view's frame graph places its device buffers and images (images where the device
+    // places them, DeviceInfo::placedImages) in one heap, those whose passes do not overlap
+    // in the same memory; otherwise each gets memory of its own (ViewStats::graphBytes).
+    bool aliasGraphResources = true;
     // Optional kernel variants (RendererCapabilities), each used where the device runs it
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;

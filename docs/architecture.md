@@ -265,7 +265,9 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 ```
 
 - 一条管线就是按阶段排好的一组 feature。`PipelineRegistry` 提供两条内置管线，用户可以在它们的基础上按阶段插入自己的 feature，组成新的管线。
-- 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，分配临时资源（按描述符在帧之间复用），维护按 `ViewId` 保存的历史资源。
+- 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，算出每个资源的生命周期（第一个和最后一个用到它的、会运行的 pass；回读 buffer 活到帧结束），维护按 `ViewId` 保存的历史资源。没有会运行的 pass 用到的资源不分配。
+- 内存别名：GPU 线程录制一个视图的帧图时，把只在设备上的 buffer 和图像（设备能放置图像时，`DeviceInfo::placedImages`；GL 不能，图像各占一份）放进一个 tc 的堆，生命周期重叠的资源字节不重叠，不重叠的共用同一段内存。放法是从大到小，每个放在它的对齐允许、又不和同时活着的资源重叠的最低偏移上，堆的大小就是同一时刻最多要的那么多。堆和放好的资源按“放法”（每个资源的类型、大小、偏移）在帧之间复用，帧图不变时每一帧拿到同一个堆和同一批资源，每个在途帧一份；60 帧没用到的放法和单独的资源都释放。资源在它的第一个 pass 开始时内容未定义，这本来就是 `createBuffer` 的约定；tc 在别名切换处插屏障，Vulkan 的图像从 UNDEFINED 转过去，CPU 后端用 0xCD 填满接手的内存，所以哪个 pass 读了自己没写的东西，CPU 后端上的测试会看出来。上传和回读 buffer 有主机端的内存，不进堆。`RendererConfig::aliasGraphResources` 关掉它，`ViewStats::graphBytes` 和 `unaliasedBytes` 给出共用和不共用时各要多少设备内存。1920×1080、开 TAA 的演示场景，一个视图从 173.6 MiB 降到 109.0 MiB，在途两帧共省约 130 MiB。
+- `ViewDesc::describeGraph` 让 `ViewResult::graph` 带上这一帧的帧图，用 Graphviz 的 DOT 语言：会运行的 pass 按顺序（开了计时器时带上 dispatch 数和设备耗时），它们读写的资源（大小、生命周期、在堆里的偏移，或者是历史资源），以及读写的边。`lrender_cli --graph <文件>` 写出最后一帧的。
 - 帧图 buffer 按除了设备还有谁碰它分三种（`BufferAccess`）：`createBuffer` 是只在设备上的 `tc::DeviceBuffer`，没有主机端副本，只能由 kernel 和 `copyBuffer` 读写，帧开始时内容未定义；`createUploadBuffer` 带主机端副本，pass 录制时写好再 `uploadBuffer`；`createReadbackBuffer` 是 `createBuffer` 分配的映射内存，设备原地写，帧完成之后由主机读。中间结果都是第一种，GPU 后端不为它们分配主机内存。三种描述不同，资源池不会把一种当成另一种复用。
 - pass 按编译后的顺序在 GPU 线程上录制。屏障由 tc 按实际的读写冲突插入，互不相关的 pass 可以在设备上重叠，帧图不需要自己计算屏障。
 - `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`（可以指定读参数 buffer 的第几项），同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。

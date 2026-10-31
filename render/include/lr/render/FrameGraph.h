@@ -69,6 +69,11 @@ struct ResourceDesc {
     BufferAccess access;
     std::function<std::shared_ptr<void>(tc::Device &)> create;
     std::function<void const *(void *)> hostData; // readback buffers
+    // Device buffers and images can share a heap with others (tc::Placement): what they
+    // take there, and making one at a place in it. Empty for the others.
+    std::function<tc::PlacementSize(tc::Device &)> measure;
+    std::function<std::shared_ptr<void>(tc::Device &, tc::Placement const &)> createPlaced;
+    bool image = false;
 };
 
 // A pass's view of the GPU thread while it records.
@@ -267,8 +272,16 @@ private:
         auto hostData = [](void *const resource) -> void const * {
             return static_cast<tc::BufferResource<T> const *>(resource)->data();
         };
-        return ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count, access,
-                            std::move(create), std::move(hostData)};
+        auto desc = ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count, access,
+                                 std::move(create), std::move(hostData), {}, {}, false};
+        if (access == BufferAccess::Device) {
+            desc.measure = [elements](tc::Device &device) { return device.bufferPlacement<T>(elements); };
+            desc.createPlaced = [elements](tc::Device &device, tc::Placement const &place) -> std::shared_ptr<void> {
+                auto const buffer = device.createDeviceBuffer<T>(elements, place);
+                return std::shared_ptr<tc::BufferResource<T>>{buffer.shared(), buffer.hostView()};
+            };
+        }
+        return desc;
     }
 
     template <class G>
@@ -277,8 +290,13 @@ private:
         auto create = [extent](tc::Device &device) -> std::shared_ptr<void> {
             return std::make_shared<GraphImage<G>>(device.createImage<G, tc::Dim::D2>(extent, 1));
         };
-        return ResourceDesc{std::move(name), std::type_index{typeid(GraphImage<G>)}, size, BufferAccess::Device,
-                            std::move(create), {}};
+        auto desc = ResourceDesc{std::move(name), std::type_index{typeid(GraphImage<G>)}, size, BufferAccess::Device,
+                                 std::move(create), {}, {}, {}, true};
+        desc.measure = [extent](tc::Device &device) { return device.imagePlacement<G, tc::Dim::D2>(extent, 1); };
+        desc.createPlaced = [extent](tc::Device &device, tc::Placement const &place) -> std::shared_ptr<void> {
+            return std::make_shared<GraphImage<G>>(device.createImage<G, tc::Dim::D2>(extent, 1, place));
+        };
+        return desc;
     }
 };
 

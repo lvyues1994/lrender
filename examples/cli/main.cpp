@@ -2,13 +2,14 @@
 //
 //   lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
 //               [--pipeline visibility|pathtrace] [--taa] [--samples <n>] [--timers on|off]
-//               [--gltf <file>] [--out <file> | --sequence <directory>]
+//               [--gltf <file>] [--out <file> | --sequence <directory>] [--graph <file>]
 //
 // The path tracer renders --samples frames, one sample per pixel each, and writes the last
 // to --out; with --sequence every frame goes to <directory>/frame<index>.ppm instead.
 // --taa turns on the visibility pipeline's temporal anti-aliasing, which then renders
 // --samples frames (16 unless given) of the still scene. --gltf renders the file's default
-// scene through its first camera, or a camera that frames it.
+// scene through its first camera, or a camera that frames it. --graph writes the last
+// frame's graph in Graphviz's DOT language (dot -Tsvg file > graph.svg draws it).
 
 #include <lr/asset/AssetLibrary.h>
 #include <lr/asset/AssetSource.h>
@@ -47,6 +48,7 @@ struct Options {
     std::string gltf;
     std::string out = "lrender.ppm";
     std::string sequence; // a directory: every frame through a window target
+    std::string graph;    // a DOT file for the last frame's graph
 };
 
 std::uint32_t framesOf(Options const &options) {
@@ -81,6 +83,8 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         options.out = value;
     } else if (flag == "--sequence") {
         options.sequence = value;
+    } else if (flag == "--graph") {
+        options.graph = value;
     } else {
         return false;
     }
@@ -195,6 +199,7 @@ int run(Options const &options) {
     auto last = lr::render::FrameResult{};
     auto const start = std::chrono::steady_clock::now();
     for (auto frame = 0u; frame < frames; ++frame) {
+        view.describeGraph = not options.graph.empty() and frame + 1 == frames;
         auto result = lexec::sync_wait(renderer->submit(lr::render::FrameDesc{std::move(delta), {view}}));
         delta = lr::core::RenderWorldDelta{};
         if (not result) {
@@ -218,7 +223,18 @@ int run(Options const &options) {
         std::fprintf(stderr, "cannot write the output\n");
         return EXIT_FAILURE;
     }
+    std::printf("frame graph: %.1f MiB, %.1f MiB without sharing memory\n",
+                static_cast<double>(result.stats.graphBytes) / (1024.0 * 1024.0),
+                static_cast<double>(result.stats.unaliasedBytes) / (1024.0 * 1024.0));
     printTimings(result);
+    if (not options.graph.empty()) {
+        auto *const file = std::fopen(options.graph.c_str(), "w");
+        if (file == nullptr or std::fputs(result.graph->c_str(), file) < 0 or std::fclose(file) != 0) {
+            std::fprintf(stderr, "cannot write %s\n", options.graph.c_str());
+            return EXIT_FAILURE;
+        }
+        std::printf("graph -> %s\n", options.graph.c_str());
+    }
     return EXIT_SUCCESS;
 }
 
@@ -231,7 +247,8 @@ int main(int argc, char **argv) {
                              "[--size <w>x<h>]\n"
                              "                   [--pipeline visibility|pathtrace] [--taa] [--samples <n>] "
                              "[--timers on|off]\n"
-                             "                   [--gltf <file>] [--out <file> | --sequence <directory>]\n");
+                             "                   [--gltf <file>] [--out <file> | --sequence <directory>] "
+                             "[--graph <file>]\n");
         return 2;
     }
     try {

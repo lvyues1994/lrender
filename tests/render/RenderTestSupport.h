@@ -38,6 +38,7 @@ struct HarnessOptions {
     render::VariantUse rayQueries = render::VariantUse::Auto;
     // So that tests know which frame shows a converted texture.
     render::ConversionDelivery textureConversions = render::ConversionDelivery::Deterministic;
+    bool aliasGraphResources = true;
 };
 
 // A renderer with its own small runtime.
@@ -58,6 +59,7 @@ struct RenderHarness {
         config.singlePassVisibility = options.singlePassVisibility;
         config.rayQueries = options.rayQueries;
         config.textureConversions = options.textureConversions;
+        config.aliasGraphResources = options.aliasGraphResources;
         renderer = render::makeRenderer(config);
     }
 

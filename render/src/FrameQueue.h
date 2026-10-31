@@ -34,6 +34,7 @@ struct FrameQueueConfig {
     std::uint32_t framesInFlight = 2;
     bool timers = false;
     std::size_t textureStreamingBytes = std::size_t{8} << 20;
+    bool aliasGraphResources = true; // RendererConfig::aliasGraphResources
     // Throws tc::DeviceError when a recreated device cannot run the kernels frames use.
     std::function<void(tc::Device &)> checkDevice;
 };

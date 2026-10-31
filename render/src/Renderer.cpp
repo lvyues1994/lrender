@@ -316,7 +316,8 @@ struct RendererImpl final : Renderer {
           world(textureLimitsOf(gpu->info().limits, config.maxTextureSize), *worldParallel, *conversions,
                 config.textureConversions),
           frames(FrameQueueConfig{gpu.get(), &scope, &deviceGeneration, framesInFlight, timers,
-                                  config.textureStreamingBytes, [this](tc::Device &device) {
+                                  config.textureStreamingBytes, config.aliasGraphResources,
+                                  [this](tc::Device &device) {
                                       verifyCapabilities(*makeKernelCheck(device), chosen, models.programs());
                                   }}) {
         if (timers) {
@@ -456,6 +457,7 @@ private:
             }
             builder.readback<tc::uint>(context.output, deliverOutput(plan, frameIndex));
             prepared.graph = std::move(builder).compile();
+            prepared.graph->describe = plan.desc.describeGraph;
         } catch (...) {
             prepared.failure = std::current_exception();
         }

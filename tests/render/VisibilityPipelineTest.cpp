@@ -544,6 +544,51 @@ TEST_CASE("every GPU backend renders a textured, shadowed, transparent scene as 
     });
 }
 
+// Resources whose passes do not overlap share memory, which changes no pixel: on the CPU
+// backend memory a resource takes over from another one holds a poison pattern until its
+// first pass writes it, so a pass that read what it had not written would show it.
+TEST_CASE("graph resources that share a heap render what resources of their own render, in less memory") {
+    auto const camera = test::cameraAt(core::vec3{0.3f, 1.8f, 3.0f}, core::vec3{0.0f, 0.3f, 0.0f});
+    auto const renderWith = [&camera](RenderHarness &harness) {
+        auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{48, 40}});
+        auto view = test::viewOf(target, camera);
+        view.settings.antiAliasing = render::AntiAliasing::Taa;
+        view.describeGraph = true;
+        harness.render(render::FrameDesc{texturedScene(), {view}});
+        harness.render(frameOf({}, view));
+        return harness.render(frameOf({}, view));
+    };
+    test::forEachBackend(test::HarnessOptions{}, [&](RenderHarness &harness) {
+        auto options = test::HarnessOptions{};
+        options.backend = harness.renderer->deviceInfo().backend;
+        options.device = test::deviceFor(options.backend);
+        options.aliasGraphResources = false;
+        auto separate = RenderHarness{options};
+        auto const shared = renderWith(harness);
+        auto const own = renderWith(separate);
+
+        auto const &sharing = shared.views.at(0);
+        auto const &owning = own.views.at(0);
+        CHECK(test::maxChannelDifference(*sharing.image, *owning.image) == 0);
+        CAPTURE(sharing.stats.graphBytes);
+        CAPTURE(sharing.stats.unaliasedBytes);
+        CHECK(sharing.stats.unaliasedBytes == owning.stats.unaliasedBytes);
+        CHECK(owning.stats.graphBytes == owning.stats.unaliasedBytes);
+        CHECK(sharing.stats.graphBytes < sharing.stats.unaliasedBytes);
+        MESSAGE(options.backend << ": " << sharing.stats.graphBytes << " of " << sharing.stats.unaliasedBytes << " bytes");
+
+        REQUIRE(sharing.graph.has_value());
+        auto const &graph = *sharing.graph;
+        CHECK(graph.rfind("digraph frame {", 0) == 0);
+        CHECK(graph.find("cull instances") != std::string::npos);
+        CHECK(graph.find("temporal resolve") != std::string::npos);
+        CHECK(graph.find("heap at") != std::string::npos);
+        CHECK(graph.find("history") != std::string::npos);
+        CHECK(not owning.graph->empty());
+        CHECK(owning.graph->find("heap at") == std::string::npos);
+    });
+}
+
 // A grid of quads of 17 x 16 pixels, red and blue like a chequerboard, two triangles each
 // whose pixel box is past render::kernels::largeTriangleArea(), and more triangles than a
 // raster pass lists for its tile stage: every pixel still shows its own quad.

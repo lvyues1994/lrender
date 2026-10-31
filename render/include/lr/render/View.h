@@ -53,6 +53,8 @@ struct ViewDesc {
     // The camera jumped since the view's previous frame: temporal anti-aliasing starts over
     // instead of reprojecting what the view showed before.
     bool cameraCut = false;
+    // ViewResult::graph describes this frame's graph.
+    bool describeGraph = false;
 };
 
 // sRGB-encoded RGBA8, one std::uint32_t per pixel with red in the low byte, rows from the top.
@@ -77,6 +79,11 @@ struct ViewStats {
     // The samples per pixel the path tracer has averaged since its last reset; 0 for
     // pipelines that do not accumulate.
     std::uint32_t accumulatedSamples = 0;
+    // Device memory the frame graph's resources of the frame took, history aside: the
+    // heap those with disjoint lifetimes share and the others. `unaliasedBytes` is what
+    // they would take each in its own memory.
+    std::uint64_t graphBytes = 0;
+    std::uint64_t unaliasedBytes = 0;
 };
 
 // Device time of one pass of a view's frame graph.
@@ -96,6 +103,10 @@ struct ViewResult {
     // Every pass that ran, in order, when RendererConfig::gpuTimers is on and the device
     // has timers; empty otherwise.
     std::vector<PassTiming> passTimings;
+    // With ViewDesc::describeGraph: the frame's graph in Graphviz's DOT language, the
+    // passes that ran in order and the resources they read and write, with their
+    // lifetimes, sizes and places in the shared heap, and the passes' device times.
+    std::optional<std::string> graph;
 };
 
 } // namespace lr::render

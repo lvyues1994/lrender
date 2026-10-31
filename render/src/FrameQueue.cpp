@@ -114,6 +114,7 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
 // frame keeps its resources until the device is done with it.
 void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFlight &frame) {
     auto &device = *context.device;
+    pool.endFrame();
     textures.apply(device, prepared.scene, frame.retired);
     textures.send(device, lastSubmission, frame.retired);
     deviceScene.apply(device, prepared.scene, textures, frame.retired);
@@ -147,7 +148,7 @@ void FrameQueue::recordViews(tc::Device &device, PreparedFrame &prepared, InFlig
     tables.textures = textures.textures();
     frame.runs.reserve(prepared.views.size());
     for (auto &view : prepared.views) {
-        frame.runs.emplace_back(std::move(*view.graph), pool, historyImages, device);
+        frame.runs.emplace_back(std::move(*view.graph), pool, historyImages, device, config.aliasGraphResources);
         frame.runs.back().record(device, tables);
     }
 }

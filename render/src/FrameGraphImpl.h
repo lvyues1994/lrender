@@ -78,14 +78,25 @@ private:
     std::unordered_map<std::uint64_t, std::shared_ptr<void>> resources;
 };
 
+// The passes, by their place among those that run, that read or write a resource: it
+// lives from the first one to the last one.
+struct Lifetime {
+    std::uint32_t first = 0;
+    std::uint32_t last = 0;
+};
+
 struct CompiledResource {
     ResourceDesc desc;
     std::optional<std::uint64_t> history; // a FrameHistories id
+    // Empty for a resource no pass that runs uses: it is not made.
+    std::optional<Lifetime> lifetime;
 };
 
 struct CompiledPass {
     std::string name;
     PassRecorder recorder;
+    std::vector<std::uint32_t> reads;
+    std::vector<std::uint32_t> writes;
 };
 
 struct CompiledReadback {
@@ -98,7 +109,26 @@ struct CompiledGraph {
     std::vector<CompiledPass> passes; // those the outputs need, in declaration order
     std::vector<CompiledReadback> readbacks;
     std::vector<ResultHandler> finishers;
+    bool describe = false; // ViewDesc::describeGraph
 };
+
+// Where resources go in a heap they share: those whose lifetimes overlap get bytes that
+// do not, and the heap is as large as the most that is alive at once needs.
+struct HeapItem {
+    std::uint32_t resource = 0;
+    Lifetime lifetime;
+    tc::PlacementSize size;
+    std::size_t offset = 0;
+};
+
+struct HeapPlan {
+    std::vector<HeapItem> items; // in resource order
+    std::size_t bytes = 0;
+};
+
+// The largest first, each at the lowest offset its alignment allows where it overlaps
+// nothing it lives with.
+HeapPlan planHeap(std::vector<HeapItem> items);
 
 // The view a graph is built for, which owns its history.
 struct GraphOwner {
@@ -153,15 +183,46 @@ private:
     Blackboard board;
 };
 
-// Graph resources the GPU thread keeps between frames, reused by type and size.
+// The resources of a heap plan, made at their offsets in one heap.
+struct PlacedResources {
+    tc::MemoryHeap heap;
+    std::vector<std::shared_ptr<void>> resources; // as the plan's items
+};
+
+// Graph resources the GPU thread keeps between frames: single ones reused by type and
+// size, and the resources of heap plans reused by plan, so a graph that does not change
+// gets the same heap and resources every frame (one set per frame in flight). What no
+// frame has used for `keepFrames` frames goes.
 struct ResourcePool {
+    explicit ResourcePool(std::uint64_t const keepFrames_ = 60) noexcept : keepFrames(keepFrames_) {}
+
     std::shared_ptr<void> acquire(ResourceDesc const &desc, tc::Device &device);
     void release(ResourceDesc const &desc, std::shared_ptr<void> resource);
-    void clear() noexcept { available.clear(); }
+    // What `desc` takes in a heap; asked of the device once per type and size.
+    tc::PlacementSize measure(ResourceDesc const &desc, tc::Device &device);
+    PlacedResources acquirePlaced(HeapPlan const &plan, std::vector<CompiledResource> const &resources,
+                                  tc::Device &device);
+    void releasePlaced(HeapPlan const &plan, std::vector<CompiledResource> const &resources, PlacedResources placed);
+    // Once a frame.
+    void endFrame();
+    void clear() noexcept;
 
 private:
     using Key = std::tuple<std::type_index, std::uint64_t, BufferAccess>;
-    std::map<Key, std::vector<std::shared_ptr<void>>> available;
+    using PlanKey = std::pair<std::size_t, std::vector<std::tuple<std::type_index, std::uint64_t, std::size_t>>>;
+    template <class T>
+    struct Kept {
+        T value;
+        std::uint64_t frame; // when it came back
+    };
+
+    static PlanKey keyOf(HeapPlan const &plan, std::vector<CompiledResource> const &resources);
+
+    std::uint64_t keepFrames;
+    std::uint64_t frame = 0;
+    std::map<Key, std::vector<Kept<std::shared_ptr<void>>>> available;
+    std::map<Key, tc::PlacementSize> sizes;
+    std::map<PlanKey, std::vector<Kept<PlacedResources>>> placed;
 };
 
 struct RecordedDispatch {
@@ -170,9 +231,13 @@ struct RecordedDispatch {
 };
 
 // One view's graph on the GPU thread: holds its resources from record() until finish() or
-// its destruction, which must both wait until the device has finished the frame.
+// its destruction, which must both wait until the device has finished the frame. With
+// `alias`, the device buffers and images (images where the device places them) share a
+// heap by their lifetimes; their contents are undefined when their first pass starts, as
+// always.
 struct GraphRun {
-    GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device);
+    GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device,
+             bool alias);
     GraphRun(GraphRun &&) noexcept = default;
     GraphRun &operator=(GraphRun &&) = delete;
     ~GraphRun();
@@ -183,15 +248,21 @@ struct GraphRun {
     // Every pass with the device time of its dispatches, which are the timings from
     // `first` on: the device lists them in execution order.
     std::vector<PassTiming> passTimings(std::vector<tc::KernelTiming> const &timings, std::size_t first) const;
-    // Calls the readback handlers and the finishers, then returns the resources to the pool.
+    // Calls the readback handlers and the finishers, fills in the graph's memory and,
+    // when asked, its description, then returns the resources to the pool.
     void finish(ViewResult &result);
 
 private:
     void releaseResources() noexcept;
+    std::string describe(ViewResult const &result) const;
 
     CompiledGraph graph;
     ResourcePool *pool;
     std::vector<std::shared_ptr<void>> resources;
+    HeapPlan plan;
+    PlacedResources placed;
+    std::vector<std::uint64_t> bytes; // of each resource, 0 for those not made or history
+    std::vector<bool> inHeap;
     std::vector<RecordedDispatch> recorded;
 };
 

@@ -36,7 +36,7 @@ cmake --workflow --preset debug        # 配置、构建、测试
 ./build/debug/examples/lrender_cli --pipeline pathtrace --samples 16 --sequence frames/   # frames/frame0.ppm …
 ```
 
-演示场景的纹理都是程序生成的：棋盘格地面、带法线贴图的木箱、用 alpha 遮罩镂空的格栅，还有一个半透明的球，太阳投下级联阴影。`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--sequence <目录>` 改为把每一帧写成 `<目录>/frame<帧号>.ppm`（目录要先存在）；`--timers on` 打印每个 pass 的设备耗时。`--taa` 打开可见性缓冲管线的时间抗锯齿，渲染 `--samples` 帧（默认 16）静止的场景再写出最后一帧。程序启动时打印设备选中的 kernel 变体（子组、一遍写入的可见性缓冲、路径追踪用不用 ray query）。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
+演示场景的纹理都是程序生成的：棋盘格地面、带法线贴图的木箱、用 alpha 遮罩镂空的格栅，还有一个半透明的球，太阳投下级联阴影。`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--sequence <目录>` 改为把每一帧写成 `<目录>/frame<帧号>.ppm`（目录要先存在）；`--timers on` 打印每个 pass 的设备耗时；`--graph <文件>` 把最后一帧的帧图写成 Graphviz 的 DOT（`dot -Tsvg 文件 > graph.svg` 画出来），程序也会打印帧图资源共用内存前后各要多少。`--taa` 打开可见性缓冲管线的时间抗锯齿，渲染 `--samples` 帧（默认 16）静止的场景再写出最后一帧。程序启动时打印设备选中的 kernel 变体（子组、一遍写入的可见性缓冲、路径追踪用不用 ray query）。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
 
 在窗口里看演示场景：
 
