@@ -24,11 +24,17 @@ struct Rotation {
     static Rotation identity() noexcept { return Rotation{}; }
     // Counter-clockwise about `axis` (normalized here) when looking down the axis.
     static Rotation axisAngle(vec3 const &axis, float radians) noexcept;
+    // The rotation whose matrix is `matrix`, which must be orthonormal with determinant 1.
+    static Rotation fromMatrix(mat3 const &matrix) noexcept;
+    // Turns -z towards `forward` and +y as close to `up` as it can, as a camera looks.
+    static Rotation lookingAlong(vec3 const &forward, vec3 const &up) noexcept;
 
     vec4 quaternion{0.0f, 0.0f, 0.0f, 1.0f};
 };
 
 struct Transform {
+    static Transform identity() noexcept { return Transform{}; }
+
     vec3 translation{0.0f};
     Rotation rotation;
     vec3 scale{1.0f};
@@ -41,6 +47,9 @@ struct Aabb {
 
 mat3 rotationMatrix(Rotation const &rotation) noexcept;
 mat4 matrixOf(Transform const &transform) noexcept;
+// The transform whose matrix is `matrix`: exact for translations, rotations and scales
+// along the axes (glTF's nodes); a matrix that also shears loses the shear.
+Transform decomposed(mat4 const &matrix) noexcept;
 // The box around `box` after `matrix` (an affine transform).
 Aabb transformed(Aabb const &box, mat4 const &matrix) noexcept;
 

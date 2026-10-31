@@ -78,6 +78,59 @@ TEST_CASE("ids of one kind compare and hash by value") {
     CHECK(not MeshId{}.isValid());
 }
 
+TEST_CASE("entity ids differ by generation in the same slot") {
+    auto const entities = std::unordered_set<EntityId>{EntityId{1, 0}, EntityId{1, 1}, EntityId{1, 0}};
+
+    CHECK(entities.size() == 2);
+    CHECK(EntityId{1, 0} != EntityId{1, 1});
+    CHECK(not EntityId{}.isValid());
+}
+
+template <class Matrix>
+bool nearMatrix(Matrix const &a, Matrix const &b, int const columns, float const tolerance = 1e-5f) {
+    for (auto column = 0; column < columns; ++column) {
+        for (auto row = 0; row < columns; ++row) {
+            if (not near(a[column][row], b[column][row], tolerance)) {
+                return false;
+            }
+        }
+    }
+    return true;
+}
+
+bool nearMatrix(mat4 const &a, mat4 const &b) { return nearMatrix(a, b, 4); }
+
+TEST_CASE("a rotation comes back from its matrix, whichever of its components is largest") {
+    for (auto const &axis : {vec3{1.0f, 0.0f, 0.0f}, vec3{0.0f, 1.0f, 0.0f}, vec3{0.0f, 0.0f, 1.0f}, vec3{1.0f, 2.0f, 3.0f}}) {
+        for (auto const angle : {0.3f, 2.0f, 3.1f}) {
+            auto const rotation = Rotation::axisAngle(axis, angle);
+            auto const back = Rotation::fromMatrix(rotationMatrix(rotation));
+            CHECK(nearMatrix(rotationMatrix(back), rotationMatrix(rotation), 3));
+        }
+    }
+}
+
+TEST_CASE("a transform comes back from its matrix") {
+    auto transform = Transform{};
+    transform.translation = vec3{1.0f, -2.0f, 3.0f};
+    transform.rotation = Rotation::axisAngle(vec3{1.0f, 1.0f, 0.0f}, 0.7f);
+    transform.scale = vec3{2.0f, 0.5f, 3.0f};
+
+    CHECK(nearMatrix(matrixOf(decomposed(matrixOf(transform))), matrixOf(transform)));
+    transform.scale.x = -2.0f;
+    CHECK(nearMatrix(matrixOf(decomposed(matrixOf(transform))), matrixOf(transform)));
+}
+
+TEST_CASE("looking along a direction turns -z towards it with +y up") {
+    auto const forward = normalize(vec3{1.0f, -0.5f, -2.0f});
+    auto const rotation = rotationMatrix(Rotation::lookingAlong(forward, vec3{0.0f, 1.0f, 0.0f}));
+
+    CHECK(near(-rotation[2], forward));
+    CHECK(near(dot(rotation[1], forward), 0.0f));
+    CHECK(rotation[1].y > 0.0f);
+    CHECK(near(rotation[0].y, 0.0f));
+}
+
 // Every triangle winds counter-clockwise seen from where its vertex normals point.
 bool frontFacesOutwards(MeshData const &mesh) {
     for (auto index = std::size_t{0}; index + 2 < mesh.indices.size(); index += 3) {

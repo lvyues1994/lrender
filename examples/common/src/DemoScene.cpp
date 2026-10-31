@@ -6,26 +6,13 @@
 #include <cmath>
 #include <cstdint>
 #include <memory>
+#include <optional>
 
 namespace lr::examples {
 
 namespace {
 
 core::MeshHandle share(core::MeshData mesh) { return std::make_shared<core::MeshData const>(std::move(mesh)); }
-
-core::MaterialDesc material(core::vec3 const &color, float const metallic, float const roughness) {
-    auto desc = core::MaterialDesc{};
-    desc.baseColor = core::vec4{color, 1.0f};
-    desc.metallic = metallic;
-    desc.roughness = roughness;
-    return desc;
-}
-
-core::mat4 at(core::vec3 const &position) {
-    auto transform = core::Transform{};
-    transform.translation = position;
-    return core::matrixOf(transform);
-}
 
 std::uint8_t byteOf(float const value) {
     return static_cast<std::uint8_t>(std::lround(std::clamp(value, 0.0f, 1.0f) * 255.0f));
@@ -95,90 +82,144 @@ core::ImageHandle latticeImage() {
     });
 }
 
-} // namespace
+core::MaterialDesc material(core::vec3 const &color, float const metallic, float const roughness) {
+    auto desc = core::MaterialDesc{};
+    desc.baseColor = core::vec4{color, 1.0f};
+    desc.metallic = metallic;
+    desc.roughness = roughness;
+    return desc;
+}
 
-DemoScene makeDemoScene() {
-    auto scene = DemoScene{};
-    auto &delta = scene.delta;
-    auto const plane = core::MeshId{0};
-    auto const box = core::MeshId{1};
-    auto const sphere = core::MeshId{2};
-    auto const quad = core::MeshId{3};
-    delta.meshes = {{plane, share(core::makePlane(core::vec2{6.0f, 6.0f}))},
-                    {box, share(core::makeBox(core::vec3{0.5f, 0.5f, 0.5f}))},
-                    {sphere, share(core::makeSphere(0.7f, 48, 24))},
-                    {quad, share(core::makeQuad(core::vec2{0.8f, 0.8f}))}};
+core::Transform at(core::vec3 const &position) {
+    auto transform = core::Transform{};
+    transform.translation = position;
+    return transform;
+}
 
-    auto const checker = core::TextureId{0};
-    auto const crate = core::TextureId{1};
-    auto const crateRelief = core::TextureId{2};
-    auto const lattice = core::TextureId{3};
-    delta.textures = {{checker, checkerImage(), core::TextureSampler{}},
-                      {crate, crateImage(), core::TextureSampler{}},
-                      {crateRelief, crateNormals(), core::TextureSampler{}},
-                      {lattice, latticeImage(), core::TextureSampler{}}};
+core::Transform scaledAt(core::vec3 const &position, float const scale) {
+    auto transform = at(position);
+    transform.scale = core::vec3{scale};
+    return transform;
+}
 
-    auto const ground = core::MaterialId{0};
-    auto const wood = core::MaterialId{1};
-    auto const gold = core::MaterialId{2};
-    auto const glow = core::MaterialId{3};
-    auto const glass = core::MaterialId{4};
-    auto const leaves = core::MaterialId{5};
-    auto groundMaterial = material(core::vec3{1.0f}, 0.0f, 0.9f);
-    groundMaterial.baseColorTexture = checker;
-    groundMaterial.uvTransform.scale = core::vec2{6.0f};
-    auto woodMaterial = material(core::vec3{1.0f}, 0.0f, 0.6f);
-    woodMaterial.baseColorTexture = crate;
-    woodMaterial.normalTexture = crateRelief;
-    auto emissive = material(core::vec3{0.0f}, 0.0f, 1.0f);
-    emissive.emissive = core::vec3{0.4f, 0.8f, 2.0f};
-    auto glassMaterial = material(core::vec3{0.6f, 0.75f, 0.85f}, 0.0f, 0.12f);
-    glassMaterial.baseColor.w = 0.35f;
-    glassMaterial.alphaMode = core::AlphaMode::Blend;
-    auto leavesMaterial = material(core::vec3{1.0f}, 0.0f, 0.8f);
-    leavesMaterial.baseColorTexture = lattice;
-    leavesMaterial.alphaMode = core::AlphaMode::Mask;
-    leavesMaterial.doubleSided = true;
-    delta.materials = {{ground, groundMaterial},
-                       {wood, woodMaterial},
-                       {gold, material(core::vec3{1.0f, 0.78f, 0.34f}, 1.0f, 0.3f)},
-                       {glow, emissive},
-                       {glass, glassMaterial},
-                       {leaves, leavesMaterial}};
+core::Transform turnedAt(core::vec3 const &position, float const radians) {
+    auto transform = at(position);
+    transform.rotation = core::Rotation::axisAngle(core::vec3{0.0f, 1.0f, 0.0f}, radians);
+    return transform;
+}
 
-    auto turned = core::Transform{};
-    turned.translation = core::vec3{-1.3f, 0.5f, 0.2f};
-    turned.rotation = core::Rotation::axisAngle(core::vec3{0.0f, 1.0f, 0.0f}, 0.6f);
-    auto standing = core::Transform{};
-    standing.translation = core::vec3{-0.6f, 0.8f, -1.6f};
-    standing.rotation = core::Rotation::axisAngle(core::vec3{0.0f, 1.0f, 0.0f}, 0.35f);
-    delta.instances = {{core::InstanceId{0}, plane, ground, core::mat4{1.0f}},
-                       {core::InstanceId{1}, box, wood, core::matrixOf(turned)},
-                       {core::InstanceId{2}, sphere, gold, at(core::vec3{1.2f, 0.7f, -0.2f})},
-                       {core::InstanceId{3}, sphere, glow, at(core::vec3{0.1f, 0.35f, 1.4f}) *
-                                                               core::matrixOf(core::Transform{core::vec3{0.0f}, {},
-                                                                                              core::vec3{0.35f}})},
-                       {core::InstanceId{4}, sphere, glass, at(core::vec3{0.05f, 0.45f, 0.25f}) *
-                                                                core::matrixOf(core::Transform{core::vec3{0.0f}, {},
-                                                                                               core::vec3{0.643f}})},
-                       {core::InstanceId{5}, quad, leaves, core::matrixOf(standing)}};
+void addDrawn(scene::World &world, core::Transform const &local, std::optional<scene::EntityId> const parent,
+              scene::Renderable const &renderable) {
+    world.setRenderable(world.createEntity(local, parent), renderable);
+}
 
+struct DemoMaterials {
+    core::MaterialId ground;
+    core::MaterialId wood;
+    core::MaterialId gold;
+    core::MaterialId glow;
+    core::MaterialId glass;
+    core::MaterialId leaves;
+};
+
+// The materials, which hold the textures made for them.
+DemoMaterials addMaterials(scene::WorldResources &resources) {
+    auto const checker = resources.addTexture(checkerImage(), core::TextureSampler{});
+    auto const crate = resources.addTexture(crateImage(), core::TextureSampler{});
+    auto const crateRelief = resources.addTexture(crateNormals(), core::TextureSampler{});
+    auto const lattice = resources.addTexture(latticeImage(), core::TextureSampler{});
+    auto ground = material(core::vec3{1.0f}, 0.0f, 0.9f);
+    ground.baseColorTexture = checker;
+    ground.uvTransform.scale = core::vec2{6.0f};
+    auto wood = material(core::vec3{1.0f}, 0.0f, 0.6f);
+    wood.baseColorTexture = crate;
+    wood.normalTexture = crateRelief;
+    auto glow = material(core::vec3{0.0f}, 0.0f, 1.0f);
+    glow.emissive = core::vec3{0.4f, 0.8f, 2.0f};
+    auto glass = material(core::vec3{0.6f, 0.75f, 0.85f}, 0.0f, 0.12f);
+    glass.baseColor.w = 0.35f;
+    glass.alphaMode = core::AlphaMode::Blend;
+    auto leaves = material(core::vec3{1.0f}, 0.0f, 0.8f);
+    leaves.baseColorTexture = lattice;
+    leaves.alphaMode = core::AlphaMode::Mask;
+    leaves.doubleSided = true;
+    auto const materials = DemoMaterials{resources.addMaterial(ground),
+                                         resources.addMaterial(wood),
+                                         resources.addMaterial(material(core::vec3{1.0f, 0.78f, 0.34f}, 1.0f, 0.3f)),
+                                         resources.addMaterial(glow),
+                                         resources.addMaterial(glass),
+                                         resources.addMaterial(leaves)};
+    for (auto const texture : {checker, crate, crateRelief, lattice}) {
+        resources.releaseTexture(texture);
+    }
+    return materials;
+}
+
+void releaseMaterials(scene::WorldResources &resources, DemoMaterials const &materials) {
+    for (auto const id : {materials.ground, materials.wood, materials.gold, materials.glow, materials.glass,
+                          materials.leaves}) {
+        resources.releaseMaterial(id);
+    }
+}
+
+void addLights(scene::World &world, scene::EntityId const lantern) {
     auto sun = core::DirectionalLight{};
     sun.direction = core::vec3{-0.4f, -1.0f, -0.5f};
     sun.color = core::vec3{1.0f, 0.95f, 0.85f};
     sun.illuminance = 3.0f;
     sun.castsShadows = true;
+    world.setLight(world.createEntity(core::Transform::identity(), std::nullopt), sun);
     auto lamp = core::PointLight{};
-    lamp.position = core::vec3{0.6f, 1.6f, 1.8f};
     lamp.color = core::vec3{1.0f, 0.6f, 0.3f};
     lamp.intensity = 4.0f;
     lamp.range = 8.0f;
-    delta.lights = {{core::LightId{0}, sun}, {core::LightId{1}, lamp}};
-    delta.environment = core::EnvironmentDesc{core::vec3{0.12f, 0.16f, 0.24f}};
+    world.setLight(world.createEntity(at(core::vec3{0.5f, 1.25f, 0.4f}), lantern), lamp);
+    world.setEnvironment(core::EnvironmentDesc{core::vec3{0.12f, 0.16f, 0.24f}});
+}
 
-    scene.camera.position = core::vec3{0.0f, 2.2f, 5.5f};
-    scene.camera.target = core::vec3{0.0f, 0.5f, 0.0f};
-    return scene;
+} // namespace
+
+DemoEntities addDemoScene(scene::World &world) {
+    auto &resources = world.resources();
+    auto const plane = resources.addMesh(share(core::makePlane(core::vec2{6.0f, 6.0f})));
+    auto const box = resources.addMesh(share(core::makeBox(core::vec3{0.5f, 0.5f, 0.5f})));
+    auto const sphere = resources.addMesh(share(core::makeSphere(0.7f, 48, 24)));
+    auto const quad = resources.addMesh(share(core::makeQuad(core::vec2{0.8f, 0.8f})));
+    auto const materials = addMaterials(resources);
+
+    addDrawn(world, core::Transform::identity(), std::nullopt, scene::Renderable{plane, materials.ground});
+    addDrawn(world, turnedAt(core::vec3{-1.3f, 0.5f, 0.2f}, 0.6f), std::nullopt, scene::Renderable{box, materials.wood});
+    addDrawn(world, at(core::vec3{1.2f, 0.7f, -0.2f}), std::nullopt, scene::Renderable{sphere, materials.gold});
+    auto const lantern = world.createEntity(at(core::vec3{0.1f, 0.35f, 1.4f}), std::nullopt);
+    addDrawn(world, scaledAt(core::vec3{0.0f}, 0.35f), lantern, scene::Renderable{sphere, materials.glow});
+    addDrawn(world, scaledAt(core::vec3{0.05f, 0.45f, 0.25f}, 0.643f), std::nullopt,
+             scene::Renderable{sphere, materials.glass});
+    addDrawn(world, turnedAt(core::vec3{-0.6f, 0.8f, -1.6f}, 0.35f), std::nullopt,
+             scene::Renderable{quad, materials.leaves});
+    addLights(world, lantern);
+    for (auto const mesh : {plane, box, sphere, quad}) {
+        resources.releaseMesh(mesh);
+    }
+    releaseMaterials(resources, materials);
+
+    auto view = core::CameraDesc{};
+    view.position = core::vec3{0.0f, 2.2f, 5.5f};
+    view.target = core::vec3{0.0f, 0.5f, 0.0f};
+    auto placed = at(view.position);
+    placed.rotation = core::Rotation::lookingAlong(view.target - view.position, view.up);
+    auto const camera = world.createEntity(placed, std::nullopt);
+    auto lens = scene::CameraLens{};
+    lens.verticalFov = view.verticalFov;
+    lens.nearPlane = view.nearPlane;
+    lens.farPlane = view.farPlane;
+    world.setCamera(camera, lens);
+    return DemoEntities{camera, view, lantern};
+}
+
+DemoScene makeDemoScene() {
+    auto const world = scene::makeWorld(scene::WorldConfig{});
+    auto const entities = addDemoScene(*world);
+    return DemoScene{world->extractDelta(), entities.view};
 }
 
 } // namespace lr::examples

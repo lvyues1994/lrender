@@ -45,7 +45,7 @@ cmake --workflow --preset debug        # 配置、构建、测试
 SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # 不开窗口，跑 30 帧就退出
 ```
 
-左键拖动绕场景旋转，滚轮缩放；Tab 在可见性缓冲和路径追踪两条管线之间切换（1、2 直接选），T 开关时间抗锯齿（默认开），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。
+场景放在一个 `lr::scene::World` 里，由脚本每帧推动：相机慢慢绕场景转，发光的球带着上方的点光源上下浮动。左键拖动改变相机的方向，滚轮缩放；Tab 在可见性缓冲和路径追踪两条管线之间切换（1、2 直接选），T 开关时间抗锯齿（默认开），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出，这时每帧按 1/60 秒模拟，退出前打印 tick 数和相机从哪里转到了哪里。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。
 
 两个程序都可以用 `--gltf` 换成 glTF 场景（`.gltf` 带外部文件或 data URI，或 `.glb`；图片是 PNG、JPEG 或 KTX2）：
 
@@ -54,7 +54,7 @@ SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # �
 ./build/debug/examples/lrender_view --backend vulkan --gltf models/scene.glb
 ```
 
-有相机就用文件里的第一个，否则按场景的包围盒取景；另外加一个天空，文件里没有灯时再加一个太阳。`lrender_cli` 会打印加载的网格、材质、纹理、灯光和相机数，以及没能加载的内容。`lrender_view` 监听场景用到的文件，改了就重新加载；debug 构建在 GPU 后端上还监听 lrender 自己的 kernel 目录，改了 kernel 再构建一次，运行中的窗口就换上新程序（release 预设关掉了这个功能）。
+有相机就用文件里的第一个，否则按场景的包围盒取景；另外加一个天空，文件里没有灯时再加一个太阳。`lrender_cli` 会打印加载的网格、材质、纹理、灯光和相机数，以及没能加载的内容。`lrender_view` 由一个脚本加载场景，并监听场景用到的文件，改了就重新加载，在 World 里换掉旧场景；debug 构建在 GPU 后端上还监听 lrender 自己的 kernel 目录，改了 kernel 再构建一次，运行中的窗口就换上新程序（release 预设关掉了这个功能）。`lrender_view --mesh <文件>` 把 glTF 合并成一个网格，运行 `docs/architecture.md` 里的 `orbitCamera` 脚本。
 
 在自己的程序里加载 glTF：
 
@@ -76,6 +76,39 @@ view.target = renderer->targets().createImage({lr::core::ivec2{960, 540}});
 view.camera = (*scene)->cameras.at(0).camera;
 lexec::sync_wait(renderer->submit({std::move(added.delta), {view}}));
 ```
+
+用 World 和脚本管理场景（`lr::scene`）：World 记着实体、层级和资源，每帧只交出变化的部分；脚本是 co2 协程，只在 `tick()` 里、在调用它的线程上恢复，所以可以直接改 World。
+
+```cpp
+lr::core::Transform raisedTo(float const height) {
+    auto transform = lr::core::Transform{};
+    transform.translation.y = height;
+    return transform;
+}
+
+// 跨挂起点的局部写在 CO2_BEG 里；被等待的表达式里不能有 lambda。
+auto bob(lr::scene::World &world, lr::scene::EntityId const entity)
+    CO2_BEG(lr::scene::ScriptTask, (world, entity), lr::scene::SimDuration elapsed{}; float seconds{};) {
+    while (world.isAlive(entity)) {
+        world.setTransform(entity, raisedTo(0.5f + 0.2f * std::sin(seconds)));
+        CO2_AWAIT_SET(elapsed, lr::scene::nextFrame());   // 也可以等 waitFor(时长)，或者任何 lexec sender
+        seconds += std::chrono::duration<float>{elapsed}.count();
+    }
+}
+CO2_END
+
+auto world = lr::scene::makeWorld({});
+auto scripts = lr::scene::makeScriptHost({});              // 析构时停止所有脚本
+auto const ball = world->spawnInstance(mesh, lr::core::Transform::identity());
+scripts->start(bob(*world, ball));
+for (;;) {
+    scripts->tick(std::chrono::milliseconds{16});
+    auto frame = lr::render::FrameDesc{world->extractDelta(), {view}};
+    lexec::sync_wait(renderer->submit(std::move(frame)));
+}
+```
+
+脚本等待的 sender 不管在哪个线程上完成，脚本都在之后的某次 tick 里恢复。`ScriptHostConfig::release` 设成 `Deterministic` 后，第 t 次 tick 里等待的操作恰好在第 t + 1 次 tick 恢复（没完成就等它），加载快慢不影响脚本的时间线。
 
 自定义材质模型的写法见 `render/include/lr/render/MaterialModel.h` 开头的例子，测试里的 `tests/render/TestMaterialModels.h` 是一个完整的例子。
 

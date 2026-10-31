@@ -36,9 +36,10 @@ lrender 是一个 C++17 渲染引擎库。宿主程序把它嵌进自己的主�
 ### co2：逐帧推进的逻辑
 
 - 脚本返回 `ScriptTask`，这是按 co2 promise 协议写的自定义返回类型，用 `CO2_*` 宏编写。脚本只会在宿主调用 `ScriptHost::tick()` 时、由其中的 `co2::ManualExecutor::run()` 恢复，所以可以无锁读写场景。
-- `ScriptTask` 的 promise 用 `await_transform` 把每个被等待的 sender 包成 `continues_on(sim)`。例如 `CO2_AWAIT_SET(mesh, assets.loadMesh(path))` 完成在 IO 线程上，但脚本一定在下一次 tick 时回到宿主线程继续执行。“脚本在别的线程上访问场景”这种状态，在类型层面就构造不出来。
+- `ScriptTask` 的 promise 用 `await_transform` 把每个被等待的 sender 包成 `continues_on(sender, 闸门)`，再交给 `lexec::coro::as_awaitable`。闸门是每次等待各有一个的 co2 `Scheduler`，经 `lexec::coro::scheduler` 当作 lexec 调度器：sender 在哪个线程上完成都行，`continues_on` 把结果存进操作状态，把续体交给闸门，闸门只把它记在 ScriptHost 那里，等某次 tick 放行时才排进 `ManualExecutor`。例如 `CO2_AWAIT_SET(mesh, assets.loadMesh(path))` 完成在 IO 线程上，但脚本一定在之后的某次 tick 里回到宿主线程继续执行。“脚本在别的线程上访问场景”这种状态，在类型层面就构造不出来；不是 sender 的 awaitable（`co2::Task`、`scheduleOn` 之类）在脚本里编译不过。
 - 每个脚本只是一个堆上的帧（通常几百字节），不需要独立的栈，上万个实体脚本也负担得起。
 - co2 v2 还没有定时器和 `whenAll`：模拟时间上的等待（`nextFrame()`、`waitFor(duration)`）由 ScriptHost 提供，组合则交给 lexec。
+- 宏 DSL 的限制写脚本时会碰到：跨挂起点的局部要写在 `CO2_BEG` 里；被等待的表达式里不能有 lambda，要先包成返回 sender 的函数。
 
 ### compute_shaders：同一份 kernel 跑在 GPU 和 CPU 上
 
@@ -80,7 +81,7 @@ present  → render, runtime, core   实现 render 定义的 Presenter 接口
 render   → gpu, runtime, core
 gpu      → runtime, core
 asset    → runtime, core
-scene    → core
+scene    → runtime, core           以及 co2 和 lexec 的 co2 桥
 runtime  → 只依赖 lexec 与 stackfull
 ```
 
@@ -314,7 +315,7 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - 新纹理流入池时，GPU 线程把数据拷进当前帧的暂存段（`createBuffer` 分配的映射内存，每个在途帧一段，第一次用到时才分配），再 `copyBufferToImage` 写进对应的层和 mip 级别；拷贝和前后的 dispatch 一样在设备时间线上排序。每段从录制第 k 帧时用到的是第 k - framesInFlight 帧用过的那一段，那一帧已经做完，主机写它不会和设备读冲突。每帧最多拷 `RendererConfig::textureStreamingBytes`（默认 8 MiB），按 mip 级别排队，一帧放不下的留到下一帧；`copyBufferToImage` 只能整级拷贝，所以比预算还大的单个级别独占一帧，暂存段为它临时变大。RGBA8 纹理的第 0 层到了，同一帧里接着用下采样 kernel 逐级生成其余各级（每次 dispatch 一层，因为 llvmpipe 的 `texelFetch` 在一次 dispatch 里层号不同时会读错层）。最后一级写完，纹理才算驻留，材质才引用它；之前材质只用因子。
 - 材质里的引用由 GPU 线程填：`SceneUpdate` 里的材质带着纹理 ID，`DeviceScene` 按 `TexturePool` 的驻留情况把它们换成引用，驻留情况一变就重写所有材质。替换一个纹理（同一个 ID 再 upsert）时，旧数据马上不再被引用，新数据写完之前只用因子。
 - 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。lavapipe 没有 ETC2，测试里这条路走解码。经 asset 加载的图片，压缩池放不下的已经在后台池上解成 RGBA8（见 asset 的“压缩格式”）；宿主直接交来的压缩图像仍在渲染线程上解码，重采样也在渲染线程上。
-- `RenderWorld` 只把图像句柄交给 GPU 线程，自己不留；`TexturePool` 写完最后一级就放掉它，纹理在整个系统里只有设备上这一份（宿主自己留的句柄除外）。设备丢失后，渲染线程在下一帧把放置过的所有纹理记为丢失，`FrameResult::lostTextures` 列出需要重新提交的 `TextureId`，在此之前材质只用因子；那一帧失败的话，由下一个成功的帧报告。用了 scene 和 asset 时，由它们自动重新加载并提交。
+- `RenderWorld` 只把图像句柄交给 GPU 线程，自己不留；`TexturePool` 写完最后一级就放掉它，纹理在整个系统里只有设备上这一份（宿主自己留的句柄除外）。设备丢失后，渲染线程在下一帧把放置过的所有纹理记为丢失，`FrameResult::lostTextures` 列出需要重新提交的 `TextureId`，在此之前材质只用因子；那一帧失败的话，由下一个成功的帧报告。用了 scene 时，`World` 留着自己登记的图像句柄，宿主把这个列表交给 `WorldResources::resubmitTextures`，下一个增量重新提交它们（`lrender_view` 就是这样做的）。
 
 #### 与 kernel 共享的数据
 
@@ -423,34 +424,62 @@ AssetResult<ImageHandle> loadImageInTask(LoadContext const &context, AssetPath c
 
 ### scene：世界模型与脚本（可选）
 
-- `World`：组件按 SoA 存储（变换、层级、网格实例、灯光、相机），只在宿主线程上使用，每个组件都带变化标记。层级数量大时，变换传播用 `bulk` 分发到帧池，再 `sync_wait`。
-- `World::extractDelta() -> RenderWorldDelta`：只收集上次提取以来变化的部分，这是模拟与渲染之间唯一的交接点。
-- `ScriptHost`：拥有 `co2::ManualExecutor` 和一个按模拟时间排序的等待堆。
+```cpp
+struct World {                                     // 只在宿主线程上使用
+    virtual EntityId createEntity(Transform const &local, std::optional<EntityId> parent) = 0;
+    virtual void destroyEntity(EntityId entity) = 0;                                 // 连同所有后代
+    virtual void setParent(EntityId entity, std::optional<EntityId> parent) = 0;     // 保持局部变换
+    virtual void setTransform(EntityId entity, Transform const &local) = 0;
+    virtual mat4 worldMatrix(EntityId entity) const = 0;
+    virtual void setRenderable(EntityId entity, Renderable const &renderable) = 0;   // {MeshId, MaterialId}
+    virtual void setLight(EntityId entity, LightDesc const &light) = 0;              // 在实体的空间里
+    virtual void setCamera(EntityId entity, CameraLens const &lens) = 0;
+    virtual CameraDesc cameraOf(EntityId entity) const = 0;
+    virtual void setEnvironment(EnvironmentDesc const &environment) = 0;
+    virtual WorldResources &resources() noexcept = 0;                                // 网格、纹理、材质
+    virtual RenderWorldDelta extractDelta() = 0;
+    // 还有 isAlive、parentOf、removeRenderable、removeLight 等；非虚的 spawnInstance(mesh, transform) 建一个可渲染的根实体
+};
+std::unique_ptr<World> makeWorld(WorldConfig const &config);   // config：可选的 Runtime、并行传播的门槛
+```
+
+- 实体是带代数的 `EntityId { index, generation }`。槽位在实体销毁后复用，代数加一，所以旧 id 一用就抛 `std::invalid_argument`；脚本也可以先用 `isAlive` 检查。
+- 组件按槽位以 SoA 存放：局部变换、世界矩阵、父节点、子节点和兄弟链表、过期标记各一个数组；可渲染组件、灯光、相机的镜头也按槽位存放，前两者的数据在按 `InstanceId`、`LightId` 排的稠密表里。每个可渲染的实体是渲染世界里的一个实例。灯光写在实体的空间里，点光源跟着实体移动，方向光跟着实体转动。相机在实体的原点，朝实体的 -z 看，+y 向上；`Rotation::lookingAlong` 给出这样的朝向。
+- 层级：改了局部变换或父节点的实体，连同整棵子树标为过期；遇到已经过期的子树就不再往下走，所以过期的实体总是若干整棵子树。`extractDelta()` 从这些子树的根出发按层排好，逐层计算“世界 = 父的世界 × 局部”，同一层之间互不依赖。配了 `Runtime`、这次要算的数目又达到 `WorldConfig::parallelTransforms`（默认 4096）时，256 个以上的层用帧池上的 `bulk` 分发再 `sync_wait`，其余的层在宿主线程上依次算。两条路径调用同一个函数，结果逐位相同，测试用两万个实体的随机层级和两千次随机修改比对。提取之前查询 `worldMatrix`，沿过期的祖先现算，结果也相同。
+- 销毁父实体时连同所有后代一起销毁，而不是把孩子挂到别处；它们的实例和灯光在下一个增量里移除。
+- 变化跟踪：实例、灯光、网格、纹理、材质各是一张表，记着渲染世界已经有了哪些 id、上次提取以来改了哪些、移除了哪些。世界矩阵按位没变的实例不进增量，设成同样的变换什么也不会发生；两次提取之间建了又删掉的东西不出现在增量里；删掉的 id 在下一次提取之后才再分配，所以同一个增量不会既 upsert 又移除同一个 id。环境只在设置之后的那一个增量里出现。
+- 资源：`WorldResources` 给网格、纹理、材质分配 id 并计引用。`add*` 给调用方一个引用，可渲染组件持有它的网格和材质，材质持有它的纹理；同一个网格句柄（纹理是同一张图像加同一个采样器）只有一个 id，所以多个实体共用的网格只提交一次；最后一个引用放掉后，下一个增量移除它。`replace*` 用于热重载，id 不变。`defaultMaterial()` 是 World 自己持有的 `MaterialDesc{}`。
+- `World::extractDelta()` 是模拟与渲染之间唯一的交接点。
 
 ```cpp
-struct ScriptHost {
-    virtual ~ScriptHost() = default;
-    virtual ScriptId start(ScriptTask script) = 0;
-    virtual void requestStop(ScriptId const id) = 0;
-    virtual void tick(SimDuration const dt) = 0;   // 推进模拟时间，放行到期的等待和完成的操作，把执行器跑空
-    virtual bool isIdle() const = 0;               // 没有脚本还在等操作完成
+struct ScriptHost {                                    // 只在调用 tick 的宿主线程上使用
+    virtual ScriptId start(ScriptTask script) = 0;     // 从下一次 tick 开始运行
+    virtual void requestStop(ScriptId script) = 0;
+    virtual void tick(SimDuration elapsed) = 0;        // 推进模拟时间，放行到期的等待和该放行的操作，把执行器跑空
+    virtual bool isIdle() const noexcept = 0;          // 没有脚本还在运行
+    virtual std::vector<ScriptFailure> takeFailures() = 0;   // 以 stopped_error 以外的异常结束的脚本
+    virtual void shutdown() = 0;                       // 析构函数也调用它
 };
+std::unique_ptr<ScriptHost> makeScriptHost(ScriptHostConfig const &config);   // config：放行模式和 k
 ```
+
+- `ScriptHost` 拥有 `co2::ManualExecutor`、按（模拟时间，等待序号）排序的等待堆，以及在途操作的闸门列表。只有闸门列表加锁，因为 sender 在别的线程上完成。`SimDuration` 是整数纳秒，模拟时间累加没有舍入误差。
+- 一次 tick：模拟时间加上 `elapsed`；放行到期的等待（`nextFrame()` 在下一次 tick，`waitFor(d)` 在模拟时间第一次到达的那次 tick）和该放行的操作，按等待的先后排进执行器；把执行器跑空，上次 tick 以来 `start` 的脚本排在最前面，脚本在 tick 里 `start` 的新脚本这次 tick 就开始运行；最后销毁这次结束的脚本的帧。`nextFrame` 和 `waitFor` 返回实际经过的模拟时间。
 
 脚本的生命周期遵守 co2 的销毁契约：挂起在某个操作上的协程不能销毁。
 
-1. `requestStop` 请求脚本的 co2 stop token。
-2. lexec 的 co2 桥把这个 token 放进被等待 sender 的环境里，sender 以 `set_stopped` 完成。
-3. 完成照样经过 `continues_on(sim)`，所以下一次 tick 时，脚本在宿主线程上收到 `stopped_error`，结束，帧被销毁。
+1. `requestStop` 请求脚本的 co2 stop token，也就是 promise 的 `get_stop_token()` 交出的那个。
+2. lexec 的 co2 桥把这个 token 放进被等待 sender 的环境里，响应停止的 sender 以 `set_stopped` 完成。完成照样经过闸门。
+3. 下一次放行时，闸门后面那一步调度会检查这个 token，所以即使 sender 带回了值，脚本也在宿主线程上收到 `stopped_error`，结束，帧被销毁。等在 `nextFrame` / `waitFor` 上的脚本在下一次 tick 收到它。`stopped_error` 不算失败。还没运行过的脚本被停止时，会运行到第一个等待处再结束。
 4. 不响应停止的操作会让脚本停在“停止中”，直到操作完成。实体先被销毁也没关系，脚本之后通过带代数的 `EntityId` 访问时能发现实体已经失效。
-5. 关闭时对所有脚本 `requestStop`，然后反复 tick 直到 `isIdle()`。
+5. 关闭时对所有脚本 `requestStop`，然后在模拟时间不走的情况下反复 tick，直到 `isIdle()`；没有可以放行的东西时阻塞，等下一个操作完成，而不是空转。关闭之后 `start` 的脚本不会运行，它的帧随 `ScriptTask` 销毁。析构函数做的就是关闭，所以 `ManualExecutor` 析构时队列一定是空的。
 
 `ScriptHostConfig::release` 有两种取值：
 
-- `AsSoonAsReady`（默认）：操作一完成，就在下一次 tick 放行。
-- `Deterministic`：tick t 发起的操作恰好在 tick t + k 放行，没完成就在那次 tick 里等它。这样，资产在 IO 上快一点还是慢一点，都不会改变脚本的时间线，测试和重放才真正可重复。
+- `AsSoonAsReady`（默认）：已经完成的操作在下一次 tick 放行；同一次 tick 里按等待的先后。
+- `Deterministic`：tick t 里等待的操作恰好在 tick t + k 放行（`deterministicDelay`，默认 1），到时还没完成就在那次 tick 里阻塞到它完成，同一次 tick 里按等待的先后。资产在 IO 上快一点还是慢一点，都不会改变脚本的时间线，测试和重放才真正可重复：测试让三个脚本各等六次耗时随机为 0 到 4 ms 的操作，四组随机数得到逐 tick 相同的时间线，正好是 t + k。代价是永远不完成的 sender 会让那次 tick 一直等下去，所以等外部事件的脚本不该用这个模式。
 
-脚本示例：
+脚本示例。测试按原样运行这一段，`examples/common/src/Scripts.cpp` 里有一份按网格包围盒取景的，`lrender_view --mesh <文件>` 运行它：
 
 ```cpp
 auto orbitCamera(World &world, AssetLibrary &assets, EntityId const camera)
@@ -467,17 +496,25 @@ CO2_END
 
 ### examples：组合根
 
-`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；scene 还没有；TAA 默认打开，T 键开关）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口；`--taa` 打开 TAA，默认关）。两者默认显示演示场景，`--gltf <文件>` 改为经 `AssetLibrary` 加载的 glTF 场景：有相机就用文件里的第一个，否则按包围盒取景；再加一个天空，文件里没有灯时加一个太阳。`lrender_view` 在场景的文件变了时重新加载，用上一份的 `removal` 换掉旧场景，开发构建的 GPU 后端上还会重新加载 kernel。`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
+`lrender_view`（SDL 窗口与输入，加上 scene、asset、Renderer；TAA 默认打开，T 键开关）和 `lrender_cli`（离线，按指定的帧数或采样数输出图片，也是金标准测试的入口；`--taa` 打开 TAA，默认关）。两者默认显示演示场景，它由 `addDemoScene` 建在一个 `World` 里；`lrender_cli` 取这个 World 的第一个增量，`--gltf <文件>` 仍用 `sceneDelta` 直接得到增量。
+
+`lrender_view` 的场景全部在 `World` 里，由 `ScriptHost` 推动，每提交一帧就 tick 一次（`--frames` 时每次 1/60 秒，否则按墙钟时间）：
+
+- 演示场景里，`steerCamera` 每帧让相机沿 `Orbit` 慢慢转，鼠标拖动和滚轮改的也是这个 `Orbit`；`bob` 让发光的球和它上方的点光源一起上下浮动、转动，两者是同一个父实体的孩子。
+- `--gltf <文件>` 由 `showGltf` 脚本经 `AssetLibrary` 加载，用 `spawnScene` 把场景放到一个根实体下（每个实例、每盏灯一个子实体；文件里没有灯时加一个太阳），第一次加载时按文件的相机或包围盒设好 `Orbit` 和镜头。之后脚本每帧 `drainChanges`，文件变了就重新加载，销毁旧的根实体、放上新的场景，增量里是旧实例和资源的移除、新的 upsert。
+- `--mesh <文件>` 运行上面那个 `orbitCamera` 脚本。
+- 设备丢失后，帧报告的 `lostTextures` 交给 `resubmitTextures`。开发构建的 GPU 后端上还会重新加载 kernel。
+
+`lrender_view` 的主循环从不等帧：帧的 sender 用 `lexec::spawn` 放进一个 `counting_scope`，完成时给一个原子计数加一，循环只在未完成的帧少于 `framesInFlight` 时 tick 并提交新帧，每一轮都调 `blitLatest()`。宿主循环也可以写成下面这样，阻塞与否完全由宿主决定：
 
 ```cpp
 for (;;) {
-    if (not pumpSdlEvents(input)) break;
-    assets->drainChanges(changes);
-    world->applyAssetChanges(changes);
+    if (not pumpSdlEvents(input, orbit)) break;
+    world->resources().resubmitTextures(lostTextures());
     scripts->tick(clock.step());
     auto frame = FrameDesc{};
     frame.delta = world->extractDelta();
-    frame.views.push_back(mainView(*world, window));
+    frame.views.push_back(mainView(world->cameraOf(camera), window));
     pending.push_back(lexec::spawn_future(renderer->submit(std::move(frame)), scope.get_token()));
     if (pending.size() > kFramesInFlight) {
         lexec::sync_wait(std::move(pending.front()));
@@ -509,6 +546,7 @@ IO       │          等 N 完成 ───────────────
 |---|---|---|---|
 | 场景组件 | `World` | 宿主线程 | 单线程，无锁 |
 | 脚本帧 | `ScriptHost` | 宿主线程 | 只在 tick 内恢复 |
+| 在途操作的闸门 | `ScriptHost` | 任意线程上完成，宿主线程上放行 | 一把锁，只护着这张列表 |
 | `RenderWorldDelta` | 按帧移动的值 | 宿主 → 渲染线程 | 不可变 |
 | `MeshData` / `ImageData` | `shared_ptr<T const>` | 任意线程只读 | 不可变；热重载产生新对象 |
 | `RenderWorld` 镜像、BLAS 缓存、帧图资源池 | render | 渲染线程 | 单一序列 |
@@ -552,6 +590,7 @@ IO       │          等 N 完成 ───────────────
 - **让宿主线程 `sync_wait` 准备工作来保证串行。** 库会因此阻塞宿主，串行也要靠调用方遵守前置条件。改为渲染线程上的 `run_loop`。
 - **一个计算池加任务优先级。** lexec 不提供优先级，自己实现一个带优先级的池又会和 `bulk` 的池定制脱节。两个池最简单。
 - **GPU 线程自己等 GPU 完成（`Submission::wait()`，或者轮询 `isComplete()`）。** 前者让 GPU 线程在设备执行期间无法录制下一帧；后者需要定时唤醒，而 `run_loop` 没有定时器。等待交给 IO 调度器，GPU 线程只在完成之后被调度回来收尾。
+- **脚本等待的 sender 直接 `continues_on` 到 `ManualExecutor`。** 完成会随时排进执行器，tick 把执行器跑空时，tick 进行中别的线程完成的操作也会在这次 tick 里恢复，一次 tick 做多少事取决于时机；确定性模式还要知道每个操作是在哪次 tick、以什么顺序等待的。所以中间加一道闸门，由 tick 决定放行谁。
 
 ## 工程结构
 
@@ -568,14 +607,14 @@ lrender/
   render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)；include/lr/render/kernels/ 是用户 kernel 也要用的公开 kernel 头文件
   present/   image_sequence/  sdl/  （android/）  lr::present_image  lr::present_sdl  （lr::present_android）
   asset/     include/lr/asset/     src/           lr::asset    lr::core、lr::runtime、tl::expected；私有 cgltf、stb
-  scene/     include/lr/scene/     src/           lr::scene    co2、lexec 的 co2 桥
+  scene/     include/lr/scene/     src/           lr::scene    lr::core、lr::runtime、co2；lexec 的 co2 桥随 lexec 而来
   examples/  view/  cli/                          lrender_view  lrender_cli
   probes/    gpu_probe  present_probe  asset_probe  layout_probe
   tests/
 ```
 
 - 命名空间为 `lr::<module>`，每个模块一个 CMake 目标，目标图与模块图一致。
-- 作为库交付：提供 install 规则和 `find_package(lrender)` 用的包配置，每个可选层单独导出为一个组件。
+- 作为库交付：要提供 install 规则和 `find_package(lrender)` 用的包配置，每个可选层单独导出为一个组件。现在还没有，因为依赖库还不都有 install 规则，等它们有了再加。
 - compute_shaders 至少要固定到 `915657a`：按提交取计时、只在设备上的图像、压缩纹理数组和 `FencedSubmission` 从这个提交开始才有。
 - 平台取各库支持范围的交集：Linux x86_64/aarch64 和 Android arm64。
 - 主机构建依赖 libclang-18-dev 和 glslang-tools（tc 转译器）；Android 交叉编译时使用主机构建出的转译器。发布构建加 `-DTC_PROGRAM_RELOAD=OFF`。
@@ -587,17 +626,19 @@ lrender/
 | core、RenderWorld、帧图编译 | 确定 | 单元测试 |
 | render kernel | 确定 | CPU 后端的金标准图像，加上跨后端等价测试；子组和 64 位原子的变体与回退变体在同一个设备上互相比对（三角形、深度、可见实例列表、图像逐位相同）；自定义材质模型只改变自己的像素；TAA 与主机上的模拟和解析覆盖率比对，并测拖影、运动矢量和历史的重置；设备图像没有读回接口，纹理池的内容由着色 kernel 采样（自发光纹理贴满一个四边形，像素中心对准纹素中心），再用读 HDR 颜色的 feature 读进 buffer 比对；阴影、透明、环境光的镜面部分、法线贴图与路径追踪器或解析结果比对 |
 | Renderer 整体 | 确定 | cpu 后端，以及 llvmpipe、lavapipe 上的 GPU 后端（没有 sync file，走 `Submission` 的等待路径）：连续提交的帧按序完成、累积结果与逐帧提交相同、在途帧不超过上限（用一个数录制而未收尾帧数的 feature）、多视图、窗口目标交给测试用的 Presenter、缩放、设备丢失恢复（用一个录制时抛 `tc::DeviceError` 的 feature）；`ImageSequencePresenter` 写出的文件与离屏目标的图像逐像素相同 |
-| scene、ScriptHost | 确定 | 手动 tick 的单元测试；`Deterministic` 模式下的时间线逐帧比对 |
+| scene、ScriptHost | 确定 | 手动 tick 的单元测试：增量里只有该有的条目，层级传播、改父节点、连同后代销毁，旧 id 被拒绝，资源只提交一次、最后一个引用放掉才移除，帧池上的传播与宿主线程上逐位相同；`nextFrame`、`waitFor` 的时机，别的线程上完成的 sender 只在 tick 里、在宿主线程上恢复，停止和失败，析构；`Deterministic` 模式下耗时随机的加载得到逐 tick 相同的时间线；脚本经 `AssetLibrary` 加载生成的 glTF 放进 World，增量交给 Renderer，与解析结果和 CPU 后端比对 |
 | asset | 半确定 | 测试自己生成 glTF（内嵌、外部文件、.glb）、PNG、JPEG、KTX2；用一个计数、能扣住读取的测试源测去重、加载重叠和取消；热重载在构建目录下改真实文件，轮询 `drainChanges`；加载的场景经 `sceneDelta` 交给 Renderer，与解析结果和 CPU 后端比对；kernel 重新加载用改过注释的生成目录，前后两帧逐位相同 |
 | gpu | 边界 | 单元测试用 eventfd 代替 sync file、用自定义的 `Submission::Completion` 代替还没完成的提交，分别覆盖两条等待路径；`gpu_probe`：选择后端、打印 `checkKernel` 的结果，在真实设备上提交并走 sync file 路径，打开计时器时按提交打印每次 dispatch 的耗时 |
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
 | present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
 
-1. **M0** 工程骨架：CMake、presets、固定版本的依赖、install 与包配置、CI（llvmpipe 与 lavapipe 上跑 GPU 后端，覆盖没有 sync file 的等待路径）。
+1. **M0** 工程骨架：CMake、presets、固定版本的依赖、runtime 模块、CI（debug、clang-debug、asan 三个预设，llvmpipe 与 lavapipe 上跑 GPU 后端，覆盖没有 sync file 的等待路径）。
 2. **M1** 渲染核心：`RenderWorld` 增量、帧图、可见性缓冲管线的最小版本（GPU 剔除与间接 dispatch、两遍可见性缓冲、基础 PBR 着色、色调映射），在 cpu 后端上配合 `lrender_cli` 建立金标准测试。
 3. **M2** 参考路径追踪，作为画质参照；Vulkan、OpenGL、GLES 与 CPU 的等价测试；打开设备计时器，定下每张表的布局和编码。
 4. **M3** 完整的 Renderer 接口：渲染线程、GPU 线程、异步提交与 IO 上的完成等待、回读 buffer、在途帧、多视图、缩放、设备丢失恢复、SDL 窗口目标与图片序列；`lrender_view`。`gpu_probe` 和 `present_probe` 还没有写。
 5. **M4** 画质。M4a：设备端纹理池（mip、流式写入、压缩格式与解码回退、设备丢失后列出丢失的纹理）、带纹理的材质（法线贴图、UV 变换、alpha 遮罩）、级联阴影、逐像素链表的顺序无关透明、均匀环境光的镜面部分；路径追踪器同样采样纹理，混合材质按随机不透明处理。M4b：启动时的 kernel 检查与变体选择、一遍写入的可见性缓冲和子组变体、材质分类与间接着色（应用可以加自己的材质模型）、TAA。
 6. **M5** asset：流式加载、取消、热重载、KTX2 与按设备选择压缩格式，以及开发期的 kernel 重新加载；`lrender_cli` 和 `lrender_view` 的 `--gltf`。`asset_probe` 还没有写。
-7. **M6** scene 与脚本：生命周期、确定性模式。
+7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
+
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。

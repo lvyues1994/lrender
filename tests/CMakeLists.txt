@@ -62,6 +62,16 @@ lr_add_test(lr_asset_tests
 target_include_directories(lr_asset_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
 target_compile_definitions(lr_asset_tests PRIVATE LR_TEST_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/output")
 
+# The scene module alone, then scripts loading through an asset library into a world the
+# renderer draws.
+lr_add_test(lr_scene_tests
+    SOURCES scene/WorldTest.cpp scene/ScriptHostTest.cpp scene/DeterministicReleaseTest.cpp
+            scene/SceneRenderingTest.cpp asset/TestFiles.cpp
+    KERNELS render/TestKernels.h
+    LIBRARIES lr::scene lr::asset lr::render tc_devices lr_third_party_stb stackfull::runtime)
+target_include_directories(lr_scene_tests PRIVATE "${CMAKE_CURRENT_SOURCE_DIR}")
+target_compile_definitions(lr_scene_tests PRIVATE LR_TEST_OUTPUT_DIR="${CMAKE_CURRENT_BINARY_DIR}/output")
+
 set(lr_present_test_sources present/ImageSequencePresenterTest.cpp)
 set(lr_present_test_libraries lr::present_image tc_devices)
 if(TARGET lr::present_sdl)

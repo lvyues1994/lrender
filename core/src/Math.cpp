@@ -12,6 +12,33 @@ Rotation Rotation::axisAngle(vec3 const &axis, float const radians) noexcept {
     return Rotation{vec4{unit.x * s, unit.y * s, unit.z * s, std::cos(half)}};
 }
 
+Rotation Rotation::fromMatrix(mat3 const &matrix) noexcept {
+    // r(row, column); the largest of w, x, y, z is found first, so no division is by a small number.
+    auto const r = [&matrix](int const row, int const column) { return matrix[column][row]; };
+    auto const trace = r(0, 0) + r(1, 1) + r(2, 2);
+    auto q = vec4{};
+    if (trace > 0.0f) {
+        auto const s = std::sqrt(trace + 1.0f) * 2.0f;
+        q = vec4{(r(2, 1) - r(1, 2)) / s, (r(0, 2) - r(2, 0)) / s, (r(1, 0) - r(0, 1)) / s, 0.25f * s};
+    } else if (r(0, 0) > r(1, 1) and r(0, 0) > r(2, 2)) {
+        auto const s = std::sqrt(1.0f + r(0, 0) - r(1, 1) - r(2, 2)) * 2.0f;
+        q = vec4{0.25f * s, (r(0, 1) + r(1, 0)) / s, (r(0, 2) + r(2, 0)) / s, (r(2, 1) - r(1, 2)) / s};
+    } else if (r(1, 1) > r(2, 2)) {
+        auto const s = std::sqrt(1.0f + r(1, 1) - r(0, 0) - r(2, 2)) * 2.0f;
+        q = vec4{(r(0, 1) + r(1, 0)) / s, 0.25f * s, (r(1, 2) + r(2, 1)) / s, (r(0, 2) - r(2, 0)) / s};
+    } else {
+        auto const s = std::sqrt(1.0f + r(2, 2) - r(0, 0) - r(1, 1)) * 2.0f;
+        q = vec4{(r(0, 2) + r(2, 0)) / s, (r(1, 2) + r(2, 1)) / s, 0.25f * s, (r(1, 0) - r(0, 1)) / s};
+    }
+    return Rotation{tc::normalize(q)};
+}
+
+Rotation Rotation::lookingAlong(vec3 const &forward, vec3 const &up) noexcept {
+    auto const back = -tc::normalize(forward);
+    auto const side = tc::normalize(tc::cross(up, back));
+    return fromMatrix(mat3{side, tc::cross(back, side), back});
+}
+
 mat3 rotationMatrix(Rotation const &rotation) noexcept {
     auto const q = rotation.quaternion;
     auto const xx = q.x * q.x;
@@ -33,6 +60,22 @@ mat4 matrixOf(Transform const &transform) noexcept {
     auto const s = transform.scale;
     return mat4{vec4{r[0] * s.x, 0.0f}, vec4{r[1] * s.y, 0.0f}, vec4{r[2] * s.z, 0.0f},
                 vec4{transform.translation, 1.0f}};
+}
+
+Transform decomposed(mat4 const &matrix) noexcept {
+    auto const x = matrix[0].xyz();
+    auto const y = matrix[1].xyz();
+    auto const z = matrix[2].xyz();
+    // A mirroring matrix flips one axis: x's, by convention.
+    auto const mirrored = tc::dot(tc::cross(x, y), z) < 0.0f;
+    auto const scale = vec3{mirrored ? -tc::length(x) : tc::length(x), tc::length(y), tc::length(z)};
+    auto transform = Transform{};
+    transform.translation = matrix[3].xyz();
+    transform.scale = scale;
+    if (scale.x != 0.0f and scale.y != 0.0f and scale.z != 0.0f) {
+        transform.rotation = Rotation::fromMatrix(mat3{x / scale.x, y / scale.y, z / scale.z});
+    }
+    return transform;
 }
 
 Aabb transformed(Aabb const &box, mat4 const &matrix) noexcept {
