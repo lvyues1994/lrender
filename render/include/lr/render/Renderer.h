@@ -46,6 +46,18 @@ struct RenderTargets {
     virtual void destroy(RenderTargetId id) = 0;
 };
 
+// When the textures the renderer decodes or resamples (compressed images in formats the
+// device has no arrays of, images that are not power-of-two squares) upload. Their
+// conversions run on the background pool; images that go to a texture pool as they are
+// upload with the frame they come in.
+enum class ConversionDelivery : std::uint8_t {
+    // With the first frame after their conversion finished: no frame waits for one.
+    AsSoonAsReady,
+    // With the frame after the one they came in, which waits for the conversion if it has
+    // not finished: how long conversions take does not change which frame shows them.
+    Deterministic,
+};
+
 struct PipelineDesc {
     PipelineId base; // the pipeline whose features come first
     std::vector<std::shared_ptr<RenderFeature>> features;
@@ -101,6 +113,7 @@ struct RendererConfig {
     std::size_t textureStreamingBytes = std::size_t{8} << 20;
     // Larger textures are scaled down on the host (also to what the device allows).
     std::uint32_t maxTextureSize = 2048;
+    ConversionDelivery textureConversions = ConversionDelivery::AsSoonAsReady;
     // Optional kernel variants (RendererCapabilities), each used where the device runs it
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;

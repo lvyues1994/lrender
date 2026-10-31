@@ -1,5 +1,7 @@
 #pragma once
 
+#include "Bvh.h"
+#include "RenderWork.h"
 #include "SceneUpdate.h"
 #include "TextureLayout.h"
 
@@ -8,6 +10,7 @@
 
 #include <cmath>
 #include <cstdint>
+#include <memory>
 #include <optional>
 #include <unordered_map>
 #include <unordered_set>
@@ -20,9 +23,15 @@ namespace lr::render {
 // lights stay dense (removal moves the last one into the gap) because kernels loop over
 // them; meshes and materials keep their slots. Geometry and hierarchies of replaced or
 // removed meshes are not reclaimed yet. Texture images pass through to the GPU thread
-// (TextureLayout places them); the world keeps only their ids.
+// (TextureLayout places them); the world keeps only their ids. The meshes of a delta are
+// encoded, and their hierarchies built, as items of `parallel`; the textures that need
+// converting are converted on `conversions` and upload with the next frame.
 struct RenderWorld {
-    explicit RenderWorld(TextureLimits const &limits = TextureLimits{}) : textures(limits) {}
+    // Encodes and converts on the calling thread.
+    explicit RenderWorld(TextureLimits const &limits = TextureLimits{});
+    // `parallel` and `conversions` must outlive the world.
+    RenderWorld(TextureLimits const &limits, ParallelFor &parallel, ImageConversions &conversions,
+                ConversionDelivery delivery);
 
     // Material models 0 to count - 1 exist; materials of other models are rejected.
     void allowMaterialModels(std::uint32_t const count) noexcept { materialModels = count; }
@@ -88,7 +97,7 @@ private:
 
     void validate(core::RenderWorldDelta const &delta) const;
     std::uint32_t takeSlot(std::vector<std::uint32_t> &freeSlots, std::uint32_t &end);
-    void upsertMesh(core::MeshUpsert const &upsert, SceneUpdate &update);
+    void upsertMeshes(std::vector<core::MeshUpsert> const &upserts, SceneUpdate &update);
     void upsertMaterial(core::MaterialUpsert const &upsert, SceneUpdate &update);
     void writeInstance(std::uint32_t index, SceneUpdate &update) const;
     void writeLight(std::uint32_t index, SceneUpdate &update) const;
@@ -99,9 +108,15 @@ private:
     void applyTextures(core::RenderWorldDelta const &delta, SceneUpdate &update);
     void updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update);
     void updateSummaries();
-    void buildBlas(MeshRecord &record, SceneUpdate &update);
+    // The hierarchies of `records`' meshes, built as items of `parallel`, in that order.
+    void buildBlases(std::vector<MeshRecord *> const &records, SceneUpdate &update);
+    void placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &update);
     void buildTlas(SceneUpdate &update);
     SceneCapacity capacity() const noexcept;
+
+    std::unique_ptr<ParallelFor> ownParallel;
+    std::unique_ptr<ImageConversions> ownConversions;
+    ParallelFor *parallel;
 
     std::unordered_map<core::MeshId, MeshRecord> meshes;
     std::vector<std::uint32_t> freeMeshSlots;

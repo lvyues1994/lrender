@@ -6,6 +6,7 @@
 #include "kernels/PathTrace.h"
 
 #include <lr/core/Primitives.h>
+#include <lr/runtime/Runtime.h>
 
 #include <doctest/doctest.h>
 
@@ -370,6 +371,64 @@ TEST_CASE("hierarchies follow the deltas after they are first built") {
     CHECK(afterMove.blasRoots[0].index == first.meshes[0].index);
     CHECK(afterMove.blasRoots[0].value >= first.blasNodes.size()); // appended after the first hierarchies
     CHECK(afterMove.blasTriangles.size() == 12);
+}
+
+bool sameNodes(std::vector<render::Indexed<render::GpuBvhNode>> const &a,
+               std::vector<render::Indexed<render::GpuBvhNode>> const &b) {
+    return std::equal(a.begin(), a.end(), b.begin(), b.end(), [](auto const &x, auto const &y) {
+        return x.index == y.index and x.value.boundsMin == y.value.boundsMin and x.value.boundsMax == y.value.boundsMax
+           and x.value.first == y.value.first and x.value.count == y.value.count;
+    });
+}
+
+// The frame pool encodes the meshes and builds their hierarchies at once; what it makes
+// lands where the serial order puts it.
+TEST_CASE("a world that works on the frame pool makes the updates a serial one makes") {
+    auto config = runtime::RuntimeConfig{};
+    config.framePoolThreads = 3;
+    auto const runtime = runtime::makeRuntime(config);
+    auto const parallel = render::makeFramePoolFor(*runtime);
+    auto const conversions = render::makeImmediateConversions();
+    auto pooled =
+        render::RenderWorld{render::TextureLimits{}, *parallel, *conversions, render::ConversionDelivery::Deterministic};
+    auto serial = render::RenderWorld{};
+    auto random = std::mt19937{5};
+    auto const delta = scatteredInstances(random);
+    auto again = core::RenderWorldDelta{};
+    again.meshes = {delta.meshes[2], delta.meshes[0]};
+
+    for (auto const *step : std::vector<core::RenderWorldDelta const *>{&delta, &again}) {
+        auto a = pooled.apply(*step);
+        auto b = serial.apply(*step);
+        if (step == &delta) {
+            pooled.keepHierarchies(a);
+            serial.keepHierarchies(b);
+        }
+        REQUIRE(a.geometry.size() == b.geometry.size());
+        for (auto index = std::size_t{0}; index < a.geometry.size(); ++index) {
+            auto const &x = a.geometry[index];
+            auto const &y = b.geometry[index];
+            CHECK(x.firstVertex == y.firstVertex);
+            CHECK(x.firstIndex == y.firstIndex);
+            CHECK(x.indices == y.indices);
+            auto const sameVertices = std::equal(
+                x.vertices.begin(), x.vertices.end(), y.vertices.begin(), y.vertices.end(), [](auto const &p, auto const &q) {
+                    return p.position == q.position and p.normal.value == q.normal.value and p.uv.value == q.uv.value;
+                });
+            CHECK(sameVertices);
+        }
+        auto const sameMeshes = std::equal(a.meshes.begin(), a.meshes.end(), b.meshes.begin(), b.meshes.end(),
+                                           [](auto const &x, auto const &y) {
+                                               return x.index == y.index and x.value.firstVertex == y.value.firstVertex
+                                                  and x.value.boundsMin == y.value.boundsMin
+                                                  and x.value.vertexCount == y.value.vertexCount;
+                                           });
+        CHECK(sameMeshes);
+        CHECK(sameNodes(a.blasNodes, b.blasNodes));
+        CHECK(sameNodes(a.tlasNodes, b.tlasNodes));
+        CHECK(gather(a.blasRoots) == gather(b.blasRoots));
+        CHECK(a.blasTriangles.size() == b.blasTriangles.size());
+    }
 }
 
 } // namespace

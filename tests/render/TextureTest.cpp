@@ -13,6 +13,8 @@
 #include <array>
 #include <cmath>
 #include <cstdint>
+#include <functional>
+#include <future>
 #include <memory>
 #include <string>
 #include <utility>
@@ -49,6 +51,12 @@ struct QuadView {
     // The frame after `delta`'s, by which the textures it uploads have arrived.
     std::vector<core::vec4> renderUploaded(core::RenderWorldDelta delta) {
         render(std::move(delta));
+        return render({});
+    }
+
+    // A frame later still, by which textures the renderer decodes or resamples have arrived.
+    std::vector<core::vec4> renderConverted(core::RenderWorldDelta delta) {
+        renderUploaded(std::move(delta));
         return render({});
     }
 
@@ -322,7 +330,7 @@ TEST_CASE("hand-made BC1 and ETC2 textures sample to their decoded texels on eve
             auto delta = quadWith(test::emissiveTexture(kTexture));
             delta.textures = {{kTexture, image, {}}};
 
-            auto const difference = largestDifference(view.renderUploaded(std::move(delta)), expected);
+            auto const difference = largestDifference(view.renderConverted(std::move(delta)), expected);
 
             CAPTURE(difference);
             auto const tolerance = harness.renderer->deviceInfo().backend == "cpu" ? 1e-3f
@@ -434,7 +442,8 @@ core::TextureUpsert solid(std::uint32_t const id, int const size) {
 }
 
 TEST_CASE("a removed texture's layer goes to the next texture of its size, and full colour pools double") {
-    auto layout = render::TextureLayout{render::TextureLimits{}};
+    auto const conversions = render::makeImmediateConversions();
+    auto layout = render::TextureLayout{render::TextureLimits{}, *conversions};
     auto update = render::SceneUpdate{};
     for (auto id = 0u; id < 4u; ++id) {
         layout.place(solid(id, 32), update);
@@ -457,22 +466,28 @@ TEST_CASE("a removed texture's layer goes to the next texture of its size, and f
     CHECK(not layout.locationOf(core::TextureId{1}).has_value());
 }
 
+// Decoded images upload with the frame after the one that placed them.
 TEST_CASE("compressed images keep their blocks where the device has arrays of them, and are decoded elsewhere") {
     auto const bc1 = handMadeImage(tc::CompressedFormat::Bc1);
     auto const etc2 = handMadeImage(tc::CompressedFormat::Etc2Rgb8);
-    auto layout = render::TextureLayout{withArraysOf(tc::compressedBit(tc::CompressedFormat::Bc1))};
+    auto const conversions = render::makeImmediateConversions();
+    auto layout = render::TextureLayout{withArraysOf(tc::compressedBit(tc::CompressedFormat::Bc1)), *conversions};
     auto update = render::SceneUpdate{};
 
     layout.place(core::TextureUpsert{core::TextureId{0}, bc1, {}}, update);
     layout.place(core::TextureUpsert{core::TextureId{1}, etc2, {}}, update);
+    layout.deliverConversions(update);
+    auto next = render::SceneUpdate{};
+    layout.deliverConversions(next);
 
-    REQUIRE(update.textureUploads.size() == 2);
+    REQUIRE(update.textureUploads.size() == 1);
     auto const &blocks = update.textureUploads[0];
     CHECK(render::textureSlot(blocks.ref) >= render::colorPoolSlots());
     auto const unchanged = blocks.image == bc1;
     CHECK(unchanged);
     CHECK(blocks.levels == 5);
-    auto const &decoded = update.textureUploads[1];
+    REQUIRE(next.textureUploads.size() == 1);
+    auto const &decoded = next.textureUploads[0];
     CHECK(render::textureSlot(decoded.ref) == 0);
     CHECK(not decoded.image->compressed.has_value());
     CHECK(decoded.levels == 1);
@@ -482,7 +497,9 @@ TEST_CASE("compressed images keep their blocks where the device has arrays of th
 }
 
 TEST_CASE("images are resampled to their pool's square, larger ones scaled down in linear colour") {
-    auto layout = render::TextureLayout{withArraysOf(0, 16)};
+    auto const conversions = render::makeImmediateConversions();
+    auto layout = render::TextureLayout{withArraysOf(0, 16), *conversions};
+    auto placing = render::SceneUpdate{};
     auto update = render::SceneUpdate{};
     auto const checker = test::rgba8Image(core::ivec2{32, 32}, core::ColorEncoding::Srgb, [](int const x, int const y) {
         auto const value = (x + y) % 2 == 0 ? 255 : 0;
@@ -491,9 +508,12 @@ TEST_CASE("images are resampled to their pool's square, larger ones scaled down 
     auto const narrow = test::rgba8Image(core::ivec2{20, 12}, core::ColorEncoding::Linear,
                                          [](int, int) { return tc::ivec4{10, 20, 30, 40}; });
 
-    layout.place(core::TextureUpsert{core::TextureId{0}, checker, {}}, update);
-    layout.place(core::TextureUpsert{core::TextureId{1}, narrow, {}}, update);
+    layout.place(core::TextureUpsert{core::TextureId{0}, checker, {}}, placing);
+    layout.place(core::TextureUpsert{core::TextureId{1}, narrow, {}}, placing);
+    layout.deliverConversions(placing);
+    layout.deliverConversions(update);
 
+    CHECK(placing.textureUploads.empty());
     REQUIRE(update.textureUploads.size() == 2);
     auto const &scaled = *update.textureUploads[0].image;
     CHECK(scaled.extent == core::ivec2{16, 16});
@@ -504,6 +524,73 @@ TEST_CASE("images are resampled to their pool's square, larger ones scaled down 
     CHECK(stretched.extent == core::ivec2{16, 16});
     CHECK(stretched.levels[0][0] == 10);
     CHECK(stretched.levels[0][3] == 40);
+}
+
+// Conversions that finish when the test says so.
+struct HeldConversions final : render::ImageConversions {
+    std::future<core::ImageHandle> start(std::function<core::ImageHandle()> convert) override {
+        held.push_back(Held{std::move(convert), std::promise<core::ImageHandle>{}});
+        return held.back().result.get_future();
+    }
+
+    void finishAll() {
+        for (auto &conversion : held) {
+            conversion.result.set_value(conversion.convert());
+        }
+        held.clear();
+    }
+
+    struct Held {
+        std::function<core::ImageHandle()> convert;
+        std::promise<core::ImageHandle> result;
+    };
+    std::vector<Held> held;
+};
+
+TEST_CASE("as soon as ready, a texture uploads with the first frame after its conversion finished") {
+    auto conversions = HeldConversions{};
+    auto layout = render::TextureLayout{render::TextureLimits{}, conversions, render::ConversionDelivery::AsSoonAsReady};
+    auto const narrow = test::rgba8Image(core::ivec2{20, 12}, core::ColorEncoding::Linear,
+                                         [](int, int) { return tc::ivec4{10, 0, 0, 255}; });
+    auto frames = std::vector<render::SceneUpdate>(4);
+    layout.place(core::TextureUpsert{core::TextureId{0}, narrow, {}}, frames[0]);
+    layout.deliverConversions(frames[0]);
+    layout.deliverConversions(frames[1]);
+    conversions.finishAll();
+    layout.deliverConversions(frames[2]);
+    layout.deliverConversions(frames[3]);
+
+    CHECK(frames[0].textureUploads.empty());
+    CHECK(frames[1].textureUploads.empty()); // the conversion still runs; the frame does not wait
+    REQUIRE(frames[2].textureUploads.size() == 1);
+    CHECK(frames[2].textureUploads[0].image->extent == core::ivec2{32, 32});
+    CHECK(frames[3].textureUploads.empty());
+}
+
+TEST_CASE("a texture removed or placed again while it converts uploads what it is by then") {
+    auto const conversions = render::makeImmediateConversions();
+    auto layout = render::TextureLayout{render::TextureLimits{}, *conversions};
+    auto const narrow = [](int const red) {
+        return test::rgba8Image(core::ivec2{20, 12}, core::ColorEncoding::Linear,
+                                [red](int, int) { return tc::ivec4{red, 0, 0, 255}; });
+    };
+    auto first = render::SceneUpdate{};
+    layout.place(core::TextureUpsert{core::TextureId{0}, narrow(10), {}}, first);
+    layout.place(core::TextureUpsert{core::TextureId{1}, narrow(20), {}}, first);
+    layout.deliverConversions(first);
+
+    auto second = render::SceneUpdate{};
+    layout.remove(core::TextureId{0});
+    layout.place(core::TextureUpsert{core::TextureId{1}, narrow(30), {}}, second);
+    layout.deliverConversions(second);
+    auto third = render::SceneUpdate{};
+    layout.deliverConversions(third);
+
+    CHECK(first.textureUploads.empty());
+    CHECK(second.textureUploads.empty());
+    REQUIRE(third.textureUploads.size() == 1);
+    CHECK(third.textureUploads[0].id == core::TextureId{1});
+    CHECK(third.textureUploads[0].image->levels[0][0] == 30);
 }
 
 } // namespace

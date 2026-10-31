@@ -1,8 +1,11 @@
 #include "TextureLayout.h"
 
 #include <algorithm>
+#include <chrono>
 #include <cmath>
+#include <exception>
 #include <memory>
+#include <utility>
 
 namespace lr::render {
 
@@ -155,13 +158,16 @@ std::vector<std::uint8_t> rgba8LevelZero(core::ImageData const &image) {
     return texels;
 }
 
+// Whether a colour pool `size` texels square takes `image` only once it is decoded or resampled.
+bool needsConversion(core::ImageData const &image, std::uint32_t const size) noexcept {
+    auto const side = static_cast<int>(size);
+    return image.compressed or image.extent != core::ivec2{side, side};
+}
+
 // `image` as an RGBA8 image `size` texels square with one level, resampled in linear colour.
 core::ImageHandle colorImageOf(core::ImageHandle const &image, std::uint32_t const size,
                                core::TextureSampler const &sampler) {
     auto const side = static_cast<int>(size);
-    if (not image->compressed and image->extent == core::ivec2{side, side}) {
-        return image;
-    }
     auto const srgb = image->encoding == core::ColorEncoding::Srgb;
     auto const texels = rgba8LevelZero(*image);
     auto source = FloatImage{image->extent.x, image->extent.y, std::vector<core::vec4>(texels.size() / 4)};
@@ -214,6 +220,12 @@ bool TextureLayout::fitsCompressedPool(core::ImageData const &image) const noexc
     auto const size = static_cast<std::uint32_t>(image.extent.x);
     return image.extent.x == image.extent.y and isPowerOfTwo(size) and size <= limits.maxSize
        and image.levels.size() >= core::fullLevelCount(image.extent);
+}
+
+TextureLocation TextureLayout::locate(core::TextureId const id, std::uint32_t const slot) {
+    auto const location = TextureLocation{slot, takeLayer(slot), ++placements};
+    locations[id] = location;
+    return location;
 }
 
 std::uint32_t TextureLayout::takeLayer(std::uint32_t const slot) {
@@ -276,10 +288,9 @@ void TextureLayout::place(core::TextureUpsert const &upsert, SceneUpdate &update
     if (fitsCompressedPool(image)) {
         auto const size = static_cast<std::uint32_t>(image.extent.x);
         if (auto const slot = compressedSlot(*image.compressed, size, update)) {
-            auto const layer = takeLayer(*slot);
-            locations[upsert.id] = TextureLocation{*slot, layer};
-            update.textureUploads.push_back(
-                TextureUpload{upsert.id, refOf(*slot, layer, size), upsert.image, core::fullLevelCount(image.extent)});
+            auto const location = locate(upsert.id, *slot);
+            update.textureUploads.push_back(TextureUpload{upsert.id, refOf(*slot, location.layer, size), upsert.image,
+                                                          core::fullLevelCount(image.extent)});
             return;
         }
     }
@@ -289,10 +300,44 @@ void TextureLayout::place(core::TextureUpsert const &upsert, SceneUpdate &update
     if (not slot) {
         return;
     }
-    auto const layer = takeLayer(*slot);
-    locations[upsert.id] = TextureLocation{*slot, layer};
-    update.textureUploads.push_back(
-        TextureUpload{upsert.id, refOf(*slot, layer, size), colorImageOf(upsert.image, size, sampler), 1});
+    auto const location = locate(upsert.id, *slot);
+    auto const ref = refOf(*slot, location.layer, size);
+    if (not needsConversion(image, size)) {
+        update.textureUploads.push_back(TextureUpload{upsert.id, ref, upsert.image, 1});
+        return;
+    }
+    converting.push_back(Conversion{upsert.id, location.placement, ref,
+                                    conversions->start([image = upsert.image, size, sampler] {
+                                        return colorImageOf(image, size, sampler);
+                                    }),
+                                    frame});
+}
+
+// A conversion that failed fails the frame once the others are delivered; its texture
+// keeps its layer and shows its factor until it is upserted again.
+void TextureLayout::deliverConversions(SceneUpdate &update) {
+    auto const waits = delivery == ConversionDelivery::Deterministic;
+    auto const started = std::stable_partition(converting.begin(), converting.end(), [&](Conversion const &conversion) {
+        return conversion.frame == frame
+            or (not waits and conversion.image.wait_for(std::chrono::seconds{0}) != std::future_status::ready);
+    });
+    auto failure = std::exception_ptr{};
+    for (auto it = started; it != converting.end(); ++it) {
+        try {
+            auto image = it->image.get();
+            auto const found = locations.find(it->id);
+            if (found != locations.end() and found->second.placement == it->placement) {
+                update.textureUploads.push_back(TextureUpload{it->id, it->ref, std::move(image), 1});
+            }
+        } catch (...) {
+            failure = failure ? failure : std::current_exception();
+        }
+    }
+    converting.erase(started, converting.end());
+    ++frame;
+    if (failure) {
+        std::rethrow_exception(failure);
+    }
 }
 
 void TextureLayout::remove(core::TextureId const id) {
@@ -307,6 +352,7 @@ void TextureLayout::remove(core::TextureId const id) {
 void TextureLayout::reset() noexcept {
     pools = {};
     locations.clear();
+    converting.clear();
 }
 
 std::optional<TextureLocation> TextureLayout::locationOf(core::TextureId const id) const {

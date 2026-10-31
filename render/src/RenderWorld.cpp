@@ -1,12 +1,11 @@
 #include "RenderWorld.h"
 
-#include "Bvh.h"
-
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
 #include <string>
 #include <unordered_set>
+#include <utility>
 #include <variant>
 
 namespace lr::render {
@@ -251,22 +250,45 @@ std::uint32_t RenderWorld::takeSlot(std::vector<std::uint32_t> &freeSlots, std::
     return end++;
 }
 
-void RenderWorld::upsertMesh(core::MeshUpsert const &upsert, SceneUpdate &update) {
-    auto const &data = *upsert.mesh;
-    auto const found = meshes.find(upsert.id);
-    auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
+RenderWorld::RenderWorld(TextureLimits const &limits)
+    : ownParallel(makeSerialFor()), ownConversions(makeImmediateConversions()), parallel(ownParallel.get()),
+      textures(limits, *ownConversions) {}
 
-    auto geometry = encodeGeometry(data, vertexEnd, indexEnd);
-    vertexEnd += static_cast<std::uint32_t>(geometry.vertices.size());
-    indexEnd += static_cast<std::uint32_t>(geometry.indices.size());
+RenderWorld::RenderWorld(TextureLimits const &limits, ParallelFor &parallel_, ImageConversions &conversions,
+                         ConversionDelivery const delivery)
+    : parallel(&parallel_), textures(limits, conversions, delivery) {}
 
-    auto const bounds = core::boundsOf(data);
-    auto const gpu =
-        GpuMesh{geometry.firstVertex, geometry.firstIndex, static_cast<std::uint32_t>(data.indices.size() / 3),
-                bounds.min,           bounds.max,          static_cast<std::uint32_t>(geometry.vertices.size())};
-    meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}};
-    update.geometry.push_back(std::move(geometry));
-    update.meshes.push_back(Indexed<GpuMesh>{slot, gpu});
+// Each mesh's vertices and indices go after those before it, as they come; the encoding
+// and the bounds of each are an item of `parallel`.
+void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &upserts, SceneUpdate &update) {
+    auto geometry = std::vector<GeometryUpload>(upserts.size());
+    auto bounds = std::vector<core::Aabb>(upserts.size());
+    auto firsts = std::vector<std::pair<std::uint32_t, std::uint32_t>>{};
+    firsts.reserve(upserts.size());
+    for (auto const &upsert : upserts) {
+        firsts.emplace_back(vertexEnd, indexEnd);
+        vertexEnd += static_cast<std::uint32_t>(upsert.mesh->positions.size());
+        indexEnd += static_cast<std::uint32_t>(upsert.mesh->indices.size());
+    }
+    parallel->run(upserts.size(), [&](std::size_t const index) {
+        auto const &data = *upserts[index].mesh;
+        geometry[index] = encodeGeometry(data, firsts[index].first, firsts[index].second);
+        bounds[index] = core::boundsOf(data);
+    });
+    for (auto index = std::size_t{0}; index < upserts.size(); ++index) {
+        auto const &upsert = upserts[index];
+        auto const found = meshes.find(upsert.id);
+        auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
+        auto const gpu = GpuMesh{geometry[index].firstVertex,
+                                 geometry[index].firstIndex,
+                                 static_cast<std::uint32_t>(upsert.mesh->indices.size() / 3),
+                                 bounds[index].min,
+                                 bounds[index].max,
+                                 static_cast<std::uint32_t>(geometry[index].vertices.size())};
+        meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}};
+        update.geometry.push_back(std::move(geometry[index]));
+        update.meshes.push_back(Indexed<GpuMesh>{slot, gpu});
+    }
 }
 
 void RenderWorld::upsertMaterial(core::MaterialUpsert const &upsert, SceneUpdate &update) {
@@ -395,9 +417,18 @@ void RenderWorld::removeLight(core::LightId const id, SceneUpdate &update) {
     lights.pop_back();
 }
 
-void RenderWorld::buildBlas(MeshRecord &record, SceneUpdate &update) {
+void RenderWorld::buildBlases(std::vector<MeshRecord *> const &records, SceneUpdate &update) {
+    auto built = std::vector<Bvh>(records.size());
+    parallel->run(records.size(), [&](std::size_t const index) {
+        built[index] = buildBvh(triangleBounds(*records[index]->data), BvhBuildConfig{4});
+    });
+    for (auto index = std::size_t{0}; index < records.size(); ++index) {
+        placeBlas(*records[index], built[index], update);
+    }
+}
+
+void RenderWorld::placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &update) {
     auto const &data = *record.data;
-    auto const bvh = buildBvh(triangleBounds(data), BvhBuildConfig{4});
     record.blasRoot = bvh.nodes.empty() ? noBvhNode() : blasNodeEnd;
     record.blasBounds = bvh.nodes.empty() ? core::Aabb{} : boundsOf(bvh.nodes[0]);
     update.blasRoots.push_back(Indexed<tc::uint>{record.slot, record.blasRoot});
@@ -443,12 +474,14 @@ void RenderWorld::buildTlas(SceneUpdate &update) {
 }
 
 void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update) {
+    auto records = std::vector<MeshRecord *>{};
     for (auto const &upsert : delta.meshes) {
         auto const found = meshes.find(upsert.id);
         if (found != meshes.end()) {
-            buildBlas(found->second, update);
+            records.push_back(&found->second);
         }
     }
+    buildBlases(records, update);
     if (not delta.meshes.empty() or not delta.instances.empty() or not delta.removed.instances.empty()) {
         buildTlas(update);
     }
@@ -492,9 +525,7 @@ void RenderWorld::keepHierarchies(SceneUpdate &update) {
         records.push_back(&record);
     }
     std::sort(records.begin(), records.end(), [](MeshRecord const *a, MeshRecord const *b) { return a->slot < b->slot; });
-    for (auto *const record : records) {
-        buildBlas(*record, update);
-    }
+    buildBlases(records, update);
     buildTlas(update);
     update.capacity = capacity();
     update.tlasNodeCount = tlasNodeCount;
@@ -512,10 +543,9 @@ SceneCapacity RenderWorld::capacity() const noexcept {
 SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     validate(delta);
     auto update = SceneUpdate{};
-    for (auto const &upsert : delta.meshes) {
-        upsertMesh(upsert, update);
-    }
+    upsertMeshes(delta.meshes, update);
     applyTextures(delta, update);
+    textures.deliverConversions(update);
     for (auto const &upsert : delta.materials) {
         upsertMaterial(upsert, update);
     }

@@ -311,7 +311,10 @@ struct RendererImpl final : Renderer {
           timers(config.gpuTimers and gpu->info().timers),
           chosen(chooseFor(*gpu, config)),
           models(*gpu),
-          world(textureLimitsOf(gpu->info().limits, config.maxTextureSize)),
+          worldParallel(makeFramePoolFor(*config.runtime)),
+          conversions(makeBackgroundConversions(*config.runtime)),
+          world(textureLimitsOf(gpu->info().limits, config.maxTextureSize), *worldParallel, *conversions,
+                config.textureConversions),
           frames(FrameQueueConfig{gpu.get(), &scope, &deviceGeneration, framesInFlight, timers,
                                   config.textureStreamingBytes, [this](tc::Device &device) {
                                       verifyCapabilities(*makeKernelCheck(device), chosen, models.programs());
@@ -467,6 +470,8 @@ private:
     runtime::SerialThread renderThread;
     TargetsImpl targetSet;
     PipelinesImpl pipelineSet;
+    std::unique_ptr<ParallelFor> worldParallel;        // the world's, on the frame pool
+    std::unique_ptr<ImageConversions> conversions;     // the world's, on the background pool
     RenderWorld world;                                 // render thread
     FrameHistories histories{kHistoryKeepFrames};      // render thread
     TemporalViews temporalViews{kHistoryKeepFrames};   // render thread

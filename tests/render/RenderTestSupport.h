@@ -36,6 +36,8 @@ struct HarnessOptions {
     render::VariantUse subgroups = render::VariantUse::Auto;
     render::VariantUse singlePassVisibility = render::VariantUse::Auto;
     render::VariantUse rayQueries = render::VariantUse::Auto;
+    // So that tests know which frame shows a converted texture.
+    render::ConversionDelivery textureConversions = render::ConversionDelivery::Deterministic;
 };
 
 // A renderer with its own small runtime.
@@ -55,6 +57,7 @@ struct RenderHarness {
         config.subgroups = options.subgroups;
         config.singlePassVisibility = options.singlePassVisibility;
         config.rayQueries = options.rayQueries;
+        config.textureConversions = options.textureConversions;
         renderer = render::makeRenderer(config);
     }
 
