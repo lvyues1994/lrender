@@ -348,8 +348,8 @@ TEST_CASE("submitting a view of an unknown target throws at once") {
                     std::invalid_argument);
 }
 
-// The GPU backends on Mesa's software devices against the CPU backend. Skipped where those
-// devices are missing, unless LRENDER_TEST_REQUIRE_GPU is set.
+// The GPU backends on test::deviceFor() their names against the CPU backend. Skipped where
+// those devices are missing, unless LRENDER_TEST_REQUIRE_GPU is set.
 TEST_CASE("every GPU backend renders what the CPU backend renders") {
     auto delta = [] {
         auto scene = quadScene();
@@ -380,7 +380,7 @@ TEST_CASE("every GPU backend renders what the CPU backend renders") {
         CAPTURE(backend);
         auto harness = std::unique_ptr<RenderHarness>{};
         try {
-            harness = std::make_unique<RenderHarness>(backend, "llvmpipe");
+            harness = std::make_unique<RenderHarness>(backend, test::deviceFor(backend));
         } catch (tc::DeviceError const &error) {
             if (requireGpu) {
                 FAIL(error.what());

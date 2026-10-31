@@ -112,4 +112,4 @@ for (;;) {
 
 自定义材质模型的写法见 `render/include/lr/render/MaterialModel.h` 开头的例子，测试里的 `tests/render/TestMaterialModels.h` 是一个完整的例子。
 
-GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。SDL 的测试用 offscreen（或 dummy）视频驱动，不打开可见的窗口，SDL 启动不了时跳过。
+GPU 后端的测试跑在 Mesa 的软件设备（llvmpipe、lavapipe）上，没有这些设备时跳过；设置 `LRENDER_TEST_REQUIRE_GPU=1` 后改为失败，CI 就是这样运行的。设置 `LRENDER_TEST_DEVICE=NVIDIA`（设备名的一部分）可以改在硬件设备上跑，验证层的用法见 `docs/architecture.md` 的“验证与里程碑”。SDL 的测试用 offscreen（或 dummy）视频驱动，不打开可见的窗口，SDL 启动不了时跳过。

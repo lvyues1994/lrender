@@ -25,7 +25,7 @@ FetchContent_Declare(stackfull
 
 FetchContent_Declare(compute_shaders
     GIT_REPOSITORY https://github.com/lvyues1994/compute_shaders.git
-    GIT_TAG 915657a5d625fefb608b51befc5871f9ebd069db
+    GIT_TAG 2f5b9f96a11b629ec5e0d28003229ba813773191
     SYSTEM)
 
 # The asset module's: tl::expected for AssetResult, cgltf for glTF, stb_image for PNG and

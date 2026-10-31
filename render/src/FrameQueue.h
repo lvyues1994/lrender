@@ -94,6 +94,7 @@ private:
     std::deque<InFlight> inFlight;
     std::vector<Outcome> outcomes;
     std::exception_ptr lostWith; // what the frames prepared for a lost device fail with
+    tc::Submission lastSubmission; // of the frame recorded last, which texture copies follow
     // Lost textures of frames that failed, for the next frame that succeeds to report.
     std::vector<core::TextureId> unreportedLostTextures;
 };

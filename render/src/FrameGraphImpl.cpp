@@ -147,7 +147,7 @@ FrameGraphBuilder::DeclaredHistory GraphBuilder::declareHistory(ResourceDesc des
 }
 
 void GraphBuilder::addReadback(std::uint32_t const resource, ReadbackHandler handler) {
-    if (resource >= resources.size() or not resources[resource].desc.hostVisible) {
+    if (resource >= resources.size() or resources[resource].desc.access != BufferAccess::Readback) {
         throw std::logic_error{"lr::render: readback() needs a buffer from createReadbackBuffer()"};
     }
     readbacks.push_back(CompiledReadback{resource, std::move(handler)});
@@ -211,7 +211,7 @@ CompiledGraph GraphBuilder::compile() && {
 }
 
 std::shared_ptr<void> ResourcePool::acquire(ResourceDesc const &desc, tc::Device &device) {
-    auto &free = available[Key{desc.type, desc.size, desc.hostVisible}];
+    auto &free = available[Key{desc.type, desc.size, desc.access}];
     if (free.empty()) {
         return desc.create(device);
     }
@@ -221,7 +221,7 @@ std::shared_ptr<void> ResourcePool::acquire(ResourceDesc const &desc, tc::Device
 }
 
 void ResourcePool::release(ResourceDesc const &desc, std::shared_ptr<void> resource) {
-    available[Key{desc.type, desc.size, desc.hostVisible}].push_back(std::move(resource));
+    available[Key{desc.type, desc.size, desc.access}].push_back(std::move(resource));
 }
 
 GraphRun::GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device)

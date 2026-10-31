@@ -129,7 +129,9 @@ TEST_CASE("accumulating frames back to back gives the image accumulating them on
             for (auto frame = 0u; frame < kFrames; ++frame) {
                 frames.push_back(render::FrameDesc{frame == 0 ? quadScene() : core::RenderWorldDelta{}, {view}});
             }
-            return *renderBackToBack(*harness.renderer, std::move(frames)).back().result->views[0].image;
+            auto const last = renderBackToBack(*harness.renderer, std::move(frames)).back();
+            REQUIRE(last.result.has_value());
+            return *last.result->views[0].image;
         }
         auto last = harness.render(render::FrameDesc{quadScene(), {view}});
         for (auto frame = 1u; frame < kFrames; ++frame) {
@@ -140,7 +142,7 @@ TEST_CASE("accumulating frames back to back gives the image accumulating them on
     test::forEachBackend(test::HarnessOptions{}, [&finalImage](RenderHarness &harness) {
         auto options = test::HarnessOptions{};
         options.backend = harness.renderer->deviceInfo().backend;
-        options.device = options.backend == "cpu" ? "" : "llvmpipe";
+        options.device = test::deviceFor(options.backend);
         options.framesInFlight = 1;
         auto oneAtATime = RenderHarness{options};
 

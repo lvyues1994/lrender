@@ -48,9 +48,11 @@ TEST_CASE("each device gets the variants it runs, and none it is told not to use
         CHECK(chosen.singlePassVisibility == tc::uses(info.limits.features, tc::KernelFeature::Int64Atomics));
         CHECK(chosen.subgroupSize == info.limits.subgroupSize);
         // Mesa's llvmpipe has neither on OpenGL and OpenGL ES; lavapipe has both.
-        auto const both = info.backend == "cpu" or info.backend == "vulkan";
-        CHECK(chosen.subgroups == both);
-        CHECK(chosen.singlePassVisibility == both);
+        if (info.backend == "cpu" or info.deviceName.find("llvmpipe") != std::string::npos) {
+            auto const both = info.backend == "cpu" or info.backend == "vulkan";
+            CHECK(chosen.subgroups == both);
+            CHECK(chosen.singlePassVisibility == both);
+        }
     });
 
     auto options = test::HarnessOptions{};
@@ -192,7 +194,7 @@ ProbedFrame renderBusyScene(RenderHarness &harness) {
 // The same backend and device as `harness`, with `options`' variants.
 test::HarnessOptions sameDevice(RenderHarness const &harness, test::HarnessOptions options) {
     options.backend = harness.renderer->deviceInfo().backend;
-    options.device = options.backend == "cpu" ? "" : "llvmpipe";
+    options.device = test::deviceFor(options.backend);
     return options;
 }
 

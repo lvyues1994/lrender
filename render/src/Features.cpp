@@ -386,13 +386,17 @@ struct ShadowFeature final : RenderFeature {
         auto const texels = static_cast<std::size_t>(resolution) * resolution;
         auto const depths = cascades.size() * texels;
         auto const map = graph.createBuffer<tc::uint>("shadow map", shadowHeaderWords() + depths);
+        auto const header = graph.createUploadBuffer<tc::uint>("shadow map header", shadowHeaderWords());
 
         auto &clearPass = graph.addPass("clear shadow map");
+        clearPass.write(header);
         clearPass.write(map);
-        clearPass.record([map, header = shadowHeader(cascades, resolution), depths](PassContext &context) {
-            auto &buffer = context.buffer(map);
-            std::copy(header.begin(), header.end(), buffer.data());
-            context.device().uploadBuffer(buffer, 0, header.size());
+        clearPass.record([map, header, words = shadowHeader(cascades, resolution), depths](PassContext &context) {
+            auto &device = context.device();
+            auto &staged = context.buffer(header);
+            std::copy(words.begin(), words.end(), staged.data());
+            device.uploadBuffer(staged);
+            device.copyBuffer(staged, 0, context.buffer(map), 0, words.size() * sizeof(tc::uint));
             clearWords(context, map, shadowHeaderWords(), depths, 0xFFFFFFFFu);
         });
 

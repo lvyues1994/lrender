@@ -246,15 +246,25 @@ struct MotionProbe final : render::RenderFeature {
     std::shared_ptr<std::vector<core::vec2>> motion = std::make_shared<std::vector<core::vec2>>();
 };
 
-// The CPU backend, then each GPU backend on Mesa's software devices, which have no sync
-// files. GPU backends that cannot start are skipped, unless LRENDER_TEST_REQUIRE_GPU is set.
+// The device GPU backends test on: Mesa's software devices, which have no sync files, or
+// the one whose name contains LRENDER_TEST_DEVICE.
+inline std::string deviceFor(std::string const &backend) {
+    if (backend == "cpu") {
+        return "";
+    }
+    auto const *const device = std::getenv("LRENDER_TEST_DEVICE");
+    return device != nullptr ? device : "llvmpipe";
+}
+
+// The CPU backend, then each GPU backend on deviceFor() its name. GPU backends that cannot
+// start are skipped, unless LRENDER_TEST_REQUIRE_GPU is set.
 template <class Fn>
 void forEachBackend(HarnessOptions options, Fn const &fn) {
     auto const requireGpu = std::getenv("LRENDER_TEST_REQUIRE_GPU") != nullptr;
     for (auto const &backend : tc::availableBackends()) {
         CAPTURE(backend);
         options.backend = backend;
-        options.device = backend == "cpu" ? "" : "llvmpipe";
+        options.device = deviceFor(backend);
         auto harness = std::unique_ptr<RenderHarness>{};
         try {
             harness = std::make_unique<RenderHarness>(options);

@@ -266,6 +266,7 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 
 - 一条管线就是按阶段排好的一组 feature。`PipelineRegistry` 提供两条内置管线，用户可以在它们的基础上按阶段插入自己的 feature，组成新的管线。
 - 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，分配临时资源（按描述符在帧之间复用），维护按 `ViewId` 保存的历史资源。
+- 帧图 buffer 按除了设备还有谁碰它分三种（`BufferAccess`）：`createBuffer` 是只在设备上的 `tc::DeviceBuffer`，没有主机端副本，只能由 kernel 和 `copyBuffer` 读写，帧开始时内容未定义；`createUploadBuffer` 带主机端副本，pass 录制时写好再 `uploadBuffer`；`createReadbackBuffer` 是 `createBuffer` 分配的映射内存，设备原地写，帧完成之后由主机读。中间结果都是第一种，GPU 后端不为它们分配主机内存。三种描述不同，资源池不会把一种当成另一种复用。
 - pass 按编译后的顺序在 GPU 线程上录制。屏障由 tc 按实际的读写冲突插入，互不相关的 pass 可以在设备上重叠，帧图不需要自己计算屏障。
 - `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`（可以指定读参数 buffer 的第几项），同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。
 - 历史资源：`graph.history<G>(name, extent)` 返回一对图像 `{previous, current, valid}`，同一个 `ViewId` 和名字在每个用到它的帧里拿到同一对，并且互换一次：上一帧写进 `current` 的内容，这一帧从 `previous` 读。互换而不是原地读写，是因为 GLES 3.1 不允许 kernel 同时读写 r32 以外格式的存储图像。两张图像在帧开始时都算已写入，写 `current` 的 pass 总会保留。第一次用到、尺寸或格式变了、或者被释放过之后，`valid` 为假。记录在渲染线程上（只是 id），图像在 GPU 线程上按 id 创建；连续 60 帧没用到、或者视图的目标已经销毁，就释放。TAA 也用它。
@@ -312,7 +313,7 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - 渲染线程上的 `TextureLayout` 决定纹理放进哪个池的哪一层：压缩图像在设备有这种格式的数组、是正方形 2 的幂、不超过上限、带完整 mip 链、还有空的压缩槽时，原样进压缩池，所有级别都从图像拷贝；其余的图像（包括设备不支持的压缩格式）在渲染线程上用 `tc::decodeCompressed` 解码成 RGBA8，在线性颜色里重采样成下一个 2 的幂的正方形（缩小用面积平均，放大用按寻址方式环绕的双线性；超过上限的缩小到上限），进 RGBA8 池，只上传第 0 层。RGBA8 池满了就把层数翻倍：GPU 线程建一张更大的图像，用 kernel 逐层逐级拷过去，旧图像进退役列表。压缩池不能被 kernel 写，也没有图像到图像的拷贝，所以一开始就按约 32 MiB 分配层数，满了的新纹理改走解码。移除纹理时它的层回到空闲列表。
 - RGBA8 池存纹理自己的编码（sRGB 纹理存 sRGB 值），kernel 采样之后再解码。下采样 kernel 在线性颜色里求 2×2 平均（黑白相间的棋盘格在第 1 层是线性 0.5，而不是 sRGB 平均出来的 0.21），所以 mip 级别是对的；代价是纹素之间的双线性插值发生在 sRGB 值上，高对比边缘的插值偏暗。tc 没有 sRGB 格式，要完全正确只能存 RGBA16F，内存翻倍，现在没有这样做。
 - compute 没有导数，`texture()` 只采第 0 层，所以着色时用射线微分算 LOD：像素右边和下边相邻像素中心的相机射线与三角形所在平面相交，求出那里的 UV，与本像素 UV 的距离取较大者就是足迹，LOD = log2(足迹 × 边长)，再用 `textureLod`（`Mip::Linear`）三线性采样。各向同性，斜看时偏模糊。
-- 新纹理流入池时，GPU 线程把数据拷进当前帧的暂存段（`createBuffer` 分配的映射内存，每个在途帧一段，第一次用到时才分配），再 `copyBufferToImage` 写进对应的层和 mip 级别；拷贝和前后的 dispatch 一样在设备时间线上排序。每段从录制第 k 帧时用到的是第 k - framesInFlight 帧用过的那一段，那一帧已经做完，主机写它不会和设备读冲突。每帧最多拷 `RendererConfig::textureStreamingBytes`（默认 8 MiB），按 mip 级别排队，一帧放不下的留到下一帧；`copyBufferToImage` 只能整级拷贝，所以比预算还大的单个级别独占一帧，暂存段为它临时变大。RGBA8 纹理的第 0 层到了，同一帧里接着用下采样 kernel 逐级生成其余各级（每次 dispatch 一层，因为 llvmpipe 的 `texelFetch` 在一次 dispatch 里层号不同时会读错层）。最后一级写完，纹理才算驻留，材质才引用它；之前材质只用因子。
+- 新纹理流入池时，GPU 线程在录制一帧的开头把数据拷进暂存段（`createBuffer` 分配的映射内存，每个在途帧一段，第一次用到时才分配），再在 tc 的传输队列（`device.transfers()`）上 `copyBufferToImage` 写进对应的层和 mip 级别，马上提交。设备有独立的传输队列（`DeviceInfo::separateTransfers`，比如 NVIDIA 的专用传输队列族）时，拷贝和这一帧的 dispatch 同时在设备上进行；没有时拷贝进设备自己的时间线，按调用顺序排序。两条时间线只在 `waitFor` 处排序：拷贝先等上一帧的提交，因为上一帧可能还在采样要被覆盖的层；这一帧之前建了或换了池时，改等到此为止的设备时间线，因为新图像的布局转换录在那上面。这一帧提交之前，设备等拷贝的提交（`device.waitFor(submission)`），再用下采样 kernel 逐级生成 RGBA8 纹理的其余各级（每次 dispatch 一层，因为 llvmpipe 的 `texelFetch` 在一次 dispatch 里层号不同时会读错层）。最后一级写完，纹理才算驻留，材质从下一帧开始引用它，之前只用因子；所以纹理最早在上传它的那一帧的下一帧出现。录制第 k 帧时用的暂存段是第 k - framesInFlight 帧用过的那一段，那一帧已经做完，它的提交又等过它的拷贝，所以主机写暂存段不会和设备读冲突。每帧最多拷 `RendererConfig::textureStreamingBytes`（默认 8 MiB），按 mip 级别排队，一帧放不下的留到下一帧；`copyBufferToImage` 只能整级拷贝，所以比预算还大的单个级别独占一帧，暂存段为它临时变大。
 - 材质里的引用由 GPU 线程填：`SceneUpdate` 里的材质带着纹理 ID，`DeviceScene` 按 `TexturePool` 的驻留情况把它们换成引用，驻留情况一变就重写所有材质。替换一个纹理（同一个 ID 再 upsert）时，旧数据马上不再被引用，新数据写完之前只用因子。
 - 压缩格式按 `DeviceLimits::compressedArrayFormats` 选，因为要放进数组（Adreno 的 GLES 上 BC4、BC5 只能是 2D）。资产离线烘焙成 KTX2，桌面一份 BC、移动端一份 ASTC 或 ETC2；KTX2 的块顺序就是 `copyBufferToImage` 要求的顺序，可以直接拷贝。lavapipe 没有 ETC2，测试里这条路走解码。经 asset 加载的图片，压缩池放不下的已经在后台池上解成 RGBA8（见 asset 的“压缩格式”）；宿主直接交来的压缩图像仍在渲染线程上解码，重采样也在渲染线程上。
 - `RenderWorld` 只把图像句柄交给 GPU 线程，自己不留；`TexturePool` 写完最后一级就放掉它，纹理在整个系统里只有设备上这一份（宿主自己留的句柄除外）。设备丢失后，渲染线程在下一帧把放置过的所有纹理记为丢失，`FrameResult::lostTextures` 列出需要重新提交的 `TextureId`，在此之前材质只用因子；那一帧失败的话，由下一个成功的帧报告。用了 scene 时，`World` 留着自己登记的图像句柄，宿主把这个列表交给 `WorldResources::resubmitTextures`，下一个增量重新提交它们（`lrender_view` 就是这样做的）。
@@ -343,7 +344,7 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 - 上传在调用时就把主机端的数据拷走：Vulkan 后端 `memcpy` 进这次提交自己的暂存内存（提交完成之前不复用），再录一条 `vkCmdCopyBuffer`，屏障跟踪跨提交保留；GL 后端用 `glBufferData` / `glBufferSubData`，它们本身就是拷贝；CPU 后端的 kernel 在 `execute()` 时已经算完。所以帧 k 的场景更新可以在帧 k-1 还在设备上时录制，主机端表之后随便改。例外是 `createBuffer` 分配的映射内存，设备原地读写，回读 buffer 就是这种，它们由帧图在帧完成之前一直持有。
 - 表变大时换上一张新表，旧表进这一帧的退役列表，帧完成之后才释放。tc 自己也会把设备端的副本推迟到用过它的提交完成之后再销毁（Vulkan 的 graveyard，GL 删除对象时驱动本来就推迟），退役列表让主机端对象的寿命也不依赖这一点。
 - 每个内置 kernel 最多用 8 个 storage buffer、4 个存储图像、16 个采样纹理，push constant 不超过 128 字节；8 个 storage buffer 高于规范下限的 4 个，不满足的设备在启动时由 `checkKernel` 报告出来。着色 kernel 正好用满 8 个（实例、顶点、索引、材质、灯光、可见实例、像素列表、阴影贴图），所以可见实例列表带上网格的首索引和首顶点，省掉网格表；阴影级联的矩阵放在阴影贴图 buffer 的开头，省掉一个参数 buffer；模型的像素列表每项是（像素、三角形），着色 kernel 因此不必再读逐像素的三角形 buffer，列表的表头（每个模型的长度和起点）放在同一个 buffer 的开头。透明混合 kernel 的第 8 个是片元链表，片元和它们的表头放在同一个 buffer 里。TAA 的运动 pass 要三个矩阵，超过 128 字节，所以放进一个小 buffer，由 pass 每帧上传。
-- 每帧变化的小块数据（阴影级联的矩阵）由 pass 写进帧图 buffer 的主机端副本，再 `uploadBuffer` 一段：帧图 buffer 按在途帧各取一份，上传在调用时拷走，所以不会和在途帧冲突。
+- 每帧变化的小块数据由 pass 写进 upload buffer 的主机端副本，再 `uploadBuffer` 一段：帧图 buffer 按在途帧各取一份，上传在调用时拷走，所以不会和在途帧冲突。阴影级联的矩阵在只在设备上的阴影贴图 buffer 的开头，所以先上传进一个 upload buffer，再 `copyBuffer` 过去。
 - HDR 中间目标用 `RGBA16F`，它在 GLES 3.1 和 Vulkan 上都是强制支持的存储格式，也能线性过滤。
 
 #### 回读
@@ -574,7 +575,8 @@ IO       │          等 N 完成 ───────────────
 | 交换链、窗口上屏、vsync | tc 是无窗口的 compute 框架 | present 模块；Android 上用 `ASurfaceControl` 零拷贝上屏 |
 | 无绑定资源 | tc 以 GLES 3.1 为底线，它没有 descriptor indexing | 按尺寸档分组的纹理数组 |
 | 任务优先级 | std::execution 没有这个概念 | 帧池与后台池分开 |
-| 光栅化管线、硬件光线追踪 | 超出 compute | 计算光栅化、软件 BVH |
+| 光栅化管线 | 超出 compute | 计算光栅化；硬件光栅由 lrender 自己的模块负责，提案见 `hardware-raster.md` |
+| 光追管线（raygen、hit 着色器、SBT） | 超出 compute | 软件 BVH；kernel 里的 ray query 属于 compute，tc 已经提供，路径追踪器还没用上 |
 | 无异常构建 | 会改变 co2 和 tc 的错误模型 | 引擎要求开启异常 |
 | Windows、macOS | 超出 stackfull 声明的目标平台 | 引擎只支持 Linux 与 Android |
 | CPU 后端的 kernel 热重载 | CPU 后端运行的是编译好的 C++ | 重新加载只在 GPU 后端提供 |
@@ -615,7 +617,7 @@ lrender/
 
 - 命名空间为 `lr::<module>`，每个模块一个 CMake 目标，目标图与模块图一致。
 - 作为库交付：要提供 install 规则和 `find_package(lrender)` 用的包配置，每个可选层单独导出为一个组件。现在还没有，因为依赖库还不都有 install 规则，等它们有了再加。
-- compute_shaders 至少要固定到 `915657a`：按提交取计时、只在设备上的图像、压缩纹理数组和 `FencedSubmission` 从这个提交开始才有。
+- compute_shaders 至少要固定到 `2f5b9f9`：只在设备上的 buffer 和 `copyBuffer` 从 `9cec48f` 开始才有，传输队列从 `c3660eb` 开始；`2f5b9f9` 让同一个 EGL display 上的 OpenGL 设备共用一次初始化，在这之前销毁一个设备（或者找别的设备时跳过一个正在用的 display）会把 display 一起终止，而测试里常常同时开着两个设备。
 - 平台取各库支持范围的交集：Linux x86_64/aarch64 和 Android arm64。
 - 主机构建依赖 libclang-18-dev 和 glslang-tools（tc 转译器）；Android 交叉编译时使用主机构建出的转译器。发布构建加 `-DTC_PROGRAM_RELOAD=OFF`。
 
@@ -632,6 +634,8 @@ lrender/
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
 | present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
 
+Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设置 `LRENDER_TEST_DEVICE`（设备名的一部分，比如 `NVIDIA`）后，GPU 后端的测试改在那个设备上跑；Vulkan 上再打开验证层的同步检查（`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`），检查两条时间线之间的排序。同步检查不能用 Ubuntu 24.04 自带的 1.3.275 版验证层：它不认 timeline semaphore 上的等待，会把已经排好序的拷贝报成冲突；LunarG SDK 的 1.4.363 没有这个问题，去掉拷贝前的 `waitFor` 时它报出冲突，加上时没有。
+
 1. **M0** 工程骨架：CMake、presets、固定版本的依赖、runtime 模块、CI（debug、clang-debug、asan 三个预设，llvmpipe 与 lavapipe 上跑 GPU 后端，覆盖没有 sync file 的等待路径）。
 2. **M1** 渲染核心：`RenderWorld` 增量、帧图、可见性缓冲管线的最小版本（GPU 剔除与间接 dispatch、两遍可见性缓冲、基础 PBR 着色、色调映射），在 cpu 后端上配合 `lrender_cli` 建立金标准测试。
 3. **M2** 参考路径追踪，作为画质参照；Vulkan、OpenGL、GLES 与 CPU 的等价测试；打开设备计时器，定下每张表的布局和编码。
@@ -641,4 +645,4 @@ lrender/
 7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
 
-还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`。

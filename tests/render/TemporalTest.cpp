@@ -470,7 +470,8 @@ TEST_CASE("without temporal anti-aliasing nothing temporal runs and still frames
     auto harness = RenderHarness{options};
     auto view = test::viewOf(harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{24, 24}}),
                              sceneCamera());
-    auto const first = harness.render(test::frameOf(texturedScene(), view));
+    harness.render(test::frameOf(texturedScene(), view)); // its textures arrive in the next frame
+    auto const first = harness.render(test::frameOf({}, view));
     auto const second = harness.render(test::frameOf({}, view));
     auto const names = passNames(first.views[0]);
     CHECK(std::find(names.begin(), names.end(), "temporal motion") == names.end());

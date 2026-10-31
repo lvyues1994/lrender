@@ -152,10 +152,8 @@ TEST_CASE("overlapping transparent quads blend in depth order whichever comes fi
     test::forEachBackend(test::HarnessOptions{}, [&](RenderHarness &harness) {
         auto renderer = HdrRenderer{harness};
         auto const greenFirst = renderer.visibility(twoGlasses(true), camera);
-        auto other = RenderHarness{test::RenderHarness::withBackend(harness.renderer->deviceInfo().backend,
-                                                                    harness.renderer->deviceInfo().backend == "cpu"
-                                                                        ? ""
-                                                                        : "llvmpipe")};
+        auto const backend = harness.renderer->deviceInfo().backend;
+        auto other = RenderHarness{test::RenderHarness::withBackend(backend, test::deviceFor(backend))};
         auto otherRenderer = HdrRenderer{other};
         auto const blueFirst = otherRenderer.visibility(twoGlasses(false), camera);
 
@@ -200,8 +198,9 @@ TEST_CASE("a masked quad is cut out where its alpha falls below the cutoff, in b
     auto const camera = test::halfFillingCamera(1.0f, 4.0f);
     auto harness = RenderHarness{};
     auto renderer = HdrRenderer{harness};
+    renderer.visibility(std::move(delta), camera); // the texture arrives in the next frame
 
-    for (auto const &image : {renderer.visibility(delta, camera), renderer.pathTraced(delta, camera, 4)}) {
+    for (auto const &image : {renderer.visibility({}, camera), renderer.pathTraced({}, camera, 4)}) {
         auto cut = true;
         auto kept = true;
         for (auto y = 24; y < 40; ++y) {

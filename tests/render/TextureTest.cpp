@@ -15,6 +15,7 @@
 #include <cstdint>
 #include <memory>
 #include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -43,6 +44,12 @@ struct QuadView {
         auto const target = harness->renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{size, size}});
         view = test::viewOf(target, test::halfFillingCamera());
         view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
+    }
+
+    // The frame after `delta`'s, by which the textures it uploads have arrived.
+    std::vector<core::vec4> renderUploaded(core::RenderWorldDelta delta) {
+        render(std::move(delta));
+        return render({});
     }
 
     std::vector<core::vec4> render(core::RenderWorldDelta delta) {
@@ -87,11 +94,12 @@ tc::ivec4 patternTexel(int const x, int const y) { return tc::ivec4{x * 8, y * 8
 tc::ivec4 fillerTexel(int const x, int const y) { return tc::ivec4{x, y, 0, 255}; }
 
 // With a budget of one 32x32 RGBA8 level per frame, the texture behind three others of
-// that size streams in during the fourth frame. Until then the quad shows the factor.
+// that size is copied during the fourth frame and shows from the fifth. Until then the
+// quad shows the factor.
 TEST_CASE("a texture streams in over several frames, shows its factor until then, and the same texels on every "
           "backend") {
     constexpr auto kSize = 64;
-    constexpr auto kArrivalFrame = 3;
+    constexpr auto kArrivalFrame = 4;
     auto options = test::HarnessOptions{};
     options.textureStreamingBytes = 32 * 32 * 4;
     auto expected = std::vector<core::vec4>{};
@@ -144,7 +152,7 @@ TEST_CASE("mip levels are averaged in linear colour") {
                                                       }),
                            {}}};
 
-        auto const pixels = view.render(std::move(delta));
+        auto const pixels = view.renderUploaded(std::move(delta));
 
         auto const grey = std::all_of(pixels.begin(), pixels.end(), [](core::vec4 const &pixel) {
             return std::abs(pixel.x - 0.5f) < 0.01f and std::abs(pixel.y - 0.5f) < 0.01f
@@ -208,6 +216,7 @@ TEST_CASE("the level of detail is the log of the texels a pixel spans, and grows
         auto view = QuadView{harness, kSize};
         auto delta = quadWith(levelColoured(8.0f));
         delta.textures = {{kTexture, levelColouredImage(), {}}};
+        view.render(std::exchange(delta, core::RenderWorldDelta{})); // the texture arrives in the next frame
         for (auto const &pair : {std::pair{8.0f, 1.0f}, std::pair{8.0f * std::sqrt(2.0f), 1.5f},
                                  std::pair{16.0f, 2.0f}, std::pair{4.0f * std::pow(2.0f, 2.25f), 2.25f}}) {
             auto const repeats = pair.first;
@@ -313,7 +322,7 @@ TEST_CASE("hand-made BC1 and ETC2 textures sample to their decoded texels on eve
             auto delta = quadWith(test::emissiveTexture(kTexture));
             delta.textures = {{kTexture, image, {}}};
 
-            auto const difference = largestDifference(view.render(std::move(delta)), expected);
+            auto const difference = largestDifference(view.renderUploaded(std::move(delta)), expected);
 
             CAPTURE(difference);
             auto const tolerance = harness.renderer->deviceInfo().backend == "cpu" ? 1e-3f
@@ -331,7 +340,7 @@ TEST_CASE("a material whose texture is removed shows its factor alone") {
     delta.textures = {{kTexture, test::rgba8Image(core::ivec2{16, 16}, core::ColorEncoding::Linear,
                                                   [](int, int) { return tc::ivec4{255, 0, 0, 255}; }),
                        {}}};
-    CHECK(view.render(std::move(delta)).front().y == 0.0f);
+    CHECK(view.renderUploaded(std::move(delta)).front().y == 0.0f);
 
     auto removal = core::RenderWorldDelta{};
     removal.removed.textures = {kTexture};
@@ -345,21 +354,21 @@ TEST_CASE("a lost device lists the textures it held, which render again once ups
         auto view = QuadView{harness, 16};
         auto &pipelines = harness.renderer->pipelines();
         auto const lossy = pipelines.create(
-            render::PipelineDesc{view.view.pipeline, {std::make_shared<test::DeviceLossInjector>(2)}});
+            render::PipelineDesc{view.view.pipeline, {std::make_shared<test::DeviceLossInjector>(3)}});
         view.view.pipeline = lossy;
         auto const red = test::rgba8Image(core::ivec2{16, 16}, core::ColorEncoding::Linear,
                                           [](int, int) { return tc::ivec4{255, 0, 0, 255}; });
         auto delta = quadWith(test::emissiveTexture(kTexture));
         delta.textures = {{kTexture, red, {}}, {core::TextureId{2}, red, {}}};
 
-        CHECK(view.render(std::move(delta)).front().y == 0.0f);
+        CHECK(view.renderUploaded(std::move(delta)).front().y == 0.0f);
         CHECK_THROWS_AS(view.render({}), tc::DeviceError);
         auto const factorOnly = view.render({});
         CHECK(view.last.lostTextures == std::vector<core::TextureId>{kTexture, core::TextureId{2}});
         CHECK(factorOnly.front().y == 1.0f);
         auto again = core::RenderWorldDelta{};
         again.textures = {{kTexture, red, {}}};
-        CHECK(view.render(std::move(again)).front().y == 0.0f);
+        CHECK(view.renderUploaded(std::move(again)).front().y == 0.0f);
         CHECK(view.last.lostTextures.empty());
     });
 }
@@ -395,7 +404,8 @@ TEST_CASE("normal maps tilt the normal along the triangle's texture axes, alike 
         auto harness = RenderHarness{};
         auto view = QuadView{harness, kSize};
 
-        auto const centre = view.render(std::move(delta))[static_cast<std::size_t>(kSize / 4 * kSize / 2 + kSize / 4)];
+        auto const centre =
+            view.renderUploaded(std::move(delta))[static_cast<std::size_t>(kSize / 4 * kSize / 2 + kSize / 4)];
 
         auto const bumped = expected(tc::normalize(tilted));
         CAPTURE(centre.x);

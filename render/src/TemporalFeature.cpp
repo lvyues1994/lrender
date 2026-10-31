@@ -26,7 +26,7 @@ struct TemporalAntiAliasingFeature final : RenderFeature {
         auto const &temporal = *view.temporal;
         auto const visibility = graph.blackboard().get<VisibilityOutputs>();
         auto const history = graph.history<HdrFormat>("temporal anti-aliasing", view.extent);
-        auto const matrices = graph.createBuffer<tc::mat4>("temporal matrices", 3);
+        auto const matrices = graph.createUploadBuffer<tc::mat4>("temporal matrices", 3);
         auto const motion = graph.createBuffer<tc::vec2>("motion", pixelsOf(view.extent));
 
         auto &motionPass = graph.addPass("temporal motion");

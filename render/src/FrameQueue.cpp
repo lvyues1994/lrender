@@ -42,6 +42,7 @@ void FrameQueue::clear() noexcept {
     historyImages.clear();
     deviceScene = DeviceScene{};
     textures.clear();
+    lastSubmission = tc::Submission{};
 }
 
 void FrameQueue::advance(gpu::GpuContext &context) noexcept {
@@ -91,7 +92,7 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
 void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFlight &frame) {
     auto &device = *context.device;
     textures.apply(device, prepared.scene, frame.retired);
-    textures.stream(device, frame.retired);
+    textures.send(device, lastSubmission, frame.retired);
     deviceScene.apply(device, prepared.scene, textures, frame.retired);
     historyImages.release(prepared.releasedHistories, frame.retired);
     try {
@@ -101,8 +102,10 @@ void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFli
     } catch (...) {
         frame.failure = std::current_exception();
     }
+    textures.arrive(device);
     auto submitted = config.gpu->submit(context);
     frame.submission = submitted.submission;
+    lastSubmission = submitted.submission;
     watch(frame.index, std::move(submitted));
 }
 
@@ -219,6 +222,7 @@ void FrameQueue::loseDevice(gpu::GpuContext &context, std::exception_ptr const &
     historyImages.clear();
     deviceScene = DeviceScene{};
     textures.clear();
+    lastSubmission = tc::Submission{};
     lostWith = failure;
     try {
         recreateDevice(context);

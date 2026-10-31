@@ -589,8 +589,8 @@ ImageComparison compare(render::ImageRgba8 const &a, render::ImageRgba8 const &b
     return result;
 }
 
-// The GPU backends on Mesa's software devices against the CPU backend. Skipped where those
-// devices are missing, unless LRENDER_TEST_REQUIRE_GPU is set.
+// The GPU backends on test::deviceFor() their names against the CPU backend. Skipped where
+// those devices are missing, unless LRENDER_TEST_REQUIRE_GPU is set.
 constexpr auto kEquivalenceSamples = 4u;
 constexpr auto kEquivalencePixels = 48;
 
@@ -620,7 +620,7 @@ TEST_CASE("every GPU backend path traces what the CPU backend path traces") {
         try {
             auto options = test::HarnessOptions{};
             options.backend = backend;
-            options.device = "llvmpipe";
+            options.device = test::deviceFor(backend);
             options.gpuTimers = true;
             harness = std::make_unique<RenderHarness>(options);
         } catch (tc::DeviceError const &error) {

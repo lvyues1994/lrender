@@ -160,7 +160,7 @@ struct ResourcePool {
     void clear() noexcept { available.clear(); }
 
 private:
-    using Key = std::tuple<std::type_index, std::uint64_t, bool>;
+    using Key = std::tuple<std::type_index, std::uint64_t, BufferAccess>;
     std::map<Key, std::vector<std::shared_ptr<void>>> available;
 };
 

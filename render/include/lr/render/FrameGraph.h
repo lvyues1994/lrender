@@ -54,14 +54,21 @@ struct HistoryImage {
     bool valid = false;
 };
 
+// Who touches a graph buffer besides the device.
+enum class BufferAccess : std::uint8_t {
+    Device,   // nobody: a tc::DeviceBuffer, without a host copy (images too)
+    Upload,   // passes write its host copy and upload it while they record
+    Readback, // the host reads it once the frame is done
+};
+
 // What FrameGraphBuilder implementations get for each resource.
 struct ResourceDesc {
     std::string name;
-    std::type_index type;  // the tc::BufferResource<T> or GraphImage<G>
-    std::uint64_t size;    // elements, or width << 32 | height
-    bool hostVisible;      // read by the host once the frame is done
+    std::type_index type; // the tc::BufferResource<T> or GraphImage<G>
+    std::uint64_t size;   // elements, or width << 32 | height
+    BufferAccess access;
     std::function<std::shared_ptr<void>(tc::Device &)> create;
-    std::function<void const *(void *)> hostData; // hostVisible buffers
+    std::function<void const *(void *)> hostData; // readback buffers
 };
 
 // A pass's view of the GPU thread while it records.
@@ -73,6 +80,8 @@ struct PassContext {
     virtual tc::Device &device() noexcept = 0;
     virtual SceneTables const &scene() const noexcept = 0;
 
+    // A buffer from createBuffer() lives only on the device: on GPU devices this view
+    // has no host data, and only bindings and device copies may use it.
     template <class T>
     tc::BufferResource<T> &buffer(BufferRef<T> const ref) {
         return *static_cast<tc::BufferResource<T> *>(resource(ref.index, typeid(tc::BufferResource<T>)));
@@ -167,16 +176,23 @@ using ResultHandler = std::function<void(ViewResult &)>;
 struct FrameGraphBuilder {
     virtual ~FrameGraphBuilder() = default;
 
-    // Device memory, contents undefined at the start of the frame.
+    // Device memory only, contents undefined at the start of the frame.
     template <class T>
     BufferRef<T> createBuffer(std::string name, std::size_t const count) {
-        return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, false))};
+        return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, BufferAccess::Device))};
+    }
+
+    // Device memory and a host copy, for small data a pass writes on the host and
+    // uploads (tc::Device::uploadBuffer) while it records.
+    template <class T>
+    BufferRef<T> createUploadBuffer(std::string name, std::size_t const count) {
+        return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, BufferAccess::Upload))};
     }
 
     // Memory the host reads with readback() once the frame is done.
     template <class T>
     BufferRef<T> createReadbackBuffer(std::string name, std::size_t const count) {
-        return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, true))};
+        return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, BufferAccess::Readback))};
     }
 
     template <class G>
@@ -226,23 +242,32 @@ protected:
 
 private:
     template <class T>
-    static ResourceDesc bufferDesc(std::string name, std::size_t const count, bool const hostVisible) {
+    static ResourceDesc bufferDesc(std::string name, std::size_t const count, BufferAccess const access) {
         if (count == 0 or count > 0x7FFFFFFFu) {
             throw std::invalid_argument{"lr::render: graph buffer '" + name + "' needs 1 to 2^31 - 1 elements"};
         }
         auto const elements = static_cast<std::int32_t>(count);
-        auto create = [elements, hostVisible](tc::Device &device) -> std::shared_ptr<void> {
-            if (hostVisible) {
-                return std::make_shared<tc::BufferResource<T>>(device.createBuffer<T>(elements));
+        auto create = [elements, access](tc::Device &device) -> std::shared_ptr<void> {
+            switch (access) {
+            case BufferAccess::Device: {
+                // The view of the device buffer, sharing its ownership.
+                auto const buffer = device.createDeviceBuffer<T>(elements);
+                return std::shared_ptr<tc::BufferResource<T>>{buffer.shared(), buffer.hostView()};
             }
-            auto buffer = std::make_shared<tc::BufferResource<T>>(elements);
-            device.uploadBuffer(*buffer);
-            return buffer;
+            case BufferAccess::Upload: {
+                auto buffer = std::make_shared<tc::BufferResource<T>>(elements);
+                device.uploadBuffer(*buffer);
+                return buffer;
+            }
+            case BufferAccess::Readback:
+                break;
+            }
+            return std::make_shared<tc::BufferResource<T>>(device.createBuffer<T>(elements));
         };
         auto hostData = [](void *const resource) -> void const * {
             return static_cast<tc::BufferResource<T> const *>(resource)->data();
         };
-        return ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count, hostVisible,
+        return ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count, access,
                             std::move(create), std::move(hostData)};
     }
 
@@ -252,7 +277,8 @@ private:
         auto create = [extent](tc::Device &device) -> std::shared_ptr<void> {
             return std::make_shared<GraphImage<G>>(device.createImage<G, tc::Dim::D2>(extent, 1));
         };
-        return ResourceDesc{std::move(name), std::type_index{typeid(GraphImage<G>)}, size, false, std::move(create), {}};
+        return ResourceDesc{std::move(name), std::type_index{typeid(GraphImage<G>)}, size, BufferAccess::Device,
+                            std::move(create), {}};
     }
 };
 

@@ -9,6 +9,7 @@
 #include <cstring>
 #include <memory>
 #include <string>
+#include <utility>
 
 namespace lr::render {
 
@@ -116,12 +117,19 @@ void TexturePool::forget(core::TextureId const id) {
     }
     queue.erase(std::remove_if(queue.begin(), queue.end(), [id](Pending const &pending) { return pending.upload.id == id; }),
                 queue.end());
+    if (sent) {
+        auto &completed = sent->completed;
+        completed.erase(std::remove_if(completed.begin(), completed.end(),
+                                       [id](TextureUpload const &upload) { return upload.id == id; }),
+                        completed.end());
+    }
 }
 
 void TexturePool::apply(tc::Device &device, SceneUpdate const &update, RetireList &retired) {
     prepare(device, retired);
     for (auto const &request : update.pools) {
         change(device, request, retired);
+        poolsChanged = true;
     }
     for (auto const id : update.removedTextures) {
         forget(id);
@@ -132,14 +140,14 @@ void TexturePool::apply(tc::Device &device, SceneUpdate const &update, RetireLis
     }
 }
 
-void TexturePool::copyLevel(tc::Device &device, tc::BufferResource<tc::uint> const &buffer, std::size_t const offset,
-                            Pending const &pending) {
+void TexturePool::copyLevel(tc::TransferQueue &transfers, tc::BufferResource<tc::uint> const &buffer,
+                            std::size_t const offset, Pending const &pending) {
     auto const &pool = pools[textureSlot(pending.upload.ref)];
     auto const layer = textureLayer(pending.upload.ref);
     if (pool.compressed) {
-        device.copyBufferToImage(buffer, offset, pool.blocks, pending.nextLevel, layer);
+        transfers.copyBufferToImage(buffer, offset, pool.blocks, pending.nextLevel, layer);
     } else {
-        device.copyBufferToImage(buffer, offset, pool.color, pending.nextLevel, layer);
+        transfers.copyBufferToImage(buffer, offset, pool.color, pending.nextLevel, layer);
     }
 }
 
@@ -160,12 +168,31 @@ void TexturePool::generateMips(tc::Device &device, tc::uint const ref) {
     }
 }
 
-void TexturePool::stream(tc::Device &device, RetireList &retired) {
+void TexturePool::arrive(tc::Device &device) {
+    if (not sent) {
+        return;
+    }
+    device.waitFor(sent->copies);
+    for (auto const &upload : sent->completed) {
+        if (not pools[textureSlot(upload.ref)].compressed) {
+            generateMips(device, upload.ref);
+        }
+        resident[upload.id] = upload.ref;
+        residencyChanged = true;
+        ++residency;
+    }
+    sent.reset();
+}
+
+void TexturePool::send(tc::Device &device, tc::Submission const &previous, RetireList &retired) {
     if (queue.empty()) {
         return;
     }
     auto &buffer = stagingFor(device, queue.front().upload.image->levels[queue.front().nextLevel].size(), retired);
     ++streamedFrames;
+    auto &transfers = device.transfers();
+    transfers.waitFor(std::exchange(poolsChanged, false) ? device.submit() : previous);
+    auto completed = std::vector<TextureUpload>{};
     auto used = std::size_t{0};
     while (not queue.empty()) {
         auto &pending = queue.front();
@@ -176,19 +203,15 @@ void TexturePool::stream(tc::Device &device, RetireList &retired) {
         }
         std::memcpy(buffer.data() + offset / 4, level.data(), level.size());
         device.uploadBuffer(buffer, offset / 4, alignUp(level.size(), 4) / 4);
-        copyLevel(device, buffer, offset, pending);
+        copyLevel(transfers, buffer, offset, pending);
         used = offset + level.size();
         ++pending.nextLevel;
         if (pending.nextLevel == pending.upload.levels) {
-            if (not pools[textureSlot(pending.upload.ref)].compressed) {
-                generateMips(device, pending.upload.ref);
-            }
-            resident[pending.upload.id] = pending.upload.ref;
-            residencyChanged = true;
-            ++residency;
+            completed.push_back(std::move(pending.upload));
             queue.pop_front();
         }
     }
+    sent = Sent{transfers.submit(), std::move(completed)};
 }
 
 bool TexturePool::takeResidencyChange() noexcept {
@@ -225,6 +248,8 @@ void TexturePool::clear() noexcept {
     staging.clear();
     streamedFrames = 0;
     queue.clear();
+    sent.reset();
+    poolsChanged = false;
     resident.clear();
     residencyChanged = false;
     ++residency;
