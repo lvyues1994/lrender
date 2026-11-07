@@ -747,4 +747,41 @@ TEST_CASE("the path tracer traces the same paths with ray queries as through lre
     });
 }
 
+// Instances that only move refit lrender's instance hierarchy instead of building it
+// again; the nearest hits, and so the paths, are those of a hierarchy built for where the
+// instances end up.
+TEST_CASE("the path tracer traces moved instances as it traces instances placed there") {
+    auto const camera = test::cameraAt(core::vec3{0.0f, 2.0f, 4.0f}, core::vec3{0.0f, 0.6f, 0.0f});
+    auto const extent = core::ivec2{kEquivalencePixels, kEquivalencePixels};
+    auto options = test::HarnessOptions{};
+    options.rayQueries = render::VariantUse::Off;
+    test::forEachBackend(options, [&](RenderHarness &moved) {
+        auto placedThere = options;
+        placedThere.backend = moved.renderer->deviceInfo().backend;
+        placedThere.device = test::deviceFor(placedThere.backend);
+        auto fresh = RenderHarness{placedThere};
+        auto const view = pathTraced(moved, moved.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        auto const freshView =
+            pathTraced(fresh, fresh.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        auto scene = traversalScene();
+        moved.render(frameOf(scene, view));
+        auto result = render::FrameResult{};
+        for (auto frame = 0; frame < 5; ++frame) {
+            auto delta = core::RenderWorldDelta{};
+            for (auto &instance : scene.instances) {
+                if (instance.id.value == 1 or instance.id.value >= 11) {
+                    auto const step = 0.1f * static_cast<float>(frame + 1);
+                    instance.objectToWorld[3][0] += instance.id.value % 2 == 0 ? step : -step;
+                    instance.objectToWorld[3][1] += 0.05f;
+                    delta.instances.push_back(instance);
+                }
+            }
+            result = moved.render(frameOf(std::move(delta), view));
+        }
+        auto const expected = fresh.render(frameOf(scene, freshView));
+        CHECK(result.views[0].stats.accumulatedSamples == expected.views[0].stats.accumulatedSamples);
+        CHECK(result.views[0].image->pixels == expected.views[0].image->pixels);
+    });
+}
+
 } // namespace

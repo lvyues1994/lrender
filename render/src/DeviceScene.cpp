@@ -98,6 +98,10 @@ void uploadMoved(std::vector<Move> const &moves, bool const whole, Upload const 
     }
 }
 
+// Written elements this close together go up in one copy, with those between them: the
+// host tables hold what the device should anyway, and every copy has its cost.
+constexpr auto kMergedGap = std::size_t{64};
+
 // Sorted, merged ranges of the written indices.
 template <class T>
 std::vector<Range> rangesOf(std::vector<Indexed<T>> const &writes) {
@@ -110,8 +114,8 @@ std::vector<Range> rangesOf(std::vector<Indexed<T>> const &writes) {
     indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
     auto ranges = std::vector<Range>{};
     for (auto const index : indices) {
-        if (not ranges.empty() and ranges.back().first + ranges.back().count == index) {
-            ranges.back().count += 1;
+        if (not ranges.empty() and index - (ranges.back().first + ranges.back().count) <= kMergedGap) {
+            ranges.back().count = index - ranges.back().first + 1;
         } else {
             ranges.push_back(Range{index, 1});
         }

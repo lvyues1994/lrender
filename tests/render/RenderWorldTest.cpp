@@ -1,10 +1,16 @@
+#include "Clusters.h"
 #include "RenderWorld.h"
 
 #include <lr/core/Primitives.h>
 
 #include <doctest/doctest.h>
 
+#include <algorithm>
+#include <cmath>
+#include <iterator>
+#include <map>
 #include <memory>
+#include <random>
 #include <stdexcept>
 #include <vector>
 
@@ -281,6 +287,97 @@ TEST_CASE("the world counts blended instances, bounds every instance and finds t
     world.apply(removal);
     CHECK(world.transparentInstanceCount() == 0);
     CHECK(world.bounds().max.x == doctest::Approx(1.0f));
+}
+
+// Many instances, in more chunks than the world adds up at once, moved, removed and
+// changed through their meshes and materials, one kind of change a frame: the world's sums
+// are those of every instance.
+TEST_CASE("the counts and bounds of many changing instances are those of all of them, every frame") {
+    auto random = std::mt19937{3};
+    auto world = render::RenderWorld{};
+    auto const share = [](core::MeshData mesh) { return std::make_shared<core::MeshData const>(std::move(mesh)); };
+    struct Shape {
+        std::uint32_t clusters;
+        core::Aabb bounds;
+    };
+    auto shapeOf = std::map<std::uint32_t, Shape>{};
+    auto blendOf = std::map<std::uint32_t, bool>{};
+    auto const setMesh = [&](std::uint32_t const id, core::MeshData mesh, core::RenderWorldDelta &delta) {
+        shapeOf[id] = Shape{static_cast<std::uint32_t>(render::buildClusters(mesh).size()), core::boundsOf(mesh)};
+        delta.meshes.push_back({core::MeshId{id}, share(std::move(mesh))});
+    };
+    auto const setMaterial = [&](std::uint32_t const id, bool const blends, core::RenderWorldDelta &delta) {
+        blendOf[id] = blends;
+        auto material = core::MaterialDesc{};
+        material.alphaMode = blends ? core::AlphaMode::Blend : core::AlphaMode::Opaque;
+        delta.materials.push_back({core::MaterialId{id}, material});
+    };
+    auto start = core::RenderWorldDelta{};
+    for (auto id = 0u; id < 3; ++id) {
+        setMesh(id, core::makeSphere(0.5f + 0.25f * static_cast<float>(id), 8 + 4 * id, 6), start);
+        setMaterial(id, id == 1, start);
+    }
+    struct Placed {
+        std::uint32_t mesh;
+        std::uint32_t material;
+        core::mat4 transform;
+    };
+    auto placed = std::map<std::uint32_t, Placed>{};
+    auto const place = [&](std::uint32_t const id, core::RenderWorldDelta &delta) {
+        auto transform = core::Transform{};
+        transform.translation = core::vec3{static_cast<float>(random() % 2000) * 0.1f - 100.0f,
+                                           static_cast<float>(random() % 200) * 0.1f, 0.0f};
+        auto const instance = Placed{static_cast<std::uint32_t>(random() % 3), static_cast<std::uint32_t>(random() % 3),
+                                     core::matrixOf(transform)};
+        placed[id] = instance;
+        delta.instances.push_back(
+            {core::InstanceId{id}, core::MeshId{instance.mesh}, core::MaterialId{instance.material}, instance.transform});
+    };
+    for (auto id = 0u; id < 20000; ++id) {
+        place(id, start);
+    }
+    world.apply(start);
+    auto wrong = 0;
+    for (auto frame = 0; frame < 80; ++frame) {
+        auto delta = core::RenderWorldDelta{};
+        auto const kind = frame % 4;
+        if (kind == 0) {
+            for (auto k = 0; k < 4; ++k) {
+                place(static_cast<std::uint32_t>(random() % 21000), delta);
+            }
+        } else if (kind == 1) {
+            for (auto k = 0; k < 4; ++k) {
+                auto const at = placed.begin();
+                auto const id = std::next(at, static_cast<std::ptrdiff_t>(random() % placed.size()))->first;
+                delta.removed.instances.push_back(core::InstanceId{id});
+                placed.erase(id);
+            }
+        } else if (kind == 2) {
+            auto const id = static_cast<std::uint32_t>(random() % 3);
+            setMaterial(id, not blendOf[id], delta);
+        } else {
+            auto const id = static_cast<std::uint32_t>(random() % 3);
+            setMesh(id, core::makeBox(core::vec3{0.2f + 0.1f * static_cast<float>(frame % 5)}), delta);
+        }
+        world.apply(delta);
+
+        auto transparent = 0u;
+        auto clusters = 0u;
+        auto bounds = core::Aabb{core::vec3{INFINITY}, core::vec3{-INFINITY}};
+        for (auto const &[id, instance] : placed) {
+            transparent += blendOf[instance.material] ? 1u : 0u;
+            clusters += shapeOf[instance.mesh].clusters;
+            auto const box = core::transformed(shapeOf[instance.mesh].bounds, instance.transform);
+            bounds.min = tc::min(bounds.min, box.min);
+            bounds.max = tc::max(bounds.max, box.max);
+        }
+        wrong += world.instanceCount() == placed.size() and world.transparentInstanceCount() == transparent
+                         and world.clusterInstanceCount() == clusters and world.bounds().min == bounds.min
+                         and world.bounds().max == bounds.max
+                     ? 0
+                     : 1;
+    }
+    CHECK(wrong == 0);
 }
 
 TEST_CASE("the world hands images over to the GPU thread without keeping them, and reports them once lost") {

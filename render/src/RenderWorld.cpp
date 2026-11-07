@@ -294,6 +294,13 @@ void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &all, SceneUp
         auto const found = meshes.find(upsert.id);
         auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
         auto const clusterCount = static_cast<std::uint32_t>(clusters[index].size());
+        if (found != meshes.end()) {
+            auto const &old = found->second.gpu;
+            if (old.clusterCount != clusterCount or old.triangleCount * 3 != upsert.mesh->indices.size()
+                or not(old.boundsMin == bounds[index].min) or not(old.boundsMax == bounds[index].max)) {
+                markAllInstances();
+            }
+        }
         auto const firstCluster = clusterRanges.allocate(clusterCount);
         auto const gpu = GpuMesh{geometry[index].firstVertex,
                                  geometry[index].firstIndex,
@@ -441,6 +448,10 @@ void RenderWorld::compactGeometry(SceneUpdate &update) {
 
 void RenderWorld::upsertMaterial(core::MaterialUpsert const &upsert, SceneUpdate &update) {
     auto const found = materials.find(upsert.id);
+    auto const blends = [](core::MaterialDesc const &material) { return material.alphaMode == core::AlphaMode::Blend; };
+    if (found != materials.end() and blends(found->second.desc) != blends(upsert.material)) {
+        markAllInstances();
+    }
     auto const slot = found != materials.end() ? found->second.slot : takeSlot(freeMaterialSlots, materialSlotEnd);
     materials[upsert.id] = MaterialRecord{slot, upsert.material};
     update.materials.push_back(Indexed<MaterialEncoding>{slot, encodeMaterial(upsert.material)});
@@ -489,27 +500,61 @@ std::optional<ShadowLight> RenderWorld::shadowLight() const {
     return std::nullopt;
 }
 
+namespace {
+
+constexpr auto kInstancesPerChunk = std::uint32_t{1024};
+
+} // namespace
+
+void RenderWorld::markInstance(std::uint32_t const index) {
+    auto const chunk = index / kInstancesPerChunk;
+    if (chunk < instanceChunks.size()) {
+        instanceChunks[chunk].dirty = true;
+    }
+}
+
+void RenderWorld::markAllInstances() {
+    for (auto &chunk : instanceChunks) {
+        chunk.dirty = true;
+    }
+}
+
 void RenderWorld::updateSummaries() {
+    instanceChunks.resize((instanceCount() + kInstancesPerChunk - 1) / kInstancesPerChunk);
     transparentInstances = 0;
     clusterInstances = 0;
     sceneBounds = core::Aabb{core::vec3{INFINITY}, core::vec3{-INFINITY}};
-    for (auto const &record : instances) {
-        if (materials.at(record.material).desc.alphaMode == core::AlphaMode::Blend) {
-            ++transparentInstances;
+    for (auto index = std::size_t{0}; index < instanceChunks.size(); ++index) {
+        auto &chunk = instanceChunks[index];
+        if (chunk.dirty) {
+            chunk = InstanceChunk{};
+            chunk.dirty = false;
+            auto const first = static_cast<std::uint32_t>(index) * kInstancesPerChunk;
+            for (auto at = first; at < std::min(first + kInstancesPerChunk, instanceCount()); ++at) {
+                auto const &record = instances[at];
+                if (materials.at(record.material).desc.alphaMode == core::AlphaMode::Blend) {
+                    ++chunk.transparent;
+                }
+                auto const &mesh = meshes.at(record.mesh).gpu;
+                chunk.clusters += mesh.clusterCount;
+                if (mesh.triangleCount != 0) {
+                    auto const box =
+                        core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, record.objectToWorld);
+                    chunk.bounds.min = tc::min(chunk.bounds.min, box.min);
+                    chunk.bounds.max = tc::max(chunk.bounds.max, box.max);
+                }
+            }
         }
-        auto const &mesh = meshes.at(record.mesh).gpu;
-        clusterInstances += mesh.clusterCount;
-        if (mesh.triangleCount != 0) {
-            auto const box = core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, record.objectToWorld);
-            sceneBounds.min = tc::min(sceneBounds.min, box.min);
-            sceneBounds.max = tc::max(sceneBounds.max, box.max);
-        }
+        transparentInstances += chunk.transparent;
+        clusterInstances += chunk.clusters;
+        sceneBounds.min = tc::min(sceneBounds.min, chunk.bounds.min);
+        sceneBounds.max = tc::max(sceneBounds.max, chunk.bounds.max);
     }
 }
 
 void RenderWorld::writeInstance(std::uint32_t const index, SceneUpdate &update) const {
     auto const &record = instances[index];
-    auto const gpu = GpuInstance{record.objectToWorld, tc::inverse(record.objectToWorld), meshes.at(record.mesh).slot,
+    auto const gpu = GpuInstance{record.objectToWorld, record.worldToObject, meshes.at(record.mesh).slot,
                                  materials.at(record.material).slot, record.previousObjectToWorld};
     update.instances.push_back(Indexed<GpuInstance>{index, gpu});
 }
@@ -519,15 +564,19 @@ void RenderWorld::upsertInstance(core::InstanceUpsert const &upsert, SceneUpdate
     auto const found = instanceIndex.find(upsert.id);
     if (found == instanceIndex.end()) {
         auto const index = instanceCount();
-        instances.push_back(
-            InstanceRecord{upsert.id, upsert.mesh, upsert.material, upsert.objectToWorld, upsert.objectToWorld});
+        instances.push_back(InstanceRecord{upsert.id, upsert.mesh, upsert.material, upsert.objectToWorld,
+                                           upsert.objectToWorld, tc::inverse(upsert.objectToWorld)});
         instanceIndex[upsert.id] = index;
+        addedInstances = true;
+        markInstance(index);
         writeInstance(index, update);
         return;
     }
     auto &record = instances[found->second];
-    record = InstanceRecord{upsert.id, upsert.mesh, upsert.material, upsert.objectToWorld, record.objectToWorld};
+    record = InstanceRecord{upsert.id,           upsert.mesh,          upsert.material,
+                            upsert.objectToWorld, record.objectToWorld, tc::inverse(upsert.objectToWorld)};
     movedInstances.push_back(upsert.id);
+    markInstance(found->second);
     writeInstance(found->second, update);
 }
 
@@ -558,6 +607,8 @@ void RenderWorld::removeInstance(core::InstanceId const id, SceneUpdate &update)
         writeInstance(index, update);
     }
     instances.pop_back();
+    markInstance(index);
+    markInstance(last);
 }
 
 void RenderWorld::removeLight(core::LightId const id, SceneUpdate &update) {
@@ -624,14 +675,63 @@ void RenderWorld::buildTlas(SceneUpdate &update) {
     }
     auto const bvh = buildBvh(bounds, BvhBuildConfig{1});
     update.tlasNodes.clear();
-    for (auto index = std::size_t{0}; index < bvh.nodes.size(); ++index) {
-        auto node = bvh.nodes[index];
+    tlas = bvh.nodes;
+    tlasParents.assign(tlas.size(), noBvhNode());
+    tlasLeaves.assign(instanceCount(), noBvhNode());
+    for (auto index = std::uint32_t{0}; index < tlas.size(); ++index) {
+        auto &node = tlas[index];
         if (node.count != 0) {
             node.first = members[bvh.order[node.first]];
+            tlasLeaves[node.first] = index;
+        } else {
+            tlasParents[node.first] = index;
+            tlasParents[node.first + 1] = index;
         }
-        update.tlasNodes.push_back(Indexed<GpuBvhNode>{static_cast<std::uint32_t>(index), node});
+        update.tlasNodes.push_back(Indexed<GpuBvhNode>{index, node});
     }
-    tlasNodeCount = static_cast<std::uint32_t>(bvh.nodes.size());
+    tlasNodeCount = static_cast<std::uint32_t>(tlas.size());
+}
+
+bool RenderWorld::refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update) {
+    for (auto const &upsert : delta.instances) {
+        auto const index = instanceIndex.at(upsert.id);
+        if ((tlasLeaves[index] == noBvhNode()) != (meshes.at(instances[index].mesh).blasRoot == noBvhNode())) {
+            return false;
+        }
+    }
+    auto written = std::vector<std::uint32_t>{};
+    auto const rewrite = [&](std::uint32_t const node, core::Aabb const &box) {
+        auto &held = tlas[node];
+        if (held.boundsMin == box.min and held.boundsMax == box.max) {
+            return false;
+        }
+        held.boundsMin = box.min;
+        held.boundsMax = box.max;
+        written.push_back(node);
+        return true;
+    };
+    for (auto const &upsert : delta.instances) {
+        auto const index = instanceIndex.at(upsert.id);
+        auto node = tlasLeaves[index];
+        if (node == noBvhNode()) {
+            continue;
+        }
+        auto const &record = instances[index];
+        auto changed = rewrite(node, core::transformed(meshes.at(record.mesh).blasBounds, record.objectToWorld));
+        while (changed and tlasParents[node] != noBvhNode()) {
+            node = tlasParents[node];
+            auto const first = tlas[node].first;
+            auto const children = core::Aabb{tc::min(tlas[first].boundsMin, tlas[first + 1].boundsMin),
+                                             tc::max(tlas[first].boundsMax, tlas[first + 1].boundsMax)};
+            changed = rewrite(node, children);
+        }
+    }
+    std::sort(written.begin(), written.end());
+    written.erase(std::unique(written.begin(), written.end()), written.end());
+    for (auto const node : written) {
+        update.tlasNodes.push_back(Indexed<GpuBvhNode>{node, tlas[node]});
+    }
+    return true;
 }
 
 void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update) {
@@ -643,7 +743,9 @@ void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUp
         }
     }
     buildBlases(records, update);
-    if (not delta.meshes.empty() or not delta.instances.empty() or not delta.removed.instances.empty()) {
+    if (not delta.meshes.empty() or addedInstances or not delta.removed.instances.empty()) {
+        buildTlas(update);
+    } else if (not delta.instances.empty() and not refitTlas(delta, update)) {
         buildTlas(update);
     }
 }
@@ -712,6 +814,7 @@ SceneCapacity RenderWorld::capacity() const noexcept {
 SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     validate(delta);
     auto update = SceneUpdate{};
+    addedInstances = false;
     if (fragmented()) {
         compactGeometry(update);
     }

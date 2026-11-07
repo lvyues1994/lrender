@@ -102,6 +102,15 @@ private:
         core::MaterialId material;
         core::mat4 objectToWorld;
         core::mat4 previousObjectToWorld; // as of the previous apply()
+        core::mat4 worldToObject;
+    };
+    // What updateSummaries() adds up, of kInstancesPerChunk instances in order; only the
+    // chunks an apply() changes are added up again.
+    struct InstanceChunk {
+        std::uint32_t transparent = 0;
+        std::uint32_t clusters = 0;
+        core::Aabb bounds{core::vec3{INFINITY}, core::vec3{-INFINITY}};
+        bool dirty = true;
     };
     struct LightRecord {
         core::LightId id;
@@ -125,11 +134,17 @@ private:
     void removeLight(core::LightId id, SceneUpdate &update);
     void applyTextures(core::RenderWorldDelta const &delta, SceneUpdate &update);
     void updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update);
+    void markInstance(std::uint32_t index);
+    void markAllInstances();
     void updateSummaries();
     // The hierarchies of `records`' meshes, built as items of `parallel`, in that order.
     void buildBlases(std::vector<MeshRecord *> const &records, SceneUpdate &update);
     void placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &update);
     void buildTlas(SceneUpdate &update);
+    // The instance hierarchy's boxes again for the moved instances of `delta`, which only
+    // moves instances that were there: false, changing nothing, when an instance's mesh
+    // gained or lost its hierarchy.
+    bool refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update);
     SceneCapacity capacity() const noexcept;
 
     std::unique_ptr<ParallelFor> ownParallel;
@@ -155,6 +170,7 @@ private:
     std::unordered_map<core::InstanceId, std::uint32_t> instanceIndex;
     // Upserted by the last apply(): their previous transform is out of date at the next.
     std::vector<core::InstanceId> movedInstances;
+    std::vector<InstanceChunk> instanceChunks;
     std::uint32_t transparentInstances = 0;
     std::uint32_t clusterInstances = 0;
     std::uint32_t materialModels = 1;
@@ -170,6 +186,13 @@ private:
     RangeAllocator blasNodeRanges;
     RangeAllocator blasTriangleRanges;
     std::uint32_t tlasNodeCount = 0;
+    // The instance hierarchy as it was last built or refitted, each node's parent, and each
+    // instance's leaf (noBvhNode() for those it leaves out).
+    std::vector<GpuBvhNode> tlas;
+    std::vector<std::uint32_t> tlasParents;
+    std::vector<std::uint32_t> tlasLeaves;
+    // Whether this apply() added instances.
+    bool addedInstances = false;
 };
 
 } // namespace lr::render

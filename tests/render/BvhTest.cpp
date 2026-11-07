@@ -340,6 +340,71 @@ TEST_CASE("the two-level traversal finds the hits that testing every triangle fi
     CHECK(disagreements == 0);
 }
 
+// Writes of a later update over what `scene` holds.
+template <class T>
+void patch(std::vector<T> &table, std::vector<render::Indexed<T>> const &writes) {
+    for (auto const &write : writes) {
+        table.resize(std::max<std::size_t>(table.size(), std::size_t{write.index} + 1));
+        table[write.index] = write.value;
+    }
+}
+
+int disagreementsOf(HostScene const &scene, std::mt19937 &random, int const rays) {
+    auto const triangles = worldTriangles(scene);
+    auto place = std::uniform_real_distribution<float>{-5.0f, 5.0f};
+    auto disagreements = 0;
+    for (auto ray = 0; ray < rays; ++ray) {
+        auto const origin = core::vec3{place(random), place(random), place(random)};
+        auto const direction = tc::normalize(core::vec3{place(random), place(random), place(random)});
+        auto const expected = traceBruteForce(triangles, origin, direction);
+        auto const found = traceHost(scene, origin, direction);
+        auto const agree = expected == kFar ? found == kFar : std::abs(found - expected) <= 1e-4f * (1.0f + expected);
+        disagreements += agree ? 0 : 1;
+    }
+    return disagreements;
+}
+
+TEST_CASE("instances that only move refit the instance hierarchy, which still finds every hit") {
+    auto random = std::mt19937{5};
+    auto world = render::RenderWorld{};
+    auto const start = scatteredInstances(random);
+    auto update = world.apply(start);
+    world.keepHierarchies(update);
+    auto scene = HostScene{update};
+    auto const nodes = scene.tlasNodeCount;
+    auto place = std::uniform_real_distribution<float>{-3.0f, 3.0f};
+    for (auto frame = 0; frame < 12; ++frame) {
+        auto delta = core::RenderWorldDelta{};
+        for (auto k = 0; k < 4; ++k) {
+            auto instance = start.instances[static_cast<std::size_t>(random() % start.instances.size())];
+            auto transform = core::Transform{};
+            transform.translation = core::vec3{place(random), place(random), place(random)};
+            instance.objectToWorld = core::matrixOf(transform);
+            // Between the two meshes with triangles, now and then.
+            if (frame % 3 == 1 and instance.mesh.value < 2) {
+                instance.mesh = core::MeshId{1 - instance.mesh.value};
+            }
+            delta.instances.push_back(instance);
+        }
+        auto const moved = world.apply(delta);
+        CAPTURE(frame);
+        CHECK(moved.tlasNodeCount == nodes);
+        CHECK(moved.tlasNodes.size() < nodes); // only the moved leaves and what holds them
+        patch(scene.instances, moved.instances);
+        patch(scene.tlasNodes, moved.tlasNodes);
+        CHECK(disagreementsOf(scene, random, 300) == 0);
+    }
+
+    // A mesh without triangles has no leaf: the hierarchy is built again.
+    auto emptied = core::RenderWorldDelta{};
+    auto instance = start.instances[0];
+    instance.mesh = core::MeshId{3};
+    emptied.instances.push_back(instance);
+    auto const rebuilt = world.apply(emptied);
+    CHECK(rebuilt.tlasNodeCount == nodes - 2);
+    CHECK(rebuilt.tlasNodes.size() == rebuilt.tlasNodeCount);
+}
+
 TEST_CASE("hierarchies follow the deltas after they are first built") {
     auto random = std::mt19937{3};
     auto world = render::RenderWorld{};

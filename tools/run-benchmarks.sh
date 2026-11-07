@@ -5,7 +5,8 @@
 #
 # nvidia measures at 1920x1080 on the first device whose name contains NVIDIA, lavapipe at
 # 960x540 on llvmpipe with shorter warm-ups. Needs a release build (cmake --preset release)
-# and the scenes from tools/fetch-scenes.sh.
+# and the scenes from tools/fetch-scenes.sh. With LRENDER_BENCH_CPUS set (taskset's list,
+# such as 0-15 for the performance cores of a hybrid CPU), every run stays on those CPUs.
 set -euo pipefail
 
 readonly device="${1:-nvidia}"
@@ -14,11 +15,15 @@ readonly build="${3:-build/release}"
 readonly bench="$build/probes/lrender_bench"
 
 mkdir -p "$output"
+pin=()
+if [[ -n "${LRENDER_BENCH_CPUS:-}" ]]; then
+    pin=(taskset -c "$LRENDER_BENCH_CPUS")
+fi
 measure() {
     local -r name="$1"
     shift
     echo "== $name"
-    "$bench" "${common[@]}" "$@" --json "$output/$name.json" | grep -vE "^    " || return 1
+    ${pin[@]+"${pin[@]}"} "$bench" "${common[@]}" "$@" --json "$output/$name.json" | grep -vE "^    " || return 1
 }
 
 case "$device" in
@@ -35,6 +40,10 @@ nvidia)
         --config frustum:occlusion=off
     measure scale-lights --scene scale --instances 100000 --lights 1000 --config grid:lightgrid=on \
         --config all:lightgrid=off
+    measure scale-1m-moving-10k --scene scale --instances 1000000 --lights 1000 --moving 10000 --frames 120
+    measure scale-1m-moving-100k --scene scale --instances 1000000 --lights 1000 --moving 100000 --frames 120
+    measure scale-1m-pathtrace-moving --scene scale --instances 1000000 --lights 1000 --moving 1000 --frames 60 \
+        --warmup 10 --config hierarchies:pipeline=pathtrace,rayqueries=off
     measure sponza-pathtrace --scene sponza --config rayqueries:pipeline=pathtrace \
         --config hierarchies:pipeline=pathtrace,rayqueries=off
     ;;
