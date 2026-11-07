@@ -166,7 +166,7 @@ std::unique_ptr<GpuQueue> makeGpuQueue(GpuQueueConfig const &config);   // 后�
   - 等待抛出的异常（比如 `tc::DeviceError`）走 `set_error`；任务没能启动时 stackfull 给出的 `error_code` 包成 `std::system_error`。
   - 测试里用 eventfd 代替 sync file：两者都是变成可读就算完成，所以没有 sync file 的机器上也能测到 Poller 这条路径。
 - **重建设备**：`recreateDevice` 在 GPU 线程上先销毁旧设备（tc 的 Vulkan 设备析构时会等它排队的工作，真正丢失的设备会立即返回），再按原来的配置创建新设备。`info()` 一直是第一个设备的信息，配置相同，设备也相同。
-- **同一个 fence 有两个使用者**：Android 零拷贝上屏时，`ASurfaceTransaction_setBuffer` 也要这个 fence，此时 `dup` 一份 fd 给 Presenter。
+- **同一个 fence 有两个使用者**：SharedBuffer 路径上 Presenter 也要这个 fence（桌面的 `VulkanPresenter` 让自己的队列等它，Android 的 `ASurfaceTransaction_setBuffer` 交给合成器），此时 `dup` 一份 fd 给 Presenter。
 - **计时**：完成之后回到 GPU 线程，用 `takeTimings(submitted.submission)` 取这一帧的设备耗时。这次提交已经完成，调用不会等待，也不会碰正在录制或执行的下一帧。
 - **开发期重新加载**：`Renderer::reloadKernels(dir)` 通过 `record` 在 GPU 线程上调用 `ProgramRegistry::instance().reloadFrom(dir)`，在它之前和之后提交的帧之间生效，以 tc 的报告完成（换掉的程序，被拒绝的程序和原因）；GPU 设备下一次 `useKernel` 就用新程序，接口变了的程序被拒绝，CPU 后端照旧运行编译进来的 C++。`builtInKernelDirectory()` 是 CMake 写进来的 lrender 自己的 `tc_generated/lr_render/glsl`，只在打开 `LRENDER_KERNEL_RELOAD`（也就是 `TC_PROGRAM_RELOAD`）的构建里有；发布预设关掉它，`reloadFrom` 不读磁盘，拒绝一切。`lrender_view` 在 GPU 后端上用 asset 的 `FileWatcher` 监听这个目录，变化停下 300 ms 之后重新加载一次，因为构建会给每个 kernel 写好几个文件。转译器不删掉改名之前的 kernel 留下的文件，`reloadFrom` 找不到对应的程序，就跳过它们。
 
@@ -222,14 +222,21 @@ struct PresentFrame {               // Readback 路径：设备做完之后，�
     ImageRgba8View pixels;          // 只在 present() 调用期间有效
 };
 
-struct Presenter {                  // lr::present 提供实现，宿主也可以自己写
+struct Presenter {                  // lr::present 提供实现，宿主也可以自己写；调用都在 GPU 线程上、按帧序，不得阻塞
     virtual ~Presenter() = default;
-    virtual void present(PresentFrame const &frame) = 0;   // GPU 线程上按帧序调用，不得阻塞
+    virtual void present(PresentFrame const &frame) = 0;                   // Readback 路径
+    // SharedBuffer 路径，默认不用
+    virtual bool sharesBuffersWith(tc::DeviceInfo const &device) const;    // 建目标时问一次
+    virtual SharedBufferSlot acquireShared(core::ivec2 extent);            // {slot, generation, release fence}
+    virtual tc::ExternalBufferMemory exportShared(std::uint32_t slot);     // 每次一个新的 fd
+    virtual void presentShared(SharedBufferFrame frame);                   // 提交之后立即交出，带 acquire fence
+    virtual void discardShared(std::uint32_t slot);                        // 这一帧失败了，槽原样还回去
 };
 ```
 
 - 窗口目标的像素交给它的 Presenter，`ViewResult::image` 留空；离屏目标的像素拷进 `ViewResult::image`。同一帧可以两种都有。
-- 目前只有 Readback 路径。SharedBuffer 路径（引擎直接渲染进 `AHardwareBuffer`，提交之后立即把 buffer 和 acquire fence 交给 Presenter）留给 Android：到时候 `Presenter` 加一个默认是 Readback 的 `path()`，再加一个接收 `SharedBufferFrame` 的入口，现有的 Presenter 不用改。
+- 两条路径。Readback：最后一个 pass 写进主机映射的内存，设备做完之后 `present()` 拿到像素的指针。SharedBuffer：最后一个 pass 直接写进 Presenter 导出的、同一块 GPU 上的内存，帧一提交就连同它的 fence 交给 `presentShared()`，没有回读。建窗口目标时，Presenter 的 `sharesBuffersWith()` 说可以、设备又能导出 sync file 和导入内存（`syncFiles`、`importsMemory`），这个目标就走 SharedBuffer，否则走 Readback；SharedBuffer 的几个入口都有默认实现，只做 Readback 的 Presenter 不用改。
+- SharedBuffer 的一帧：渲染线程把视图的输出声明成帧图的外部 buffer（见“帧图与扩展”）。GPU 线程录制这个视图之前向 Presenter 要一个槽：没导入过的槽（或者 `generation` 变了，或者尺寸变了）用 `exportShared()` 的 fd 经 `importBuffer` 导入，导入的 buffer 按目标和槽留着，60 帧没用就放掉；槽带的 release fence 交给 `waitFor`，设备等 Presenter 上一次读完这个槽再写。帧提交之后，把 `submitWithFence()` 的 fence `dup` 一份连同槽交给 `presentShared()`；原来那份照旧给 IO 调度器等帧完成。帧失败了（视图录制时抛了异常，或者设备丢了）就 `discardShared()`，什么也不显示。设备丢失时导入的 buffer 一起丢掉，下一次重新导入。
 - 多视图：一帧可以有任意个视图，渲染到不同目标，比如编辑器的多个视口、分屏、离屏缩略图。阴影贴图是管线内部的 pass，不算视图。
 - 缩放：帧图里的资源尺寸相对目标尺寸声明，`resize` 之后按新尺寸重建；历史资源按尺寸记录，尺寸变了就换一对新的，`valid` 为假，累积从头开始。
 - 销毁：已经提交的帧照样交给原来的 Presenter（帧图里持有它的 `shared_ptr`），之后再提交这个目标就抛 `std::invalid_argument`。
@@ -268,6 +275,7 @@ void TonemapFeature::setup(FrameGraphBuilder &graph, ViewContext const &view) {
 - 帧图在渲染线程上编译：检查读写关系，剔除没有被用到的 pass，算出每个资源的生命周期（第一个和最后一个用到它的、会运行的 pass；回读 buffer 活到帧结束），维护按 `ViewId` 保存的历史资源。没有会运行的 pass 用到的资源不分配。
 - 内存别名：GPU 线程录制一个视图的帧图时，把只在设备上的 buffer 和图像（设备能放置图像时，`DeviceInfo::placedImages`；GL 不能，图像各占一份）放进一个 tc 的堆，生命周期重叠的资源字节不重叠，不重叠的共用同一段内存。放法是从大到小，每个放在它的对齐允许、又不和同时活着的资源重叠的最低偏移上，堆的大小就是同一时刻最多要的那么多。堆和放好的资源按“放法”（每个资源的类型、大小、偏移）在帧之间复用，帧图不变时每一帧拿到同一个堆和同一批资源，每个在途帧一份；60 帧没用到的放法和单独的资源都释放。资源在它的第一个 pass 开始时内容未定义，这本来就是 `createBuffer` 的约定；tc 在别名切换处插屏障，Vulkan 的图像从 UNDEFINED 转过去，CPU 后端用 0xCD 填满接手的内存，所以哪个 pass 读了自己没写的东西，CPU 后端上的测试会看出来。上传和回读 buffer 有主机端的内存，不进堆。`RendererConfig::aliasGraphResources` 关掉它，`ViewStats::graphBytes` 和 `unaliasedBytes` 给出共用和不共用时各要多少设备内存。1920×1080、开 TAA 的演示场景，一个视图从 173.6 MiB 降到 109.0 MiB，在途两帧共省约 130 MiB。
 - `ViewDesc::describeGraph` 让 `ViewResult::graph` 带上这一帧的帧图，用 Graphviz 的 DOT 语言：会运行的 pass 按顺序（开了计时器时带上 dispatch 数和设备耗时），它们读写的资源（大小、生命周期、在堆里的偏移，或者是历史资源），以及读写的边。`lrender_cli --graph <文件>` 写出最后一帧的。
+- 外部 buffer：`GraphBuilder::createExternalBuffer` 声明一个由 GPU 线程在录制前交给 `GraphRun` 的 buffer，不从资源池里取，也不还回去；它算作帧图的输出，写它的 pass 总会运行。SharedBuffer 路径的视图输出就是它。这是 Renderer 内部用的，不在 `FrameGraphBuilder` 的公开接口上。
 - 帧图 buffer 按除了设备还有谁碰它分三种（`BufferAccess`）：`createBuffer` 是只在设备上的 `tc::DeviceBuffer`，没有主机端副本，只能由 kernel 和 `copyBuffer` 读写，帧开始时内容未定义；`createUploadBuffer` 带主机端副本，pass 录制时写好再 `uploadBuffer`；`createReadbackBuffer` 是 `createBuffer` 分配的映射内存，设备原地写，帧完成之后由主机读。中间结果都是第一种，GPU 后端不为它们分配主机内存。三种描述不同，资源池不会把一种当成另一种复用。
 - pass 按编译后的顺序在 GPU 线程上录制。屏障由 tc 按实际的读写冲突插入，互不相关的 pass 可以在设备上重叠，帧图不需要自己计算屏障。
 - `PassContext` 把帧图的资源句柄解析成 tc 资源并绑定，`dispatch` 和 `dispatchIndirect` 分别对应 `execute` 和 `executeIndirect`（可以指定读参数 buffer 的第几项），同时记下这次 dispatch 属于哪个 pass；用户 kernel 和内置 kernel 走同一条路径。
@@ -370,7 +378,13 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 
 每种实现是一个单独的 CMake 目标，宿主只链接用得到的。需要特定线程或者可能阻塞的上屏，由 Presenter 自己转交，因为 `present()` 是在 GPU 线程上调用的。
 
-- `SdlPresenter`（Readback，`lr::present_sdl`，只在找到 SDL2 时构建）：`present()` 把像素拷进三缓冲信箱，宿主主线程调用 `blitLatest()` 上屏。SDL 要求在主线程上屏。信箱是三个槽加一个原子交换的“共享槽下标 + 新帧标记”：GPU 线程写自己的槽再换进共享槽，主线程看到新帧标记就换出来，双方都不等对方，主线程总是拿到最新的一帧，中间的帧直接被覆盖。`blitLatest()` 把它传进一张流式纹理（`SDL_PIXELFORMAT_ABGR8888`，就是低字节为红的打包 RGBA8），拉伸到整个输出再 `SDL_RenderPresent`，返回帧号；没有新帧时什么都不画。纹理随 Presenter 销毁，所以最后一个引用要在主线程上、Renderer 之后、`SDL_Renderer` 之前放掉。1080p 的 RGBA8 约 8 MB 一帧，桌面的带宽足够，一直走这条路径。
+- `VulkanPresenter`（`lr::present_vulkan`，找到 Vulkan 时构建）：自己的 VkInstance、VkDevice 和交换链，一个 Presenter 对应一个窗口目标。窗口的 surface 由宿主建（`lrender_view --present vulkan` 用 `SDL_Vulkan_CreateSurface`）；没有窗口时，用 `VK_EXT_headless_surface`（只有 Mesa 的驱动有，NVIDIA 的驱动问到这种 surface 会崩溃），或者 `offscreen`，拷进自己的三张 BGRA 图像，不经过交换链，供测试和 `lrender_bench` 用。
+  - 渲染器的设备和它是同一块 GPU（UUID 相同）、它又能导出 opaque fd 和 sync file 时，走 SharedBuffer：三个槽是可导出的设备内存，用法与 tc 导入时建的 buffer 相同，所以两边的内存类型一致。否则走 Readback：`present()` 把像素拷进主机可见的暂存 buffer。
+  - 一个线程专门上屏，每次交换链能接一帧时取交来的最新一帧，更早的直接丢掉，所以渲染器比显示快时只会丢帧，不会等 Presenter。上屏时队列等这一帧的 acquire fence（导入成 semaphore），把 buffer 拷进交换链图像：交换链是 `R8G8B8A8_UNORM` 而且尺寸相同时直接拷，否则先拷进一张 RGBA8 图像再 blit，blit 负责通道顺序和缩放。交换链只用 UNORM 格式，因为像素已经是 sRGB 编码。这次提交另外 signal 一个可导出的 semaphore，导出的 sync file 就是这个槽的 release fence。buffer 在外部队列族和自己的队列族之间转移所有权。
+  - 槽按状态轮转：空闲、正在写、等上屏、上屏线程拿着、已上屏。GPU 线程要槽时，先挑 Presenter 已经读完的；SharedBuffer 路径上其次挑拷贝还在跑的，由设备等它的 release fence；最后才挑还没上屏的最旧一帧，那一帧算丢掉。上屏线程拿着的槽不给。
+  - `stats()` 给出上屏、走 SharedBuffer、丢掉的帧数，以及从交出到上屏的主机时间；`captureNext()` 把下一帧上屏的图像读回来（测试、截图）；`flush()` 等交出的帧都上屏或丢掉。
+  - 测量（RTX 5070 Ti，Sponza 1920×1080，release，与直接丢帧的 Presenter 在同一个进程里交替）：GPU 帧时间 1.218 对 1.115 ms，两者的先后对调之后是 1.204 对 1.095 ms，多出的约 0.1 ms 分散在所有 pass 上，每个不到 3 µs，像是两个设备的上下文轮流占用 GPU 的代价；墙钟多 0.15 到 0.23 ms；从交出到上屏 0.12 到 0.15 ms，全部帧都走 SharedBuffer、没有丢帧。Readback 路径交给它时每帧收尾要 230 ms 以上：tc 的 `createBuffer` 在开了 resizable BAR 的显卡上把回读 buffer 放在显存里，主机读 8 MB 要 153 ms（缓存的系统内存只要 0.29 ms），离屏目标也一样；这是向 tc 提的第 5 项（`library-requirements.md`）。
+- `SdlPresenter`（Readback，`lr::present_sdl`，只在找到 SDL2 时构建）：`present()` 把像素拷进三缓冲信箱，宿主主线程调用 `blitLatest()` 上屏。SDL 要求在主线程上屏。信箱是三个槽加一个原子交换的“共享槽下标 + 新帧标记”：GPU 线程写自己的槽再换进共享槽，主线程看到新帧标记就换出来，双方都不等对方，主线程总是拿到最新的一帧，中间的帧直接被覆盖。`blitLatest()` 把它传进一张流式纹理（`SDL_PIXELFORMAT_ABGR8888`，就是低字节为红的打包 RGBA8），拉伸到整个输出再 `SDL_RenderPresent`，返回帧号；没有新帧时什么都不画。纹理随 Presenter 销毁，所以最后一个引用要在主线程上、Renderer 之后、`SDL_Renderer` 之前放掉。1080p 的 RGBA8 约 8 MB 一帧；回读在 NVIDIA 上慢（见上），要快就用 `VulkanPresenter`。
 - `SurfaceControlPresenter`（Android API 29+，SharedBuffer）：引擎直接渲染进一组 RGBA8 的 AHardwareBuffer（通过 `ExternalImageBinding` 写入），这个 Presenter 用 `ASurfaceTransaction_setBuffer` 提交，acquire fence 是 `submitWithFence()` 返回的 `.fence`（`dup` 出来的那一份）。合成器在回调里交还的 release fence，在 GPU 线程下次写这块 buffer 之前交给 `waitFor()`，由设备等待。没有回读，也没有拷贝。Vulkan 第一次以存储图像使用新导入的帧时可能丢弃原有内容，而输出 pass 本来就写满整帧，不受影响。
 - `NativeWindowPresenter`（Android API 29 以下，Readback）：在自己的线程上 `ANativeWindow_lock` 并拷贝。
 - `ImageSequencePresenter`（Readback，`lr::present_image`）：离线输出。`present()` 拷一份像素，用 `exec::spawn(io, …)` 起一个任务，在 `stackfull::blocking()` 里写 `<directory>/<prefix><帧号>.ppm`，不阻塞 GPU 线程。`flush()` 等到目前交给它的帧都写完（或失败），返回写成和失败的帧数；析构时等还在写的帧，所以宿主要在 Renderer 之后、不在 GPU 线程上放掉最后一个引用。`lrender_cli --sequence <目录>` 用它输出每一帧。
@@ -615,7 +629,8 @@ lrender/
   runtime/   include/lr/runtime/   src/           lr::runtime  lexec::runtime、stackfull
   gpu/       include/lr/gpu/       src/           lr::gpu      tc、tc_devices、stackfull::exec、stackfull::runtime
   render/    include/lr/render/    src/  kernels/ lr::render   tc_add_kernels(...)；include/lr/render/kernels/ 是用户 kernel 也要用的公开 kernel 头文件
-  present/   image_sequence/  sdl/  （android/）  lr::present_image  lr::present_sdl  （lr::present_android）
+  present/   image_sequence/  sdl/  vulkan/  （android/）
+                                                  lr::present_image  lr::present_sdl  lr::present_vulkan  （lr::present_android）
   asset/     include/lr/asset/     src/           lr::asset    lr::core、lr::runtime、tl::expected；私有 cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    lr::core、lr::runtime、co2；lexec 的 co2 桥随 lexec 而来
   examples/  view/  cli/                          lrender_view  lrender_cli
@@ -642,7 +657,7 @@ lrender/
 | gpu | 边界 | 单元测试用 eventfd 代替 sync file、用自定义的 `Submission::Completion` 代替还没完成的提交，分别覆盖两条等待路径；`gpu_probe`：选择后端、打印 `checkKernel` 的结果，在真实设备上提交并走 sync file 路径，打开计时器时按提交打印每次 dispatch 的耗时 |
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
 | 性能 | 测量 | `lrender_bench`：release 构建，场景和方法见 `benchmarks.md`；每一项性能工作都拿它和基线比 |
-| present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
+| present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`VulkanPresenter` 在 lavapipe 的 headless surface 和 NVIDIA 的 offscreen 图像上测，两条路径都与同一帧的离屏目标逐像素相同，连续交来的帧要么上屏要么丢掉、最新的一帧上屏，改变尺寸之后重新导入，失败的帧不显示；`present_probe`：每种 Presenter 显示测试图案 |
 
 Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设置 `LRENDER_TEST_DEVICE`（设备名的一部分，比如 `NVIDIA`）后，GPU 后端的测试改在那个设备上跑；Vulkan 上再打开验证层的同步检查（`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`），检查两条时间线之间的排序。同步检查不能用 Ubuntu 24.04 自带的 1.3.275 版验证层：它不认 timeline semaphore 上的等待，会把已经排好序的拷贝报成冲突；LunarG SDK 的 1.4.363 没有这个问题，去掉拷贝前的 `waitFor` 时它报出冲突，加上时没有。
 
@@ -655,4 +670,4 @@ Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设�
 7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
 
-还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe` 和基准程序 `lrender_bench`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了 ray query、只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe` 和基准程序 `lrender_bench`。向 tc 提出的新能力见 `library-requirements.md`：前四项都已在 tc 里实现，lrender 都用上了；第五项（主机读的共享 buffer）还是提案。`VulkanPresenter` 在真实窗口上的上屏（`lrender_view --present vulkan`）还没有在显示器上看过：测试只用 headless surface 和 offscreen 图像，本机没有私有的 X 服务器。硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。

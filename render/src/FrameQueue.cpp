@@ -10,6 +10,8 @@
 #include <string>
 #include <utility>
 
+#include <unistd.h>
+
 namespace lr::render {
 
 namespace {
@@ -62,6 +64,7 @@ void FrameQueue::clear() noexcept {
     inFlight.clear();
     pool.clear();
     historyImages.clear();
+    sharedOutputs.clear();
     deviceScene = DeviceScene{};
     accelerations = AccelerationScene{};
     textures.clear();
@@ -117,6 +120,7 @@ void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFli
     auto const start = std::chrono::steady_clock::now();
     auto &device = *context.device;
     pool.endFrame();
+    sharedOutputs.endFrame();
     textures.apply(device, prepared.scene, frame.retired);
     textures.send(device, lastSubmission, frame.retired);
     deviceScene.apply(device, prepared.scene, textures, frame.retired);
@@ -136,6 +140,7 @@ void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFli
     auto submitted = config.gpu->submit(context);
     frame.submission = submitted.submission;
     lastSubmission = submitted.submission;
+    handOver(frame, submitted.fence);
     watch(frame.index, std::move(submitted));
     frame.result.recordTime = std::chrono::steady_clock::now() - start;
 }
@@ -151,9 +156,27 @@ void FrameQueue::recordViews(tc::Device &device, PreparedFrame &prepared, InFlig
     tables.textures = textures.textures();
     frame.runs.reserve(prepared.views.size());
     for (auto &view : prepared.views) {
-        frame.runs.emplace_back(std::move(*view.graph), pool, historyImages, device, config.aliasGraphResources);
+        auto externals = ExternalResources{};
+        if (view.sharedOutput) {
+            externals.emplace_back(view.sharedOutput->resource, sharedOutputs.acquire(device, view, frame.sharedSlots));
+        }
+        frame.runs.emplace_back(std::move(*view.graph), pool, historyImages, device, config.aliasGraphResources,
+                                externals);
         frame.runs.back().record(device, tables);
     }
+}
+
+void FrameQueue::handOver(InFlight &frame, tc::SyncFence const &fence) {
+    for (auto &held : frame.sharedSlots) {
+        auto const copy = fence.empty() ? -1 : ::dup(fence.get());
+        if (frame.failure or (not fence.empty() and copy < 0)) {
+            held.presenter->discardShared(held.slot);
+            continue;
+        }
+        held.presenter->presentShared(
+            SharedBufferFrame{frame.index, held.view, held.target, held.slot, tc::SyncFence{copy}});
+    }
+    frame.sharedSlots.clear();
 }
 
 void FrameQueue::watch(std::uint64_t const index, tc::FencedSubmission submitted) {
@@ -251,10 +274,14 @@ void FrameQueue::loseDevice(gpu::GpuContext &context, std::exception_ptr const &
         outcomes.push_back(Outcome{frame.completion, {}, failure});
         auto const &lostTextures = frame.result.lostTextures;
         unreportedLostTextures.insert(unreportedLostTextures.end(), lostTextures.begin(), lostTextures.end());
+        for (auto const &held : frame.sharedSlots) {
+            held.presenter->discardShared(held.slot);
+        }
     }
     inFlight.clear();
     pool.clear();
     historyImages.clear();
+    sharedOutputs.clear();
     deviceScene = DeviceScene{};
     accelerations = AccelerationScene{};
     textures.clear();

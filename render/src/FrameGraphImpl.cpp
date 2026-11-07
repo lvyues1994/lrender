@@ -119,7 +119,7 @@ PassBuilder &GraphBuilder::addPass(std::string name) {
 }
 
 std::uint32_t GraphBuilder::declareResource(ResourceDesc desc) {
-    resources.push_back(CompiledResource{std::move(desc), std::nullopt, std::nullopt});
+    resources.push_back(CompiledResource{std::move(desc), std::nullopt, std::nullopt, false});
     return static_cast<std::uint32_t>(resources.size() - 1);
 }
 
@@ -142,8 +142,8 @@ FrameGraphBuilder::DeclaredHistory GraphBuilder::declareHistory(ResourceDesc des
     auto current = std::move(desc);
     auto const name = current.name;
     current.name += " (current)";
-    resources.push_back(CompiledResource{std::move(previous), pair.previous, std::nullopt});
-    resources.push_back(CompiledResource{std::move(current), pair.current, std::nullopt});
+    resources.push_back(CompiledResource{std::move(previous), pair.previous, std::nullopt, false});
+    resources.push_back(CompiledResource{std::move(current), pair.current, std::nullopt, false});
     auto const last = static_cast<std::uint32_t>(resources.size() - 1);
     auto const declared = DeclaredHistory{last - 1, last, pair.valid};
     histories.emplace(name, declared);
@@ -167,7 +167,7 @@ CompiledGraph GraphBuilder::compile() && {
     auto needed = std::vector<bool>(resources.size(), false);
     auto written = std::vector<bool>(resources.size(), false);
     for (auto index = std::size_t{0}; index < resources.size(); ++index) {
-        needed[index] = resources[index].history.has_value();
+        needed[index] = resources[index].history.has_value() or resources[index].external;
         written[index] = resources[index].history.has_value();
     }
     for (auto const &readback : readbacks) {
@@ -342,7 +342,7 @@ void ResourcePool::clear() noexcept {
 }
 
 GraphRun::GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device,
-                   bool const alias)
+                   bool const alias, ExternalResources const &externals)
     : graph(std::move(graph_)), pool(&pool_), resources(graph.resources.size()), bytes(graph.resources.size(), 0),
       inHeap(graph.resources.size(), false) {
     auto const placedImages = alias and device.info().placedImages;
@@ -354,6 +354,16 @@ GraphRun::GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &
             continue;
         }
         if (not resource.lifetime) {
+            continue;
+        }
+        if (resource.external) {
+            auto const found = std::find_if(externals.begin(), externals.end(),
+                                            [index](auto const &external) { return external.first == index; });
+            if (found == externals.end()) {
+                throw std::logic_error{"lr::render: nothing was handed over for external buffer '"
+                                       + resource.desc.name + "'"};
+            }
+            resources[index] = found->second;
             continue;
         }
         auto const &desc = resource.desc;
@@ -487,6 +497,8 @@ std::string GraphRun::describe(ViewResult const &result) const {
         auto label = resource.desc.name + "\n" + shapeOf(resource.desc);
         if (resource.history) {
             label += ", history";
+        } else if (resource.external) {
+            label += ", external";
         } else if (bytes[index] != 0) {
             label += ", " + megabytes(bytes[index]);
         }
@@ -513,7 +525,8 @@ void GraphRun::releaseResources() noexcept {
         return;
     }
     for (auto index = std::size_t{0}; index < resources.size(); ++index) {
-        if (resources[index] != nullptr and not graph.resources[index].history and not inHeap[index]) {
+        auto const &resource = graph.resources[index];
+        if (resources[index] != nullptr and not resource.history and not resource.external and not inHeap[index]) {
             pool->release(graph.resources[index].desc, std::move(resources[index]));
         }
     }

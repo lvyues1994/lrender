@@ -9,4 +9,8 @@ target_link_libraries(lrender_cli PRIVATE lr_examples_common lr::present_image l
 if(TARGET lr::present_sdl)
     add_executable(lrender_view view/main.cpp)
     target_link_libraries(lrender_view PRIVATE lr_examples_common lr::present_sdl lr_build_options)
+    if(TARGET lr::present_vulkan)
+        target_link_libraries(lrender_view PRIVATE lr::present_vulkan)
+        target_compile_definitions(lrender_view PRIVATE LR_VIEW_VULKAN_PRESENTER)
+    endif()
 endif()

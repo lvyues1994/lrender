@@ -10,16 +10,26 @@
 #include <chrono>
 #include <cstdint>
 #include <exception>
+#include <memory>
 #include <optional>
 #include <vector>
 
 namespace lr::render {
+
+// A view whose window takes its presenter's SharedBuffer path: the GPU thread hands the
+// graph's external output buffer one of the presenter's slots.
+struct SharedOutput {
+    std::shared_ptr<Presenter> presenter;
+    core::ivec2 extent{0};
+    std::uint32_t resource = 0; // the graph's output
+};
 
 struct PreparedView {
     ViewId view;
     RenderTargetId target;
     std::optional<CompiledGraph> graph;
     std::exception_ptr failure; // the graph could not be built
+    std::optional<SharedOutput> sharedOutput;
 };
 
 // A frame as the render thread hands it to the GPU thread.

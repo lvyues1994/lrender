@@ -9,12 +9,13 @@
 // Every --config gets a renderer of its own on the same device. Their frames alternate, each
 // waited for before the next starts, so that whatever the GPU's clocks do affects them alike.
 // Settings: aliasing=on|off, subgroups=auto|off, singlepass=auto|off, rayqueries=auto|off,
-// taa=on|off, pipeline=visibility|pathtrace. Before the --frames that count (a full turn of
+// taa=on|off, pipeline=visibility|pathtrace, present=drop|readback|shared. Before the --frames that count (a full turn of
 // the orbit unless given), every configuration renders --warmup frames from where the orbit
 // starts, then more until the medians of its last two windows of 30 frames agree within 2%
 // (at most 600 more): the GPU's clocks have risen and the textures have streamed in. Frames
-// go to a window target whose presenter drops them: the Readback path windows take. The
-// scale scene is lr::examples::makeScaleScene's; sponza and game are the glTF sample
+// go to a window target. Its presenter drops them unless present= says otherwise: readback
+// and shared go to an lr::present::VulkanPresenter with offscreen images, through the
+// Readback and the SharedBuffer path (where the device can share). The scale scene is lr::examples::makeScaleScene's; sponza and game are the glTF sample
 // scenes tools/fetch-scenes.sh downloads into --scenes (build/scenes unless given).
 
 #include <lr/asset/AssetLibrary.h>
@@ -23,6 +24,7 @@
 #include <lr/examples/DemoScene.h>
 #include <lr/examples/GltfScene.h>
 #include <lr/examples/ScaleScene.h>
+#include <lr/present/VulkanPresenter.h>
 #include <lr/render/Renderer.h>
 #include <lr/runtime/Runtime.h>
 
@@ -52,7 +54,10 @@ constexpr auto kStableWithin = 0.02;
 constexpr auto kMaxExtraWarmup = 600u;
 constexpr auto kOrbitFrames = 240u;
 
+enum class Presentation : std::uint8_t { Drop, Readback, Shared };
+
 struct Settings {
+    Presentation present = Presentation::Drop;
     bool aliasing = true;
     VariantUse subgroups = VariantUse::Auto;
     VariantUse singlePass = VariantUse::Auto;
@@ -119,6 +124,10 @@ bool applySetting(Settings &settings, std::string const &key, std::string const 
         settings.taa = *on;
     } else if (key == "pipeline" and (value == "visibility" or value == "pathtrace")) {
         settings.pathTrace = value == "pathtrace";
+    } else if (key == "present" and (value == "drop" or value == "readback" or value == "shared")) {
+        settings.present = value == "drop"       ? Presentation::Drop
+                         : value == "readback" ? Presentation::Readback
+                                               : Presentation::Shared;
     } else {
         return false;
     }
@@ -287,7 +296,23 @@ struct Measurements {
     std::vector<PassSeries> passes; // in the order they first ran
     std::uint32_t clockChanges = 0; // frames left out of `gpu`: a pass had no time
     lr::render::ViewStats stats;    // of the last frame
+    // What the presenter did with the counted frames.
+    std::uint64_t shown = 0;
+    std::uint64_t sharedShown = 0;
+    std::uint64_t dropped = 0;
+    double latencyMs = 0.0; // mean, from handing a frame over to presenting it
 };
+
+// The presenter's counts from `before` to `after`.
+void measurePresenter(Measurements &into, lr::present::PresentStats const &before,
+                      lr::present::PresentStats const &after) {
+    into.shown = after.shown - before.shown;
+    into.sharedShown = after.sharedShown - before.sharedShown;
+    into.dropped = after.dropped - before.dropped;
+    auto const latencies = after.meanLatencyMs * static_cast<double>(after.shown)
+                         - before.meanLatencyMs * static_cast<double>(before.shown);
+    into.latencyMs = into.shown == 0 ? 0.0 : latencies / static_cast<double>(into.shown);
+}
 
 // The device time of the frame: the sum of its passes, when each had a time.
 std::optional<double> gpuTimeOf(lr::render::ViewResult const &view) {
@@ -332,6 +357,7 @@ void measure(Measurements &into, lr::render::FrameResult const &frame) {
 // One configuration: its renderer, the view it renders and what it measured.
 struct Run {
     ConfigSpec spec;
+    std::shared_ptr<lr::present::VulkanPresenter> presenter; // unless frames are dropped
     std::unique_ptr<lr::render::Renderer> renderer;
     lr::render::ViewDesc view;
     Series warmup; // the frame time the warm-up waits to settle
@@ -350,14 +376,24 @@ Run makeRun(ConfigSpec spec, Options const &options, lr::runtime::Runtime &runti
     config.singlePassVisibility = spec.settings.singlePass;
     config.rayQueries = spec.settings.rayQueries;
     auto renderer = lr::render::makeRenderer(config);
+    auto presenter = std::shared_ptr<lr::present::VulkanPresenter>{};
+    if (spec.settings.present != Presentation::Drop) {
+        auto presenterConfig = lr::present::VulkanPresenterConfig{};
+        presenterConfig.deviceNameContains = options.device;
+        presenterConfig.offscreen = true;
+        presenterConfig.mode = lr::present::PresentMode::Immediate;
+        presenterConfig.shareBuffers = spec.settings.present == Presentation::Shared;
+        presenter = lr::present::makeVulkanPresenter(presenterConfig);
+    }
     auto view = lr::render::ViewDesc{};
     view.id = lr::core::ViewId{0};
-    view.target = renderer->targets().createWindow(
-        lr::render::WindowTargetDesc{options.size, std::make_shared<DroppingPresenter>()});
+    auto const shown = presenter != nullptr ? std::shared_ptr<lr::render::Presenter>{presenter}
+                                            : std::make_shared<DroppingPresenter>();
+    view.target = renderer->targets().createWindow(lr::render::WindowTargetDesc{options.size, shown});
     view.pipeline = spec.settings.pathTrace ? renderer->pipelines().pathTraceReference()
                                             : renderer->pipelines().visibility();
     view.settings.antiAliasing = spec.settings.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
-    return Run{std::move(spec), std::move(renderer), view, {}, {}};
+    return Run{std::move(spec), std::move(presenter), std::move(renderer), view, {}, {}};
 }
 
 lr::render::FrameResult render(Run &run, lr::core::RenderWorldDelta delta, lr::core::CameraDesc const &camera,
@@ -528,7 +564,9 @@ std::string json(Report const &report, std::vector<Run> const &runs) {
             << measured.clockChanges << ", \"graphBytes\": " << measured.stats.graphBytes
             << ", \"unaliasedBytes\": " << measured.stats.unaliasedBytes
             << ", \"visibleInstances\": " << measured.stats.visibleInstances
-            << ", \"visibleTriangles\": " << measured.stats.visibleTriangles << ",\n     \"passes\": [";
+            << ", \"visibleTriangles\": " << measured.stats.visibleTriangles << ",\n     \"presented\": {\"shown\": "
+            << measured.shown << ", \"sharedShown\": " << measured.sharedShown << ", \"dropped\": " << measured.dropped
+            << ", \"latencyMs\": " << number(measured.latencyMs) << "},\n     \"passes\": [";
         for (auto pass = std::size_t{0}; pass < measured.passes.size(); ++pass) {
             auto const &series = measured.passes[pass];
             out << (pass == 0 ? "\n" : ",\n") << "       {\"pass\": " << quoted(series.pass)
@@ -563,6 +601,12 @@ void print(Report const &report, std::vector<Run> const &runs) {
         printSummary("prepare", measured.prepare.summary());
         printSummary("record", measured.record.summary());
         printSummary("finish", measured.finish.summary());
+        if (run.presenter != nullptr) {
+            std::printf("  presented %llu (%llu shared), dropped %llu, %.3f ms from hand-over to presenting\n",
+                        static_cast<unsigned long long>(measured.shown),
+                        static_cast<unsigned long long>(measured.sharedShown),
+                        static_cast<unsigned long long>(measured.dropped), measured.latencyMs);
+        }
         for (auto const &pass : measured.passes) {
             auto const summary = pass.milliseconds.summary();
             std::printf("    %-34s %2u %9.3f ms\n", pass.pass.c_str(), pass.dispatches, summary ? summary->median : 0.0);
@@ -601,12 +645,26 @@ int run(Options const &options) {
     }
 
     report.clocksBefore = gpuClocks(*runs.front().renderer);
+    auto presented = std::vector<lr::present::PresentStats>{};
+    for (auto const &run : runs) {
+        if (run.presenter != nullptr) {
+            run.presenter->flush();
+        }
+        presented.push_back(run.presenter != nullptr ? run.presenter->stats() : lr::present::PresentStats{});
+    }
     for (auto frame = 0u; frame < options.frames; ++frame) {
         for (auto &run : runs) {
             measure(run.measured, render(run, {}, cameraAt(scene.camera, frame, options.orbit), frame == 0));
         }
     }
     report.clocksAfter = gpuClocks(*runs.front().renderer);
+    for (auto index = std::size_t{0}; index < runs.size(); ++index) {
+        auto &run = runs[index];
+        if (run.presenter != nullptr) {
+            run.presenter->flush();
+            measurePresenter(run.measured, presented[index], run.presenter->stats());
+        }
+    }
 
     print(report, runs);
     if (not options.json.empty()) {

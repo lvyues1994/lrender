@@ -93,3 +93,16 @@ lavapipe（LLVM 20，256 位），960×540，预热至少 10 帧：
 |---|---|---|
 | scale，10 万个实例 | 4.35 → 0.028 | 8.85 → 4.41 |
 | scale，100 万个实例 | 33.3 → 0.092 | 66.3 → 33.1 |
+
+## P1：桌面零拷贝上屏
+
+`present=` 设置把帧交给 offscreen 的 `VulkanPresenter`：它有自己的设备，帧拷进它自己的 BGRA 图像，不经过交换链。RTX 5070 Ti，Sponza 1920×1080，开计时器，240 帧：
+
+| 配置 | GPU 帧 | 墙钟 | 收尾 | 上屏 |
+|---|---|---|---|---|
+| drop（Presenter 直接丢掉，基线的做法） | 1.115 | 2.63 | 0.055 | — |
+| shared（SharedBuffer 路径） | 1.218 | 2.78 | 0.056 | 240 帧全部走 SharedBuffer，没有丢帧，交出到上屏 0.12 ms |
+| readback（Readback 路径） | — | 242 | 232 | 交出到上屏 0.18 ms |
+
+- 两者的先后对调、跑 480 帧，shared 对 drop 是 1.204 对 1.095 ms。多出的约 0.1 ms 分散在所有 pass 上，每个不到 3 µs，像是两个设备的上下文轮流占用 GPU 的代价。
+- readback 的收尾慢在主机读回：tc 的 `createBuffer` 在开了 resizable BAR 的显卡上把回读 buffer 放进显存，主机读 8 MB 要 153 ms，缓存的系统内存只要 0.29 ms（`library-requirements.md` 第 5 项）。离屏目标同样受影响。readback 配置让 GPU 闲下来降到 P8，同一个进程里的其他配置也跟着变慢，所以表里它是单独测的。

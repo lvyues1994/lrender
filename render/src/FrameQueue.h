@@ -5,6 +5,7 @@
 #include "FrameGraphImpl.h"
 #include "PreparedFrame.h"
 #include "RetireList.h"
+#include "SharedOutputs.h"
 #include "TexturePool.h"
 
 #include <lr/gpu/GpuQueue.h>
@@ -59,6 +60,7 @@ private:
         std::chrono::steady_clock::time_point submitted;
         FrameResult result; // the views' ids until finish() fills in the rest
         std::vector<GraphRun> runs;
+        std::vector<SharedSlot> sharedSlots; // until the frame is submitted
         tc::Submission submission;
         RetireList retired;
         // Reported once the device is done with what the frame recorded before it.
@@ -77,6 +79,9 @@ private:
     void start(gpu::GpuContext &context, PreparedFrame prepared);
     void record(gpu::GpuContext &context, PreparedFrame &prepared, InFlight &frame);
     void recordViews(tc::Device &device, PreparedFrame &prepared, InFlight &frame);
+    // The frame's shared slots go to their presenters with a copy of the frame's fence, or
+    // back unshown when the frame failed.
+    static void handOver(InFlight &frame, tc::SyncFence const &fence);
     void watch(std::uint64_t index, tc::FencedSubmission submitted);
     void deviceDone(gpu::GpuContext &context, std::uint64_t index, std::exception_ptr const &failure) noexcept;
     void finishCompleted(gpu::GpuContext &context);
@@ -93,6 +98,7 @@ private:
     TexturePool textures;
     ResourcePool pool;
     HistoryResources historyImages;
+    SharedOutputs sharedOutputs;
     std::deque<PreparedFrame> waiting;
     std::deque<InFlight> inFlight;
     std::vector<Outcome> outcomes;

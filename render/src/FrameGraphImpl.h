@@ -90,6 +90,7 @@ struct CompiledResource {
     std::optional<std::uint64_t> history; // a FrameHistories id
     // Empty for a resource no pass that runs uses: it is not made.
     std::optional<Lifetime> lifetime;
+    bool external = false; // GraphBuilder::createExternalBuffer()
 };
 
 struct CompiledPass {
@@ -147,6 +148,17 @@ struct GraphBuilder final : FrameGraphBuilder {
     PassBuilder &addPass(std::string name) override;
     void onFinish(ResultHandler handler) override { finishers.push_back(std::move(handler)); }
     Blackboard &blackboard() noexcept override { return board; }
+
+    // A buffer of `count` elements the GPU thread hands to the GraphRun (its `externals`),
+    // such as a window's shared buffer: it takes no pool memory, and it is an output of
+    // the graph, so the passes that write it run.
+    template <class T>
+    BufferRef<T> createExternalBuffer(std::string name, std::size_t const count) {
+        auto desc = ResourceDesc{std::move(name), std::type_index{typeid(tc::BufferResource<T>)}, count,
+                                 BufferAccess::Device, {}, {}, {}, {}, false};
+        resources.push_back(CompiledResource{std::move(desc), std::nullopt, std::nullopt, true});
+        return BufferRef<T>{static_cast<std::uint32_t>(resources.size() - 1)};
+    }
 
     // Drops the passes no output or history depends on. Throws std::logic_error when a
     // pass that runs reads a resource no earlier pass writes, or never called record().
@@ -230,14 +242,17 @@ struct RecordedDispatch {
     std::string program;
 };
 
+// A graph's external buffers, by resource index, as tc::BufferResource<T>s.
+using ExternalResources = std::vector<std::pair<std::uint32_t, std::shared_ptr<void>>>;
+
 // One view's graph on the GPU thread: holds its resources from record() until finish() or
 // its destruction, which must both wait until the device has finished the frame. With
 // `alias`, the device buffers and images (images where the device places them) share a
 // heap by their lifetimes; their contents are undefined when their first pass starts, as
-// always.
+// always. Throws std::logic_error when `externals` lacks an external buffer a pass uses.
 struct GraphRun {
-    GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device,
-             bool alias);
+    GraphRun(CompiledGraph graph_, ResourcePool &pool_, HistoryResources &histories, tc::Device &device, bool alias,
+             ExternalResources const &externals = {});
     GraphRun(GraphRun &&) noexcept = default;
     GraphRun &operator=(GraphRun &&) = delete;
     ~GraphRun();

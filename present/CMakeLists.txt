@@ -2,6 +2,13 @@
 
 add_subdirectory(image_sequence)
 
+find_package(Vulkan QUIET)
+if(TARGET Vulkan::Vulkan)
+    add_subdirectory(vulkan)
+else()
+    message(STATUS "lrender: Vulkan not found, so no lr::present_vulkan")
+endif()
+
 find_package(SDL2 CONFIG QUIET)
 if(TARGET SDL2::SDL2)
     add_subdirectory(sdl)

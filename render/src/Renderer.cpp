@@ -42,17 +42,27 @@ constexpr auto kSceneOutOfStep = ~std::uint64_t{0};
 struct TargetState {
     core::ivec2 extent{0};
     std::shared_ptr<Presenter> presenter; // window targets
+    bool sharesBuffers = false;           // the presenter's SharedBuffer path
 };
 
+// Whether frames of `device` can go to `presenter` through its SharedBuffer path.
+bool sharedPath(Presenter const &presenter, tc::DeviceInfo const &device) {
+    return device.syncFiles and device.importsMemory and presenter.sharesBuffersWith(device);
+}
+
 struct TargetsImpl final : RenderTargets {
+    explicit TargetsImpl(tc::DeviceInfo const &device_) : device(device_) {}
+
     RenderTargetId createWindow(WindowTargetDesc const &desc) override {
         if (desc.presenter == nullptr) {
             throw std::invalid_argument{"lr::render: a window target needs a presenter"};
         }
-        return add(TargetState{desc.extent, desc.presenter});
+        return add(TargetState{desc.extent, desc.presenter, sharedPath(*desc.presenter, device)});
     }
 
-    RenderTargetId createImage(ImageTargetDesc const &desc) override { return add(TargetState{desc.extent, nullptr}); }
+    RenderTargetId createImage(ImageTargetDesc const &desc) override {
+        return add(TargetState{desc.extent, nullptr, false});
+    }
 
     void resize(RenderTargetId const id, core::ivec2 const extent) override {
         checkExtent(extent);
@@ -99,6 +109,7 @@ private:
         return found->second;
     }
 
+    tc::DeviceInfo device;
     std::mutex mutex;
     std::unordered_map<RenderTargetId, TargetState> targets;
     std::uint32_t next = 0;
@@ -311,6 +322,7 @@ struct RendererImpl final : Renderer {
           timers(config.gpuTimers and gpu->info().timers),
           chosen(chooseFor(*gpu, config)),
           models(*gpu),
+          targetSet(gpu->info()),
           worldParallel(makeFramePoolFor(*config.runtime)),
           conversions(makeBackgroundConversions(*config.runtime)),
           world(textureLimitsOf(gpu->info().limits, config.maxTextureSize), *worldParallel, *conversions,
@@ -449,18 +461,24 @@ private:
 
     // A view whose graph fails to build fails the frame on the GPU thread.
     PreparedView prepareView(ViewPlan const &plan, std::uint64_t const frameIndex, ModelList const &modelList) {
-        auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr};
+        auto prepared = PreparedView{plan.desc.id, plan.desc.target, std::nullopt, nullptr, std::nullopt};
         try {
             auto builder = GraphBuilder{GraphOwner{&histories, plan.desc.id, plan.desc.target, frameIndex}};
             auto context = viewContextOf(plan, frameIndex, modelList);
             auto const extent = plan.target.extent;
             auto const pixels = static_cast<std::size_t>(extent.x) * static_cast<std::size_t>(extent.y);
+            auto const shared = plan.target.sharesBuffers;
             context.sceneColor = builder.createImage<HdrFormat>("scene colour", extent);
-            context.output = builder.createReadbackBuffer<tc::uint>("output", pixels);
+            context.output = shared ? builder.createExternalBuffer<tc::uint>("output", pixels)
+                                    : builder.createReadbackBuffer<tc::uint>("output", pixels);
             for (auto const &feature : plan.features) {
                 feature->setup(builder, context);
             }
-            builder.readback<tc::uint>(context.output, deliverOutput(plan, frameIndex));
+            if (shared) {
+                prepared.sharedOutput = SharedOutput{plan.target.presenter, extent, context.output.index};
+            } else {
+                builder.readback<tc::uint>(context.output, deliverOutput(plan, frameIndex));
+            }
             prepared.graph = std::move(builder).compile();
             prepared.graph->describe = plan.desc.describeGraph;
         } catch (...) {

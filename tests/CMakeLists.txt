@@ -78,6 +78,10 @@ if(TARGET lr::present_sdl)
     list(APPEND lr_present_test_sources present/SdlPresenterTest.cpp)
     list(APPEND lr_present_test_libraries lr::present_sdl)
 endif()
+if(TARGET lr::present_vulkan)
+    list(APPEND lr_present_test_sources present/VulkanPresenterTest.cpp)
+    list(APPEND lr_present_test_libraries lr::present_vulkan)
+endif()
 lr_add_test(lr_present_tests
     SOURCES ${lr_present_test_sources}
     KERNELS render/TestKernels.h

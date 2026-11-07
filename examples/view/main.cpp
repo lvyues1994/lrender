@@ -3,7 +3,11 @@
 //
 //   lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
 //                [--pipeline visibility|pathtrace] [--frames <n>] [--gltf <file> | --mesh <file>]
+//                [--present sdl|vulkan]
 //
+// --present vulkan shows the frames through lr::present::VulkanPresenter on the window's
+// Vulkan surface, on the SharedBuffer path where the device is the same GPU; sdl (the
+// default) blits them through an SDL renderer, on the Readback path.
 // The camera circles slowly; drag with the left mouse button to turn it and scroll to zoom.
 // Tab switches between the visibility and the path tracing pipelines (1 and 2 pick one);
 // T turns the visibility pipeline's temporal anti-aliasing off and on (on to begin with);
@@ -24,6 +28,11 @@
 #include <lr/examples/GltfScene.h>
 #include <lr/examples/Scripts.h>
 #include <lr/present/SdlPresenter.h>
+#ifdef LR_VIEW_VULKAN_PRESENTER
+#include <lr/present/VulkanPresenter.h>
+
+#include <SDL_vulkan.h>
+#endif
 #include <lr/render/Renderer.h>
 #include <lr/runtime/Runtime.h>
 #include <lr/scene/ScriptHost.h>
@@ -63,10 +72,14 @@ struct Options {
     std::uint32_t frames = 0; // 0: until the window is closed
     std::string gltf;
     std::string mesh;
+    bool vulkanPresenter = false;
 };
 
 bool apply(Options &options, std::string const &flag, std::string const &value) {
-    if (flag == "--gltf") {
+    if (flag == "--present") {
+        options.vulkanPresenter = value == "vulkan";
+        return value == "vulkan" or value == "sdl";
+    } else if (flag == "--gltf") {
         options.gltf = value;
     } else if (flag == "--mesh") {
         options.mesh = value;
@@ -222,20 +235,108 @@ SdlRendererHandle makeSdlRenderer(SDL_Window *const window) {
     return renderer;
 }
 
-ivec2 outputSize(SDL_Renderer *const renderer) {
-    auto width = 0;
-    auto height = 0;
-    if (SDL_GetRendererOutputSize(renderer, &width, &height) != 0 or width <= 0 or height <= 0) {
-        throw std::runtime_error{std::string{"SDL_GetRendererOutputSize: "} + SDL_GetError()};
+// How the window shows the frames.
+struct WindowOutput {
+    virtual ~WindowOutput() = default;
+
+    virtual std::shared_ptr<lr::render::Presenter> presenter() const = 0;
+    // The window's size in pixels.
+    virtual ivec2 size() const = 0;
+    // On the main thread: whether a frame came to the window since the last call.
+    virtual bool show() = 0;
+    virtual std::string describe() const = 0;
+};
+
+// Through an SDL renderer, which the main thread blits the newest frame with.
+struct SdlOutput final : WindowOutput {
+    explicit SdlOutput(SDL_Window *const window)
+        : renderer(makeSdlRenderer(window)),
+          frames(lr::present::makeSdlPresenter(lr::present::SdlPresenterConfig{renderer.get()})) {}
+
+    std::shared_ptr<lr::render::Presenter> presenter() const override { return frames; }
+
+    ivec2 size() const override {
+        auto width = 0;
+        auto height = 0;
+        if (SDL_GetRendererOutputSize(renderer.get(), &width, &height) != 0 or width <= 0 or height <= 0) {
+            throw std::runtime_error{std::string{"SDL_GetRendererOutputSize: "} + SDL_GetError()};
+        }
+        return ivec2{width, height};
     }
-    return ivec2{width, height};
+
+    bool show() override { return frames->blitLatest().has_value(); }
+
+    std::string describe() const override {
+        auto info = SDL_RendererInfo{};
+        SDL_GetRendererInfo(renderer.get(), &info);
+        return std::string{"SDL "} + info.name + " on " + SDL_GetCurrentVideoDriver();
+    }
+
+private:
+    SdlRendererHandle renderer;
+    std::shared_ptr<lr::present::SdlPresenter> frames;
+};
+
+#ifdef LR_VIEW_VULKAN_PRESENTER
+// Through a Vulkan swapchain of the window's surface, presented on the presenter's thread.
+struct VulkanOutput final : WindowOutput {
+    VulkanOutput(SDL_Window *const window_, std::string const &device) : window(window_) {
+        auto count = 0u;
+        if (SDL_Vulkan_GetInstanceExtensions(window, &count, nullptr) != SDL_TRUE) {
+            throw std::runtime_error{std::string{"SDL_Vulkan_GetInstanceExtensions: "} + SDL_GetError()};
+        }
+        auto names = std::vector<char const *>(count);
+        SDL_Vulkan_GetInstanceExtensions(window, &count, names.data());
+        auto config = lr::present::VulkanPresenterConfig{};
+        config.instanceExtensions.assign(names.begin(), names.end());
+        config.createSurface = [window = window](VkInstance const instance) {
+            auto surface = VkSurfaceKHR{VK_NULL_HANDLE};
+            return SDL_Vulkan_CreateSurface(window, instance, &surface) == SDL_TRUE ? surface : VK_NULL_HANDLE;
+        };
+        config.deviceNameContains = device;
+        frames = lr::present::makeVulkanPresenter(config);
+    }
+
+    std::shared_ptr<lr::render::Presenter> presenter() const override { return frames; }
+
+    ivec2 size() const override {
+        auto width = 0;
+        auto height = 0;
+        SDL_Vulkan_GetDrawableSize(window, &width, &height);
+        return ivec2{std::max(width, 1), std::max(height, 1)};
+    }
+
+    bool show() override {
+        auto const shown = frames->stats().shown;
+        return std::exchange(lastShown, shown) != shown;
+    }
+
+    std::string describe() const override { return "Vulkan presenter on " + frames->deviceName(); }
+
+private:
+    SDL_Window *window;
+    std::shared_ptr<lr::present::VulkanPresenter> frames;
+    std::uint64_t lastShown = 0;
+};
+#endif
+
+std::unique_ptr<WindowOutput> outputFor(Options const &options, SDL_Window *const window) {
+#ifdef LR_VIEW_VULKAN_PRESENTER
+    if (options.vulkanPresenter) {
+        return std::make_unique<VulkanOutput>(window, options.device);
+    }
+#else
+    if (options.vulkanPresenter) {
+        throw std::runtime_error{"this build has no lr::present_vulkan"};
+    }
+#endif
+    return std::make_unique<SdlOutput>(window);
 }
 
 struct Session {
     lr::render::Renderer &renderer;
-    lr::present::SdlPresenter &presenter;
+    WindowOutput &output;
     SDL_Window *window;
-    SDL_Renderer *sdlRenderer;
     lr::render::RenderTargetId target;
 };
 
@@ -385,7 +486,7 @@ LoopResult runLoop(Session const &session, Options const &options, Simulation co
             handle(event, input, simulation.orbit);
         }
         if (input.resized) {
-            session.renderer.targets().resize(session.target, outputSize(session.sdlRenderer));
+            session.renderer.targets().resize(session.target, session.output.size());
             input.resized = false;
         }
         auto const finished = reports.count.load(std::memory_order_acquire);
@@ -398,7 +499,7 @@ LoopResult runLoop(Session const &session, Options const &options, Simulation co
             submitFrame(session, input, simulate(simulation, clock, reports, result), reports, scope);
             ++result.submitted;
         }
-        auto const shown = session.presenter.blitLatest().has_value();
+        auto const shown = session.output.show();
         if (shown) {
             ++result.shown;
             showStatus(session, input, reports);
@@ -455,13 +556,14 @@ bool reportScriptFailures(lr::scene::ScriptHost &scripts) {
 
 int run(Options const &options) {
     auto const video = SdlVideo{};
+    auto const flags = std::uint32_t{SDL_WINDOW_RESIZABLE}
+                     | (options.vulkanPresenter ? std::uint32_t{SDL_WINDOW_VULKAN} : std::uint32_t{0});
     auto const window = WindowHandle{SDL_CreateWindow("lrender", SDL_WINDOWPOS_UNDEFINED, SDL_WINDOWPOS_UNDEFINED,
-                                                      options.size.x, options.size.y, SDL_WINDOW_RESIZABLE)};
+                                                      options.size.x, options.size.y, flags)};
     if (window == nullptr) {
         throw std::runtime_error{std::string{"SDL_CreateWindow: "} + SDL_GetError()};
     }
-    auto const sdlRenderer = makeSdlRenderer(window.get());
-    auto presenter = lr::present::makeSdlPresenter(lr::present::SdlPresenterConfig{sdlRenderer.get()});
+    auto const output = outputFor(options, window.get());
     auto runtime = lr::runtime::makeRuntime(lr::runtime::RuntimeConfig{});
     auto config = lr::render::RendererConfig{};
     config.backend = options.backend;
@@ -469,10 +571,8 @@ int run(Options const &options) {
     config.runtime = runtime.get();
     config.framesInFlight = kFramesInFlight;
     auto renderer = lr::render::makeRenderer(config);
-    auto sdlInfo = SDL_RendererInfo{};
-    SDL_GetRendererInfo(sdlRenderer.get(), &sdlInfo);
-    std::printf("backend %s: %s; SDL %s on %s\n", renderer->deviceInfo().backend.c_str(),
-                renderer->deviceInfo().deviceName.c_str(), sdlInfo.name, SDL_GetCurrentVideoDriver());
+    std::printf("backend %s: %s; %s\n", renderer->deviceInfo().backend.c_str(),
+                renderer->deviceInfo().deviceName.c_str(), output->describe().c_str());
 
     auto const source = lr::asset::makeFileSource(lr::asset::FileSourceConfig{});
     auto assetConfig = lr::asset::AssetLibraryConfig{};
@@ -490,9 +590,9 @@ int run(Options const &options) {
     auto const camera = startScene(options, *world, *scripts, *assets, orbit);
 
     auto kernelReloads = kernelReloadsFor(*renderer, *runtime);
-    auto const target = renderer->targets().createWindow(
-        lr::render::WindowTargetDesc{outputSize(sdlRenderer.get()), presenter});
-    auto const session = Session{*renderer, *presenter, window.get(), sdlRenderer.get(), target};
+    auto const target =
+        renderer->targets().createWindow(lr::render::WindowTargetDesc{output->size(), output->presenter()});
+    auto const session = Session{*renderer, *output, window.get(), target};
     auto reports = FrameReports{};
     auto scope = lexec::counting_scope{};
     auto const start = Clock::now();
@@ -504,7 +604,7 @@ int run(Options const &options) {
         failure = std::current_exception();
     }
     static_cast<void>(lexec::sync_wait(scope.join()));
-    if (presenter->blitLatest()) {
+    if (output->show()) {
         ++loop.shown;
     }
     auto const elapsed = std::chrono::duration<double, std::milli>(Clock::now() - start);
@@ -538,7 +638,8 @@ int main(int argc, char **argv) {
         std::fprintf(stderr, "usage: lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
                              "                    [--pipeline visibility|pathtrace] [--frames <n>] "
-                             "[--gltf <file> | --mesh <file>]\n");
+                             "[--gltf <file> | --mesh <file>]\n"
+                             "                    [--present sdl|vulkan]\n");
         return 2;
     }
     try {

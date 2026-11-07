@@ -5,8 +5,11 @@
 #include <doctest/doctest.h>
 
 #include <algorithm>
+#include <memory>
 #include <optional>
 #include <stdexcept>
+#include <string>
+#include <utility>
 #include <vector>
 
 namespace {
@@ -145,6 +148,35 @@ TEST_CASE("the same heap plan gets the same heap and resources once they are bac
     CHECK(&other.heap.identity() != heap); // the first set is in use
     pool.releasePlaced(plan, compiled.resources, std::move(other));
     pool.releasePlaced(plan, compiled.resources, std::move(again));
+}
+
+TEST_CASE("an external buffer is an output, taken from what the run is handed and never pooled") {
+    auto request = tc::DeviceRequest{};
+    request.backend = "cpu";
+    auto const device = tc::createDevice(request);
+    auto const compile = [] {
+        auto graph = GraphBuilder{};
+        auto const out = graph.createExternalBuffer<tc::uint>("out", 4);
+        auto &write = graph.addPass("write");
+        write.write(out);
+        write.record([out](PassContext &context) { context.buffer(out)[2] = 7u; });
+        return std::make_pair(std::move(graph).compile(), out);
+    };
+    auto [compiled, out] = compile();
+    REQUIRE(passNames(compiled) == std::vector<std::string>{"write"});
+    auto const handed = std::make_shared<tc::BufferResource<tc::uint>>(4);
+    auto pool = ResourcePool{};
+    auto histories = HistoryResources{};
+
+    auto run = GraphRun{std::move(compiled), pool, histories, *device, true, {{out.index, handed}}};
+    run.record(*device, SceneTables{});
+    auto result = ViewResult{};
+    run.finish(result);
+
+    CHECK((*handed)[2] == 7u);
+    CHECK(handed.use_count() == 1);
+    CHECK(result.stats.unaliasedBytes == 0);
+    CHECK_THROWS_AS((GraphRun{compile().first, pool, histories, *device, true}), std::logic_error);
 }
 
 TEST_CASE("a pass that reads what no earlier pass wrote is an error") {

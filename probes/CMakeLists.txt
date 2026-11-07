@@ -5,7 +5,7 @@ target_include_directories(layout_probe PRIVATE "${PROJECT_SOURCE_DIR}/render")
 target_link_libraries(layout_probe PRIVATE lr::render tc_devices lr_build_options)
 
 # The benchmark loads its scenes through the examples' helpers.
-if(TARGET lr_examples_common)
+if(TARGET lr_examples_common AND TARGET lr::present_vulkan)
     add_executable(lrender_bench bench/main.cpp)
-    target_link_libraries(lrender_bench PRIVATE lr_examples_common lr_build_options)
+    target_link_libraries(lrender_bench PRIVATE lr_examples_common lr::present_vulkan lr_build_options)
 endif()
