@@ -12,6 +12,7 @@
 #include <atomic>
 #include <chrono>
 #include <cstdint>
+#include <cstdlib>
 #include <thread>
 #include <tuple>
 #include <vector>
@@ -141,6 +142,37 @@ TEST_CASE("an IO task waits on the runtime's poller until a descriptor becomes r
     CHECK(signalled);
     REQUIRE(result.has_value());
     CHECK(std::get<0>(*result));
+}
+
+// An idle IO worker sleeps in the poller; work handed to it from another thread must wake
+// it every time, however the hand-off falls against its way to sleep.
+TEST_CASE("an idle IO worker wakes for every task handed to it from another thread") {
+    constexpr auto kHandOffs = 20000;
+    auto config = smallConfig();
+    config.ioWorkers = 1;
+    auto runtime = makeRuntime(config);
+    auto done = std::atomic<int>{0};
+    auto driver = std::thread{[&] {
+        for (auto handOff = 0; handOff < kHandOffs; ++handOff) {
+            static_cast<void>(lexec::sync_wait(lexec::schedule(runtime->io()) | lexec::then([] {})));
+            done.store(handOff + 1, std::memory_order_release);
+        }
+    }};
+    auto seen = 0;
+    auto progressAt = std::chrono::steady_clock::now();
+    while (seen < kHandOffs) {
+        std::this_thread::sleep_for(std::chrono::milliseconds{10});
+        auto const now = done.load(std::memory_order_acquire);
+        if (now != seen) {
+            seen = now;
+            progressAt = std::chrono::steady_clock::now();
+        } else if (std::chrono::steady_clock::now() - progressAt > std::chrono::seconds{10}) {
+            FAIL_CHECK("hand-off " << seen << " never woke the IO worker");
+            std::abort(); // the stuck driver thread cannot be joined
+        }
+    }
+    driver.join();
+    CHECK(seen == kHandOffs);
 }
 
 TEST_CASE("a runtime without threads for the background pool is rejected") {

@@ -1,6 +1,6 @@
 # 对依赖库的新需求
 
-前五项是对 compute_shaders 的，最后一节是 stackfull 的一处修正。
+前五项是对 compute_shaders 的，最后一节是 stackfull 的一处修正（已经改了）。
 
 lrender 需要 tc 新增五项能力。前三项互相独立；第四项是 `hardware-raster.md` 里硬件光栅方案的前提，现在桌面的零拷贝上屏也用它；第五项是测零拷贝上屏时发现的，还是提案，等同意了再动 tc。每一项写明 lrender 怎么用、为什么在 tc 的职责之内、接口草案（照 tc 现有的写法，命名只是建议）、各后端的语义与回退，以及验收方式。
 
@@ -194,7 +194,7 @@ BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType extent, HostA
 
 **验收：** 各后端上设备写、主机读的结果正确，和 `Writes` 的 buffer 一样；RTX 5070 Ti 上主机读 8 MB 的 `Reads` buffer 不到 1 ms；lrender 的帧图把回读 buffer 改成 `Reads` 之后，Sponza 1080p 的离屏目标和 Readback 路径的收尾时间从 230 ms 降到几毫秒。
 
-## stackfull：交给空闲 IO 工作线程的任务可能唤不醒它（修正提案，还没有改）
+## stackfull：交给空闲 IO 工作线程的任务可能唤不醒它（已修正，`acb8861`）
 
 **现象。** lrender 的 asset 测试偶尔挂住：debug 构建里约 60 次一次，ASan 下约 10 次一次，机器忙的时候更多。挂住时所有线程都在睡：主线程在 `sync_wait` 里等一次加载，两个池的线程在条件变量上，IO 工作线程在 `epoll_wait` 里。给每个线程发个信号把它们从系统调用里打断，测试就接着跑完了，所以是丢了一次唤醒。
 
@@ -214,5 +214,7 @@ BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType extent, HostA
 ```
 
 **验证。** 一个只有一个 IO 工作线程的 runtime，从另一个线程连续交 2 万次任务、每次等它完成，进度停住 10 秒就算失败：没改的 stackfull 5 次里失败 2 次（第 1193 和 1569 次交接没有唤醒它）；改了之后 20 次都没有失败，lrender 的 asset 测试并行跑 400 次也没有再挂住。这个测试应当放进 stackfull 自己的测试里（`stackfull::runtime` 带 Driver、一个工作线程），lrender 的 `RuntimeTest` 也加一份，等 lrender 固定到修正后的提交再加，免得现在的 CI 时红时绿。
+
+**实现。** stackfull 的 `acb8861` 按上面的写法修正，`IoTest.TasksSpawnedFromOutsideWakeTheWorkerSleepingInTheDriver`（一个带 Driver 的工作线程，从外面连续派生 2 万个任务）在修正前每次都在几百次之内挂住，修正后 epoll 和 poll 两种 Poller 上都通过，stackfull 的 308 个测试在 debug、asan、tsan 下都通过。lrender 固定到这个提交，`RuntimeTest` 加了同样的测试；asset 测试连跑 100 次不再挂住。
 
 **为什么在 stackfull 的职责之内。** 调度器的唤醒协议是 stackfull 的；lrender 只是通过 `lr::runtime` 用它，绕不开。

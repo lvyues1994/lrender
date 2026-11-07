@@ -20,7 +20,7 @@ FetchContent_Declare(co2
 
 FetchContent_Declare(stackfull
     GIT_REPOSITORY https://github.com/lvyues1994/stackfull.git
-    GIT_TAG 67d087c00c00b904a25cffa1420cd284175b3a19
+    GIT_TAG acb88611e1de8fbe7ed6e195ba76ad9cbb04a9dc
     SYSTEM)
 
 FetchContent_Declare(compute_shaders

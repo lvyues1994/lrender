@@ -645,6 +645,7 @@ lrender/
 
 - 命名空间为 `lr::<module>`，每个模块一个 CMake 目标，目标图与模块图一致。
 - 作为库交付：要提供 install 规则和 `find_package(lrender)` 用的包配置，每个可选层单独导出为一个组件。现在还没有，因为依赖库还不都有 install 规则，等它们有了再加。
+- stackfull 至少要固定到 `acb8861`：在这之前，交给空闲 IO 工作线程的任务偶尔唤不醒它（工作线程在成为 timekeeper 之前被认领，随后睡进 Driver），asset 的加载因此偶尔挂住，见 `library-requirements.md`。
 - compute_shaders 至少要固定到 `fb599b6`：只在设备上的 buffer 和 `copyBuffer` 从 `9cec48f` 开始才有，传输队列从 `c3660eb` 开始，ray query 从 `317c74a` 开始；`2f5b9f9` 让同一个 EGL display 上的 OpenGL 设备共用一次初始化，在这之前销毁一个设备（或者找别的设备时跳过一个正在用的 display）会把 display 一起终止，而测试里常常同时开着两个设备；`fb599b6` 让 CPU 后端和 Vulkan 一样把底层引用为 0 的实例当作不参与追踪。
 - 平台取各库支持范围的交集：Linux x86_64/aarch64 和 Android arm64。
 - 主机构建依赖 libclang-18-dev 和 glslang-tools（tc 转译器）；Android 交叉编译时使用主机构建出的转译器。发布构建加 `-DTC_PROGRAM_RELOAD=OFF`。
@@ -674,4 +675,4 @@ Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设�
 7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
 
-还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe` 和基准程序 `lrender_bench`。向 tc 提出的新能力见 `library-requirements.md`：前四项都已在 tc 里实现，lrender 都用上了；第五项（主机读的共享 buffer）还是提案。`VulkanPresenter` 在真实窗口上的上屏（`lrender_view --present vulkan`）还没有在显示器上看过：测试只用 headless surface 和 offscreen 图像，本机没有私有的 X 服务器。硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe` 和基准程序 `lrender_bench`。向 tc 提出的新能力见 `library-requirements.md`：前四项都已在 tc 里实现，lrender 都用上了；第五项（主机读的共享 buffer）还是提案。`VulkanPresenter` 在真实窗口上的上屏（`lrender_view --present vulkan`）在本机的 X11 桌面上跑过一次：debug 构建，RTX 5070 Ti，300 帧 3.6 秒（每秒 83 帧），FIFO 交换链在 60 Hz 下上屏 201 帧，其余的被更新的帧替换，没有报错；自动测试只用 headless surface 和 offscreen 图像，因为本机没有私有的 X 服务器。硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。
