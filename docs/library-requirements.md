@@ -2,9 +2,9 @@
 
 前五项是对 compute_shaders 的，最后一节是 stackfull 的一处修正（已经改了）。
 
-lrender 需要 tc 新增五项能力。前三项互相独立；第四项是 `hardware-raster.md` 里硬件光栅方案的前提，现在桌面的零拷贝上屏也用它；第五项是测零拷贝上屏时发现的，还是提案，等同意了再动 tc。每一项写明 lrender 怎么用、为什么在 tc 的职责之内、接口草案（照 tc 现有的写法，命名只是建议）、各后端的语义与回退，以及验收方式。
+lrender 需要 tc 新增五项能力。前三项互相独立；第四项是 `hardware-raster.md` 里硬件光栅方案的前提，现在桌面的零拷贝上屏也用它；第五项是测零拷贝上屏时发现的。每一项写明 lrender 怎么用、为什么在 tc 的职责之内、接口草案（照 tc 现有的写法，命名只是建议）、各后端的语义与回退，以及验收方式。
 
-前四项都已在 tc 里实现，接口以 tc 的 README 为准：只在设备上的 buffer、内存堆与资源别名是 `9cec48f`，传输队列是 `c3660eb`，外部 buffer 导入与设备 UUID 是 `93f30dc`，ray query 是 `317c74a`。lrender 都用上了：第 1 项的 ray query（路径追踪器的变体），第 2 项的只在设备上的 buffer、`copyBuffer` 和堆（帧图里生命周期不重叠的资源共用内存），第 3 项的传输队列，第 4 项的外部 buffer（窗口的 SharedBuffer 路径，见 `lr::present_vulkan`）。实现中补了一处：CPU 后端原先不接受底层引用为 0 的实例（Vulkan 规定它不参与追踪），`fb599b6` 改成和 Vulkan 一样；lavapipe 在这种实例上有问题，见 tc 的 README。
+五项都已在 tc 里实现，接口以 tc 的 README 为准（第 5 项是 `efc7d78`，帧图的回读 buffer 用它，Sponza 1080p 经 Readback 路径的收尾从 232 ms 降到 1 ms 以内）：只在设备上的 buffer、内存堆与资源别名是 `9cec48f`，传输队列是 `c3660eb`，外部 buffer 导入与设备 UUID 是 `93f30dc`，ray query 是 `317c74a`。lrender 都用上了：第 1 项的 ray query（路径追踪器的变体），第 2 项的只在设备上的 buffer、`copyBuffer` 和堆（帧图里生命周期不重叠的资源共用内存），第 3 项的传输队列，第 4 项的外部 buffer（窗口的 SharedBuffer 路径，见 `lr::present_vulkan`）。实现中补了一处：CPU 后端原先不接受底层引用为 0 的实例（Vulkan 规定它不参与追踪），`fb599b6` 改成和 Vulkan 一样；lavapipe 在这种实例上有问题，见 tc 的 README。
 
 文中的设备能力是在本机查到的：RTX 5070 Ti（NVIDIA 595 驱动）和 lavapipe（Mesa 25.2.8）。
 
@@ -14,7 +14,7 @@ lrender 需要 tc 新增五项能力。前三项互相独立；第四项是 `har
 | 2 | 只在设备上的 buffer、内存堆与资源别名 | 帧图的临时资源 | buffer 和图像都别名 | buffer 别名，图像不别名 | 都别名 |
 | 3 | 独立的传输队列 | 纹理与几何的流式上传 | 专用的传输队列族 | 退化为主时间线 | `submit()` 时完成 |
 | 4 | 导入外部 buffer、设备 UUID | 与硬件光栅模块共享可见性缓冲 | 有 | 桌面 GL 有 | 不适用 |
-| 5 | 主机读的共享 buffer（提案） | 离屏目标和 Readback 路径的回读 | 主机缓存的内存 | `GL_CLIENT_STORAGE_BIT` | 不变 |
+| 5 | 主机读的共享 buffer | 离屏目标和 Readback 路径的回读 | 主机缓存的内存 | `GL_CLIENT_STORAGE_BIT` | 不变 |
 
 ## 1. kernel 里的 ray query 与加速结构
 
@@ -158,7 +158,7 @@ device->waitFor(copied);                             // 之后排队的主时间
 - 后端：Vulkan 用 `VK_KHR_external_memory_fd`，本机两个设备都有；桌面 GL 用 `GL_EXT_memory_object_fd`；GLES 取决于扩展；CPU 不适用。
 - 为什么在 tc 的职责之内：tc 已经和相机、合成器这类外部使用者共享内存（`ExternalImage`、`SyncFence`），这一项把同样的能力扩展到 buffer 和桌面 Linux。
 
-## 5. 主机读的共享 buffer（提案，还没有实现）
+## 5. 主机读的共享 buffer（已实现，`efc7d78`）
 
 **lrender 怎么用。** 离屏目标和窗口的 Readback 路径，最后一个 pass 都把整帧写进 `createBuffer()` 的内存，帧做完后主机就地读：离屏目标拷进 `ViewResult::image`，Readback 的 Presenter 拷一份再交给自己的线程。1080p 一帧是 8 MB。
 

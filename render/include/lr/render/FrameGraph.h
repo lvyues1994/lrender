@@ -194,7 +194,8 @@ struct FrameGraphBuilder {
         return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, BufferAccess::Upload))};
     }
 
-    // Memory the host reads with readback() once the frame is done.
+    // Memory the host reads with readback() once the frame is done: cached host memory
+    // where the device has it (tc::HostAccess::Reads).
     template <class T>
     BufferRef<T> createReadbackBuffer(std::string name, std::size_t const count) {
         return BufferRef<T>{declareResource(bufferDesc<T>(std::move(name), count, BufferAccess::Readback))};
@@ -267,7 +268,7 @@ private:
             case BufferAccess::Readback:
                 break;
             }
-            return std::make_shared<tc::BufferResource<T>>(device.createBuffer<T>(elements));
+            return std::make_shared<tc::BufferResource<T>>(device.createBuffer<T>(elements, tc::HostAccess::Reads));
         };
         auto hostData = [](void *const resource) -> void const * {
             return static_cast<tc::BufferResource<T> const *>(resource)->data();

@@ -632,8 +632,10 @@ private:
         capture.buffer = Owned<VkBuffer>{device, buffer, vkDestroyBuffer};
         auto requirements = VkMemoryRequirements{};
         vkGetBufferMemoryRequirements(device, buffer, &requirements);
-        auto const type = gpu.memoryType(requirements.memoryTypeBits, VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
-                                                                          | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT);
+        auto constexpr readable = VkMemoryPropertyFlags{VK_MEMORY_PROPERTY_HOST_VISIBLE_BIT
+                                                        | VK_MEMORY_PROPERTY_HOST_COHERENT_BIT};
+        auto type = gpu.memoryType(requirements.memoryTypeBits, readable | VK_MEMORY_PROPERTY_HOST_CACHED_BIT);
+        type = type ? type : gpu.memoryType(requirements.memoryTypeBits, readable);
         if (not type) {
             throw std::runtime_error{"lr::present: no host memory to capture into"};
         }
