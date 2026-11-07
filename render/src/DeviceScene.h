@@ -5,6 +5,7 @@
 #include "TexturePool.h"
 
 #include <lr/render/GpuTypes.h>
+#include <lr/render/Renderer.h>
 
 #include <tc/device.hpp>
 
@@ -23,6 +24,8 @@ namespace lr::render {
 struct DeviceScene {
     void apply(tc::Device &device, SceneUpdate const &update, TexturePool &textures, RetireList &retired);
     SceneTables tables() const noexcept;
+    // What the tables take on the device (SceneMemory, textures aside).
+    SceneMemory memory() const noexcept;
 
 private:
     void applyHierarchies(tc::Device &device, SceneUpdate const &update, RetireList &retired);
@@ -30,6 +33,7 @@ private:
 
     std::unique_ptr<tc::TableResource<GpuVertex, VertexLayout>> vertices;
     std::unique_ptr<tc::BufferResource<tc::uint>> indices;
+    std::unique_ptr<tc::TableResource<GpuCluster>> clusters;
     std::unique_ptr<tc::TableResource<GpuMesh>> meshes;
     std::unique_ptr<tc::TableResource<GpuInstance, InstanceLayout>> instances;
     std::unique_ptr<tc::TableResource<GpuMaterial>> materials;

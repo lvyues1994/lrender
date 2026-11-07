@@ -32,6 +32,15 @@ bool reserveTable(std::unique_ptr<tc::TableResource<T, Layout>> &table, std::siz
     return true;
 }
 
+template <class T, class Layout>
+std::uint64_t bytesOf(std::unique_ptr<tc::TableResource<T, Layout>> const &table) noexcept {
+    return table == nullptr ? 0 : tc::TableResource<T, Layout>::wordsFor(table->size()) * sizeof(std::uint32_t);
+}
+
+std::uint64_t bytesOf(std::unique_ptr<tc::BufferResource<tc::uint>> const &buffer) noexcept {
+    return buffer == nullptr ? 0 : buffer->size() * sizeof(tc::uint);
+}
+
 bool reserveBuffer(std::unique_ptr<tc::BufferResource<tc::uint>> &buffer, std::size_t const capacity,
                    RetireList &retired) {
     if (buffer != nullptr and buffer->size() >= capacity) {
@@ -153,6 +162,7 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, TexturePo
     auto const &capacity = update.capacity;
     auto const newVertices = reserveTable(vertices, capacity.vertices, retired);
     auto const newIndices = reserveBuffer(indices, capacity.indices, retired);
+    auto const newClusters = reserveTable(clusters, capacity.clusters, retired);
     auto const newMeshes = reserveTable(meshes, capacity.meshes, retired);
     auto const newInstances = reserveTable(instances, capacity.instances, retired);
     auto const newMaterials = reserveTable(materials, capacity.materials, retired);
@@ -163,6 +173,9 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, TexturePo
             vertices->set(geometry.firstVertex + index, geometry.vertices[index]);
         }
         std::copy(geometry.indices.begin(), geometry.indices.end(), indices->begin() + geometry.firstIndex);
+        for (auto index = std::size_t{0}; index < geometry.clusters.size(); ++index) {
+            clusters->set(geometry.firstCluster + index, geometry.clusters[index]);
+        }
     }
     if (newVertices) {
         device.uploadTable(*vertices);
@@ -170,12 +183,18 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, TexturePo
     if (newIndices) {
         device.uploadBuffer(*indices);
     }
+    if (newClusters) {
+        device.uploadTable(*clusters);
+    }
     for (auto const &geometry : update.geometry) {
         if (not newVertices and not geometry.vertices.empty()) {
             device.uploadTable(*vertices, geometry.firstVertex, geometry.vertices.size());
         }
         if (not newIndices and not geometry.indices.empty()) {
             device.uploadBuffer(*indices, geometry.firstIndex, geometry.indices.size());
+        }
+        if (not newClusters and not geometry.clusters.empty()) {
+            device.uploadTable(*clusters, geometry.firstCluster, geometry.clusters.size());
         }
     }
 
@@ -189,10 +208,19 @@ void DeviceScene::apply(tc::Device &device, SceneUpdate const &update, TexturePo
 }
 
 SceneTables DeviceScene::tables() const noexcept {
-    return SceneTables{vertices.get(),  indices.get(),       meshes.get(),    instances.get(),
-                       materials.get(), lights.get(),        instanceCount,   lightCount,
-                       blasNodes.get(), blasTriangles.get(), blasRoots.get(), tlasNodes.get(),
-                       tlasNodeCount,   nullptr,             MaterialTextures{}};
+    return SceneTables{vertices.get(),  indices.get(),   meshes.get(),        clusters.get(),
+                       instances.get(), materials.get(), lights.get(),        instanceCount,
+                       lightCount,      blasNodes.get(), blasTriangles.get(), blasRoots.get(),
+                       tlasNodes.get(), tlasNodeCount,   nullptr,             MaterialTextures{}};
+}
+
+SceneMemory DeviceScene::memory() const noexcept {
+    auto memory = SceneMemory{};
+    memory.geometry = bytesOf(vertices) + bytesOf(indices);
+    memory.clusters = bytesOf(clusters);
+    memory.objects = bytesOf(meshes) + bytesOf(instances) + bytesOf(materials) + bytesOf(lights);
+    memory.hierarchies = bytesOf(blasNodes) + bytesOf(blasTriangles) + bytesOf(blasRoots) + bytesOf(tlasNodes);
+    return memory;
 }
 
 } // namespace lr::render

@@ -21,11 +21,12 @@ namespace lr::render {
 // The render thread's copy of the scene. Each frame applies a RenderWorldDelta and turns
 // the changes into the SceneUpdate the GPU thread applies to its tables. Instances and
 // lights stay dense (removal moves the last one into the gap) because kernels loop over
-// them; meshes and materials keep their slots. Geometry and hierarchies of replaced or
-// removed meshes are not reclaimed yet. Texture images pass through to the GPU thread
-// (TextureLayout places them); the world keeps only their ids. The meshes of a delta are
-// encoded, and their hierarchies built, as items of `parallel`; the textures that need
-// converting are converted on `conversions` and upload with the next frame.
+// them; meshes and materials keep their slots. Geometry, clusters and hierarchies of
+// replaced or removed meshes are not reclaimed yet. Texture images pass through to the GPU
+// thread (TextureLayout places them); the world keeps only their ids. The meshes of a delta
+// are encoded and cut into clusters, and their hierarchies built, as items of `parallel`;
+// the textures that need converting are converted on `conversions` and upload with the
+// next frame.
 struct RenderWorld {
     // Encodes and converts on the calling thread.
     explicit RenderWorld(TextureLimits const &limits = TextureLimits{});
@@ -78,6 +79,7 @@ private:
         // While hierarchies are kept: the root of the mesh's, and the bounds of its triangles.
         std::uint32_t blasRoot;
         core::Aabb blasBounds;
+        std::vector<GpuCluster> clusters; // for a full update
     };
     struct MaterialRecord {
         std::uint32_t slot;
@@ -123,6 +125,7 @@ private:
     std::uint32_t meshSlotEnd = 0;
     std::uint32_t vertexEnd = 0;
     std::uint32_t indexEnd = 0;
+    std::uint32_t clusterEnd = 0;
 
     TextureLayout textures;
     std::unordered_set<core::TextureId> textureIds;

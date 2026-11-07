@@ -411,6 +411,14 @@ TEST_CASE("a world that works on the frame pool makes the updates a serial one m
             CHECK(x.firstVertex == y.firstVertex);
             CHECK(x.firstIndex == y.firstIndex);
             CHECK(x.indices == y.indices);
+            CHECK(x.firstCluster == y.firstCluster);
+            auto const sameClusters = std::equal(
+                x.clusters.begin(), x.clusters.end(), y.clusters.begin(), y.clusters.end(), [](auto const &p, auto const &q) {
+                    return p.boundsMin == q.boundsMin and p.boundsMax == q.boundsMax and p.center == q.center
+                       and p.radius == q.radius and p.coneAxis == q.coneAxis and p.coneCutoff == q.coneCutoff
+                       and p.firstTriangle == q.firstTriangle and p.triangleCount == q.triangleCount;
+                });
+            CHECK(sameClusters);
             auto const sameVertices = std::equal(
                 x.vertices.begin(), x.vertices.end(), y.vertices.begin(), y.vertices.end(), [](auto const &p, auto const &q) {
                     return p.position == q.position and p.normal.value == q.normal.value and p.uv.value == q.uv.value;

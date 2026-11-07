@@ -54,6 +54,8 @@ struct TexturePool {
     tc::uint residentRef(core::TextureId id) const;
     MaterialTextures textures() const noexcept;
     std::size_t queuedUploads() const noexcept { return queue.size(); }
+    // What the pools take on the device, every mip level of every layer.
+    std::uint64_t memoryBytes() const noexcept;
     // Drops every device resource, as when the device is lost.
     void clear() noexcept;
 

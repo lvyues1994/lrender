@@ -296,6 +296,7 @@ struct Measurements {
     std::vector<PassSeries> passes; // in the order they first ran
     std::uint32_t clockChanges = 0; // frames left out of `gpu`: a pass had no time
     lr::render::ViewStats stats;    // of the last frame
+    lr::render::SceneMemory memory; // of the last frame
     // What the presenter did with the counted frames.
     std::uint64_t shown = 0;
     std::uint64_t sharedShown = 0;
@@ -352,6 +353,7 @@ void measure(Measurements &into, lr::render::FrameResult const &frame) {
         }
     }
     into.stats = view.stats;
+    into.memory = frame.sceneMemory;
 }
 
 // One configuration: its renderer, the view it renders and what it measured.
@@ -564,7 +566,10 @@ std::string json(Report const &report, std::vector<Run> const &runs) {
             << measured.clockChanges << ", \"graphBytes\": " << measured.stats.graphBytes
             << ", \"unaliasedBytes\": " << measured.stats.unaliasedBytes
             << ", \"visibleInstances\": " << measured.stats.visibleInstances
-            << ", \"visibleTriangles\": " << measured.stats.visibleTriangles << ",\n     \"presented\": {\"shown\": "
+            << ", \"visibleTriangles\": " << measured.stats.visibleTriangles << ",\n     \"sceneBytes\": {\"geometry\": "
+            << measured.memory.geometry << ", \"clusters\": " << measured.memory.clusters
+            << ", \"objects\": " << measured.memory.objects << ", \"hierarchies\": " << measured.memory.hierarchies
+            << ", \"textures\": " << measured.memory.textures << "},\n     \"presented\": {\"shown\": "
             << measured.shown << ", \"sharedShown\": " << measured.sharedShown << ", \"dropped\": " << measured.dropped
             << ", \"latencyMs\": " << number(measured.latencyMs) << "},\n     \"passes\": [";
         for (auto pass = std::size_t{0}; pass < measured.passes.size(); ++pass) {
@@ -596,6 +601,11 @@ void print(Report const &report, std::vector<Run> const &runs) {
         std::printf("%s%s%s: %u instances and %u triangles visible, frame graph %.1f MiB\n", run.spec.name.c_str(),
                     run.spec.text.empty() ? "" : " ", run.spec.text.c_str(), measured.stats.visibleInstances,
                     measured.stats.visibleTriangles, static_cast<double>(measured.stats.graphBytes) / 1048576.0);
+        auto const mib = [](std::uint64_t const bytes) { return static_cast<double>(bytes) / 1048576.0; };
+        std::printf("  scene: geometry %.1f MiB, clusters %.1f MiB, objects %.1f MiB, hierarchies %.1f MiB, "
+                    "textures %.1f MiB\n",
+                    mib(measured.memory.geometry), mib(measured.memory.clusters), mib(measured.memory.objects),
+                    mib(measured.memory.hierarchies), mib(measured.memory.textures));
         printSummary("gpu", measured.gpu.summary());
         printSummary("wall", measured.wall.summary());
         printSummary("prepare", measured.prepare.summary());

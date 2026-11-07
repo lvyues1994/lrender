@@ -1,5 +1,7 @@
 #include "RenderWorld.h"
 
+#include "Clusters.h"
+
 #include <algorithm>
 #include <cmath>
 #include <stdexcept>
@@ -256,6 +258,7 @@ RenderWorld::RenderWorld(TextureLimits const &limits, ParallelFor &parallel_, Im
 void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &upserts, SceneUpdate &update) {
     auto geometry = std::vector<GeometryUpload>(upserts.size());
     auto bounds = std::vector<core::Aabb>(upserts.size());
+    auto clusters = std::vector<std::vector<GpuCluster>>(upserts.size());
     auto firsts = std::vector<std::pair<std::uint32_t, std::uint32_t>>{};
     firsts.reserve(upserts.size());
     for (auto const &upsert : upserts) {
@@ -267,18 +270,25 @@ void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &upserts, Sce
         auto const &data = *upserts[index].mesh;
         geometry[index] = encodeGeometry(data, firsts[index].first, firsts[index].second);
         bounds[index] = core::boundsOf(data);
+        clusters[index] = buildClusters(data);
     });
     for (auto index = std::size_t{0}; index < upserts.size(); ++index) {
         auto const &upsert = upserts[index];
         auto const found = meshes.find(upsert.id);
         auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
+        auto const clusterCount = static_cast<std::uint32_t>(clusters[index].size());
         auto const gpu = GpuMesh{geometry[index].firstVertex,
                                  geometry[index].firstIndex,
                                  static_cast<std::uint32_t>(upsert.mesh->indices.size() / 3),
                                  bounds[index].min,
                                  bounds[index].max,
-                                 static_cast<std::uint32_t>(geometry[index].vertices.size())};
-        meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}};
+                                 static_cast<std::uint32_t>(geometry[index].vertices.size()),
+                                 clusterEnd,
+                                 clusterCount};
+        geometry[index].firstCluster = clusterEnd;
+        geometry[index].clusters = clusters[index];
+        clusterEnd += clusterCount;
+        meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}, std::move(clusters[index])};
         update.geometry.push_back(std::move(geometry[index]));
         update.meshes.push_back(Indexed<GpuMesh>{slot, gpu});
     }
@@ -483,7 +493,10 @@ void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUp
 SceneUpdate RenderWorld::fullUpdate() {
     auto update = SceneUpdate{};
     for (auto const &[id, record] : meshes) {
-        update.geometry.push_back(encodeGeometry(*record.data, record.gpu.firstVertex, record.gpu.firstIndex));
+        auto geometry = encodeGeometry(*record.data, record.gpu.firstVertex, record.gpu.firstIndex);
+        geometry.firstCluster = record.gpu.firstCluster;
+        geometry.clusters = record.clusters;
+        update.geometry.push_back(std::move(geometry));
         update.meshes.push_back(Indexed<GpuMesh>{record.slot, record.gpu});
     }
     for (auto const &[id, record] : materials) {
@@ -527,10 +540,10 @@ void RenderWorld::keepHierarchies(SceneUpdate &update) {
 SceneCapacity RenderWorld::capacity() const noexcept {
     auto const kept = [this](std::uint32_t const count) { return hierarchies ? roundUpToPowerOfTwo(count) : 0u; };
     return SceneCapacity{roundUpToPowerOfTwo(vertexEnd),       roundUpToPowerOfTwo(indexEnd),
-                         roundUpToPowerOfTwo(meshSlotEnd),     roundUpToPowerOfTwo(instanceCount()),
-                         roundUpToPowerOfTwo(materialSlotEnd), roundUpToPowerOfTwo(lightCount()),
-                         kept(blasNodeEnd),                    kept(blasTriangleEnd),
-                         kept(tlasNodeCount)};
+                         roundUpToPowerOfTwo(clusterEnd),      roundUpToPowerOfTwo(meshSlotEnd),
+                         roundUpToPowerOfTwo(instanceCount()), roundUpToPowerOfTwo(materialSlotEnd),
+                         roundUpToPowerOfTwo(lightCount()),    kept(blasNodeEnd),
+                         kept(blasTriangleEnd),                kept(tlasNodeCount)};
 }
 
 SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {

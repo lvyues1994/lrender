@@ -22,6 +22,8 @@ struct GeometryUpload {
     std::vector<GpuVertex> vertices;
     std::uint32_t firstIndex = 0;
     std::vector<tc::uint> indices;
+    std::uint32_t firstCluster = 0;
+    std::vector<GpuCluster> clusters;
 };
 
 // A material and the textures it refers to (base colour, metallic-roughness, emissive,
@@ -55,6 +57,7 @@ struct TextureUpload {
 struct SceneCapacity {
     std::uint32_t vertices = 1;
     std::uint32_t indices = 1;
+    std::uint32_t clusters = 1;
     std::uint32_t meshes = 1;
     std::uint32_t instances = 1;
     std::uint32_t materials = 1;

@@ -249,6 +249,8 @@ struct Presenter {                  // lr::present 提供实现，宿主也可�
 
 镜像持有网格的不可变句柄，设备丢失之后可以重新上传几何；纹理的像素数据不保留（见“纹理”）。
 
+簇：编码网格的同一项里，网格的三角形按索引顺序切成簇，每个簇取接下来的三角形，直到超过 124 个三角形或 64 个不同的顶点。簇只是三角形的连续区间，所以三角形的编号不变，可见性缓冲、路径追踪的层次结构和 ray query 的底层结构都不受影响。每个簇（`GpuCluster`，16 个字）在网格空间里有包围盒，还有给背面剔除用的包围球和法线锥（meshoptimizer 的判据：观察点 p 满足 `dot(center - p, axis) >= cutoff * |center - p| + radius` 时，簇里每个三角形都背对它；法线张开太大时 cutoff 取 1，永远不剔除）。`GpuMesh` 记着自己的第一个簇和簇数，簇表和顶点、索引一样只往后追加，网格的簇也留在镜像里，供设备丢失后的全量更新。簇的质量取决于网格的索引顺序：多数网格按顶点缓存排过序，在空间上是局部的；顺序乱的网格，簇的包围盒会偏大，剔除效果变差但结果仍然正确。Sponza 的 26 万个三角形是 0.3 MiB 的簇表，ABeautifulGame 的 150 万个是 1.0 MiB。
+
 #### 帧图与扩展
 
 ```cpp
@@ -370,7 +372,7 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 
 #### 计时
 
-- `FrameResult::wallTime` 总是带从 `submit()` 到这一帧收尾的墙钟时间。其中主机上的三段也分开报告：`prepareTime` 是渲染线程应用增量、建视图帧图的时间，`recordTime` 是 GPU 线程从开始录制到提交的时间，`finishTime` 是设备做完之后 GPU 线程收尾（回读、取计时、交给 Presenter）的时间。三段互不重叠，都在 `wallTime` 之内；剩下的是排队和设备执行。
+- `FrameResult::wallTime` 总是带从 `submit()` 到这一帧收尾的墙钟时间。其中主机上的三段也分开报告：`prepareTime` 是渲染线程应用增量、建视图帧图的时间，`recordTime` 是 GPU 线程从开始录制到提交的时间，`finishTime` 是设备做完之后 GPU 线程收尾（回读、取计时、交给 Presenter）的时间。三段互不重叠，都在 `wallTime` 之内；剩下的是排队和设备执行。`FrameResult::sceneMemory` 是帧收尾时场景占的设备内存：几何、簇、网格实例材质灯光这几张表、软件层次结构，以及纹理池的每一层每一级。
 - `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，`ViewResult::passTimings` 还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch（帧按顺序收尾，失败的帧也取一次再丢掉，所以取到的正好是这一帧的），帧图按同样的顺序记下每次经 `PassContext` 的 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）；程序名只用来核对：有 pass 绕过 `PassContext` 直接调用设备时，两者对不上，这一帧就不给 pass 耗时。GPU 线程自己的 dispatch 不属于任何 pass：纹理池变大时的拷贝和加速结构在视图之前，到达的纹理的 mip 级别在视图之后，这几个程序在两头按名字跳过。
 - 开着计时器时，tc 会在每个计时的 dispatch 前插入完整屏障，dispatch 之间不再重叠，所以 `gpuTimers` 默认关闭，只在开发、剖析和挑选表布局时打开。帧与帧之间的重叠不受影响。
 - Adreno 上 GLES 的计时查询几乎总是返回接近 0 的值，又不报告时钟不连续，所以这类设备上只看墙钟时间。llvmpipe 的 OpenGL 和 GLES 也一样。

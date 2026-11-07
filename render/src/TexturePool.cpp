@@ -44,6 +44,25 @@ std::uint32_t levelsOf(std::uint32_t const size) noexcept {
 
 } // namespace
 
+std::uint64_t TexturePool::memoryBytes() const noexcept {
+    auto bytes = std::uint64_t{0};
+    for (auto const &pool : pools) {
+        auto levelBytes = std::uint64_t{0};
+        for (auto level = std::uint32_t{0}; pool.size != 0 and (pool.size >> level) != 0; ++level) {
+            if (pool.compressed) {
+                auto const blocks = tc::compressedBlockCount(*pool.compressed, tc::ivec2{static_cast<int>(pool.size)}, level);
+                levelBytes += std::uint64_t{tc::compressedFormatInfo(*pool.compressed).blockBytes}
+                            * static_cast<std::uint64_t>(blocks.x) * static_cast<std::uint64_t>(blocks.y);
+            } else {
+                auto const side = std::uint64_t{pool.size >> level};
+                levelBytes += side * side * 4u;
+            }
+        }
+        bytes += levelBytes * pool.layers;
+    }
+    return bytes;
+}
+
 void TexturePool::prepare(tc::Device &device, RetireList &retired) {
     if (prepared) {
         return;

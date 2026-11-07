@@ -262,6 +262,8 @@ FrameResult FrameQueue::finish(gpu::GpuContext &context, InFlight &frame) {
         }
         frame.runs[index].finish(view);
     }
+    frame.result.sceneMemory = deviceScene.memory();
+    frame.result.sceneMemory.textures = textures.memoryBytes();
     auto const finished = std::chrono::steady_clock::now();
     frame.result.finishTime = finished - start;
     frame.result.wallTime = finished - frame.submitted;

@@ -176,7 +176,7 @@ void probeInstances(tc::Device &device, Options const &options) {
     auto extent = std::uniform_real_distribution<float>{0.2f, 3.0f};
     for (auto index = std::size_t{0}; index < data.meshes->size(); ++index) {
         auto const half = core::vec3{extent(random), extent(random), extent(random)};
-        data.meshes->set(index, render::GpuMesh{0, 0, static_cast<tc::uint>(index + 1), -half, half, 0});
+        data.meshes->set(index, render::GpuMesh{0, 0, static_cast<tc::uint>(index + 1), -half, half, 0, 0, 0});
     }
     device.uploadTable(*data.meshes);
     auto const count = static_cast<std::size_t>(262144.0 * options.scale);

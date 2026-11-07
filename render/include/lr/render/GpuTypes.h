@@ -33,8 +33,30 @@ struct GpuMesh {
     tc::uint triangleCount;
     tc::vec3 boundsMin;
     tc::vec3 boundsMax;
-    tc::uint vertexCount; // from firstVertex
+    tc::uint vertexCount;  // from firstVertex
+    tc::uint firstCluster; // its clusters, in the cluster table
+    tc::uint clusterCount;
 };
+
+// A run of a mesh's triangles that culling takes as one: triangles [firstTriangle,
+// firstTriangle + triangleCount) of the mesh, at most clusterMaxTriangles() of them over at
+// most clusterMaxVertices() vertices. In the mesh's space: the box around them, and, to
+// cull a run whose triangles all face away (meshoptimizer's test), a sphere around them and
+// a cone of their normals. A viewer at p sees none of them when dot(center - p, coneAxis)
+// >= coneCutoff * length(center - p) + radius, which a cutoff of 1 never meets.
+struct GpuCluster {
+    tc::vec3 boundsMin;
+    tc::uint firstTriangle;
+    tc::vec3 boundsMax;
+    tc::uint triangleCount;
+    tc::vec3 center;
+    float radius;
+    tc::vec3 coneAxis;
+    float coneCutoff;
+};
+
+inline tc::uint clusterMaxTriangles() { return 124u; }
+inline tc::uint clusterMaxVertices() { return 64u; }
 
 struct GpuInstance {
     tc::Encoded<tc::mat4, tc::Affine3x4> objectToWorld;
@@ -164,6 +186,8 @@ using VertexTable = tc::TableBinding<GpuVertex, B, VertexLayout>;
 template <tc::uint B>
 using MeshTable = tc::TableBinding<GpuMesh, B>;
 template <tc::uint B>
+using ClusterTable = tc::TableBinding<GpuCluster, B>;
+template <tc::uint B>
 using InstanceTable = tc::TableBinding<GpuInstance, B, InstanceLayout>;
 template <tc::uint B>
 using MaterialTable = tc::TableBinding<GpuMaterial, B>;
@@ -209,6 +233,7 @@ struct SceneTables {
     tc::TableResource<GpuVertex, VertexLayout> *vertices = nullptr;
     tc::BufferResource<tc::uint> *indices = nullptr;
     tc::TableResource<GpuMesh> *meshes = nullptr;
+    tc::TableResource<GpuCluster> *clusters = nullptr;
     tc::TableResource<GpuInstance, InstanceLayout> *instances = nullptr;
     tc::TableResource<GpuMaterial> *materials = nullptr;
     tc::TableResource<GpuLight> *lights = nullptr;

@@ -81,6 +81,16 @@ struct FrameDesc {
     std::vector<ViewDesc> views;
 };
 
+// Device memory the scene takes, in bytes: its tables, as large as they have grown, and
+// the texture pools with their mip levels.
+struct SceneMemory {
+    std::uint64_t geometry = 0;    // vertices and indices
+    std::uint64_t clusters = 0;
+    std::uint64_t objects = 0;     // meshes, instances, materials and lights
+    std::uint64_t hierarchies = 0; // the hierarchies of path tracing without ray queries
+    std::uint64_t textures = 0;
+};
+
 struct FrameResult {
     std::uint64_t frameIndex = 0;
     std::vector<ViewResult> views;
@@ -92,6 +102,8 @@ struct FrameResult {
     std::chrono::duration<double, std::milli> prepareTime{0.0};
     std::chrono::duration<double, std::milli> recordTime{0.0};
     std::chrono::duration<double, std::milli> finishTime{0.0};
+    // As the GPU thread held the scene when it finished the frame.
+    SceneMemory sceneMemory;
     // Textures the device held when it was lost: upsert them again. Until then materials
     // use their factors alone. Frames that fail leave the list to the next one that does not.
     std::vector<core::TextureId> lostTextures;
