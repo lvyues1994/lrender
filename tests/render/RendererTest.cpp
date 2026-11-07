@@ -120,6 +120,27 @@ TEST_CASE("frames submitted back to back are rendered and completed in order, on
     });
 }
 
+TEST_CASE("a frame's host times on the render thread and the GPU thread are parts of its wall time") {
+    test::forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
+        auto const view = pathTraced(harness, imageTarget(harness, core::ivec2{8, 8}));
+        auto frames = std::vector<render::FrameDesc>{};
+        for (auto frame = 0u; frame < kOrderedFrames; ++frame) {
+            frames.push_back(render::FrameDesc{frame == 0 ? quadScene() : core::RenderWorldDelta{}, {view}});
+        }
+
+        auto const outcomes = renderBackToBack(*harness.renderer, std::move(frames));
+
+        for (auto const &outcome : outcomes) {
+            REQUIRE(outcome.result.has_value());
+            auto const &result = *outcome.result;
+            CHECK(result.prepareTime.count() > 0.0);
+            CHECK(result.recordTime.count() > 0.0);
+            CHECK(result.finishTime.count() > 0.0);
+            CHECK(result.prepareTime + result.recordTime + result.finishTime <= result.wallTime);
+        }
+    });
+}
+
 TEST_CASE("accumulating frames back to back gives the image accumulating them one at a time does") {
     constexpr auto kFrames = 8u;
     auto const finalImage = [](RenderHarness &harness, bool const backToBack) {

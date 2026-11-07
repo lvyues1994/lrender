@@ -26,6 +26,7 @@ struct PreparedView {
 struct PreparedFrame {
     std::uint64_t index = 0;
     std::chrono::steady_clock::time_point submitted;
+    std::chrono::duration<double, std::milli> prepareTime{0.0};
     // The device generation the scene update was made for: one the GPU thread has
     // replaced cannot apply it.
     std::uint64_t deviceGeneration = 0;

@@ -86,6 +86,12 @@ struct FrameResult {
     std::vector<ViewResult> views;
     // From submit() until the frame was finished, after the device.
     std::chrono::duration<double, std::milli> wallTime{0.0};
+    // Host time within wallTime: on the render thread, applying the delta and building the
+    // views' graphs; on the GPU thread, recording the frame for the device and submitting
+    // it, and finishing it once the device is done (readbacks, timings, presenting).
+    std::chrono::duration<double, std::milli> prepareTime{0.0};
+    std::chrono::duration<double, std::milli> recordTime{0.0};
+    std::chrono::duration<double, std::milli> finishTime{0.0};
     // Textures the device held when it was lost: upsert them again. Until then materials
     // use their factors alone. Frames that fail leave the list to the next one that does not.
     std::vector<core::TextureId> lostTextures;

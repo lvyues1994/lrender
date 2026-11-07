@@ -353,7 +353,12 @@ struct RendererImpl final : Renderer {
         auto work =
             lexec::schedule(renderThread.scheduler())
             | lexec::then([this, pending = std::move(pending), delta = std::move(frame.delta),
-                           plans = std::move(plans)]() mutable { return prepare(std::move(pending), delta, plans); })
+                           plans = std::move(plans)]() mutable {
+                  auto const start = std::chrono::steady_clock::now();
+                  auto ready = prepare(std::move(pending), delta, plans);
+                  ready.prepareTime = std::chrono::steady_clock::now() - start;
+                  return ready;
+              })
             | lexec::let_value([this](PreparedFrame &ready) {
                   return gpu->record([this, ready = std::move(ready)](gpu::GpuContext &context) mutable noexcept {
                       frames.accept(context, std::move(ready));

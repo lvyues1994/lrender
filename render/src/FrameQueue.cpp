@@ -87,6 +87,7 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
     frame.submitted = prepared.submitted;
     frame.completion = prepared.completion;
     frame.result.frameIndex = prepared.index;
+    frame.result.prepareTime = prepared.prepareTime;
     frame.result.lostTextures = std::move(prepared.lostTextures);
     for (auto const &view : prepared.views) {
         auto result = ViewResult{};
@@ -113,6 +114,7 @@ void FrameQueue::start(gpu::GpuContext &context, PreparedFrame prepared) {
 // the scene stay in step; the work recorded before a failure is still submitted, and the
 // frame keeps its resources until the device is done with it.
 void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFlight &frame) {
+    auto const start = std::chrono::steady_clock::now();
     auto &device = *context.device;
     pool.endFrame();
     textures.apply(device, prepared.scene, frame.retired);
@@ -135,6 +137,7 @@ void FrameQueue::record(gpu::GpuContext &context, PreparedFrame &prepared, InFli
     frame.submission = submitted.submission;
     lastSubmission = submitted.submission;
     watch(frame.index, std::move(submitted));
+    frame.result.recordTime = std::chrono::steady_clock::now() - start;
 }
 
 void FrameQueue::recordViews(tc::Device &device, PreparedFrame &prepared, InFlight &frame) {
@@ -219,6 +222,7 @@ void FrameQueue::finishCompleted(gpu::GpuContext &context) {
 }
 
 FrameResult FrameQueue::finish(gpu::GpuContext &context, InFlight &frame) {
+    auto const start = std::chrono::steady_clock::now();
     auto const recorded = frame.submission.sequence() != 0;
     auto const timings = config.timers and recorded ? context.device->takeTimings(frame.submission)
                                                     : std::vector<tc::KernelTiming>{};
@@ -235,7 +239,9 @@ FrameResult FrameQueue::finish(gpu::GpuContext &context, InFlight &frame) {
         }
         frame.runs[index].finish(view);
     }
-    frame.result.wallTime = std::chrono::steady_clock::now() - frame.submitted;
+    auto const finished = std::chrono::steady_clock::now();
+    frame.result.finishTime = finished - start;
+    frame.result.wallTime = finished - frame.submitted;
     return std::move(frame.result);
 }
 

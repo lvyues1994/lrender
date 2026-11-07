@@ -135,6 +135,21 @@ GeometryUpload encodeGeometry(core::MeshData const &data, std::uint32_t const fi
     return geometry;
 }
 
+template <class Upserts>
+auto idsOf(Upserts const &upserts) {
+    auto ids = std::unordered_set<decltype(upserts.front().id)>{};
+    for (auto const &upsert : upserts) {
+        ids.insert(upsert.id);
+    }
+    return ids;
+}
+
+// Whether the world (a map or set by id) has `id`, or the delta upserts it.
+template <class Id, class World>
+bool known(Id const id, World const &world, std::unordered_set<Id> const &upserted) {
+    return world.count(id) != 0 or upserted.count(id) != 0;
+}
+
 std::vector<core::Aabb> triangleBounds(core::MeshData const &mesh) {
     auto bounds = std::vector<core::Aabb>{};
     bounds.reserve(mesh.indices.size() / 3);
@@ -150,22 +165,11 @@ std::vector<core::Aabb> triangleBounds(core::MeshData const &mesh) {
 } // namespace
 
 void RenderWorld::validate(core::RenderWorldDelta const &delta) const {
-    auto meshIds = std::unordered_set<core::MeshId>{};
-    for (auto const &[id, record] : meshes) {
-        meshIds.insert(id);
-    }
     for (auto const &upsert : delta.meshes) {
         validateMesh(upsert);
-        meshIds.insert(upsert.id);
     }
-    auto knownTextures = textureIds;
     for (auto const &upsert : delta.textures) {
         validateImage(upsert);
-        knownTextures.insert(upsert.id);
-    }
-    auto materialIds = std::unordered_set<core::MaterialId>{};
-    for (auto const &[id, record] : materials) {
-        materialIds.insert(id);
     }
     for (auto const &upsert : delta.materials) {
         if (upsert.material.model.value >= materialModels) {
@@ -173,36 +177,25 @@ void RenderWorld::validate(core::RenderWorldDelta const &delta) const {
                                         + " uses material model " + std::to_string(upsert.material.model.value)
                                         + ", which the renderer does not have"};
         }
-        materialIds.insert(upsert.id);
     }
+    auto const upsertedMeshes = idsOf(delta.meshes);
+    auto const upsertedMaterials = idsOf(delta.materials);
     for (auto const &upsert : delta.instances) {
-        if (meshIds.count(upsert.mesh) == 0 or materialIds.count(upsert.material) == 0) {
+        if (not known(upsert.mesh, meshes, upsertedMeshes) or not known(upsert.material, materials, upsertedMaterials)) {
             throw std::invalid_argument{"lr::render: instance " + std::to_string(upsert.id.value)
                                         + " refers to a mesh or material the world does not have"};
         }
     }
 
-    auto instanceIds = std::unordered_set<core::InstanceId>{};
-    for (auto const &record : instances) {
-        instanceIds.insert(record.id);
-    }
-    for (auto const &upsert : delta.instances) {
-        instanceIds.insert(upsert.id);
-    }
-    auto lightIds = std::unordered_set<core::LightId>{};
-    for (auto const &record : lights) {
-        lightIds.insert(record.id);
-    }
-    for (auto const &upsert : delta.lights) {
-        lightIds.insert(upsert.id);
-    }
     auto const &removed = delta.removed;
-    auto const missing = [](auto const &ids, auto const &known) {
-        return std::any_of(ids.begin(), ids.end(), [&known](auto const id) { return known.count(id) == 0; });
+    auto const allKnown = [](auto const &ids, auto const &world, auto const &upserted) {
+        return std::all_of(ids.begin(), ids.end(), [&](auto const id) { return known(id, world, upserted); });
     };
-    if (missing(removed.meshes, meshIds) or missing(removed.textures, knownTextures)
-        or missing(removed.materials, materialIds) or missing(removed.instances, instanceIds)
-        or missing(removed.lights, lightIds)) {
+    if (not allKnown(removed.meshes, meshes, upsertedMeshes)
+        or not allKnown(removed.textures, textureIds, idsOf(delta.textures))
+        or not allKnown(removed.materials, materials, upsertedMaterials)
+        or not allKnown(removed.instances, instanceIndex, idsOf(delta.instances))
+        or not allKnown(removed.lights, lightIndex, idsOf(delta.lights))) {
         throw std::invalid_argument{"lr::render: the delta removes an object the world does not have"};
     }
 

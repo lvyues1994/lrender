@@ -361,7 +361,7 @@ using InstanceTable = TableBinding<GpuInstance, 2, Soa<>>;  // 剔除只读部�
 
 #### 计时
 
-- `FrameResult::wallTime` 总是带从 `submit()` 到这一帧收尾的墙钟时间。
+- `FrameResult::wallTime` 总是带从 `submit()` 到这一帧收尾的墙钟时间。其中主机上的三段也分开报告：`prepareTime` 是渲染线程应用增量、建视图帧图的时间，`recordTime` 是 GPU 线程从开始录制到提交的时间，`finishTime` 是设备做完之后 GPU 线程收尾（回读、取计时、交给 Presenter）的时间。三段互不重叠，都在 `wallTime` 之内；剩下的是排队和设备执行。
 - `RendererConfig::gpuTimers` 打开且 `DeviceInfo::timers` 为真时，`ViewResult::passTimings` 还带每个 pass 的设备耗时。`takeTimings(submission)` 按执行顺序返回这次提交里的每次 dispatch（帧按顺序收尾，失败的帧也取一次再丢掉，所以取到的正好是这一帧的），帧图按同样的顺序记下每次经 `PassContext` 的 dispatch 属于哪个 pass，两者逐个对应。不能按程序名对应，因为同一个 kernel 会出现在多个 pass 里（比如可见性缓冲和阴影的光栅化）；程序名只用来核对：有 pass 绕过 `PassContext` 直接调用设备时，两者对不上，这一帧就不给 pass 耗时。GPU 线程自己的 dispatch 不属于任何 pass：纹理池变大时的拷贝和加速结构在视图之前，到达的纹理的 mip 级别在视图之后，这几个程序在两头按名字跳过。
 - 开着计时器时，tc 会在每个计时的 dispatch 前插入完整屏障，dispatch 之间不再重叠，所以 `gpuTimers` 默认关闭，只在开发、剖析和挑选表布局时打开。帧与帧之间的重叠不受影响。
 - Adreno 上 GLES 的计时查询几乎总是返回接近 0 的值，又不报告时钟不连续，所以这类设备上只看墙钟时间。llvmpipe 的 OpenGL 和 GLES 也一样。
@@ -619,7 +619,8 @@ lrender/
   asset/     include/lr/asset/     src/           lr::asset    lr::core、lr::runtime、tl::expected；私有 cgltf、stb
   scene/     include/lr/scene/     src/           lr::scene    lr::core、lr::runtime、co2；lexec 的 co2 桥随 lexec 而来
   examples/  view/  cli/                          lrender_view  lrender_cli
-  probes/    gpu_probe  present_probe  asset_probe  layout_probe
+  probes/    gpu_probe  present_probe  asset_probe  layout_probe  bench（lrender_bench）
+  tools/     fetch-scenes.sh  run-benchmarks.sh
   tests/
 ```
 
@@ -640,6 +641,7 @@ lrender/
 | asset | 半确定 | 测试自己生成 glTF（内嵌、外部文件、.glb）、PNG、JPEG、KTX2；用一个计数、能扣住读取的测试源测去重、加载重叠和取消；热重载在构建目录下改真实文件，轮询 `drainChanges`；加载的场景经 `sceneDelta` 交给 Renderer，与解析结果和 CPU 后端比对；kernel 重新加载用改过注释的生成目录，前后两帧逐位相同 |
 | gpu | 边界 | 单元测试用 eventfd 代替 sync file、用自定义的 `Submission::Completion` 代替还没完成的提交，分别覆盖两条等待路径；`gpu_probe`：选择后端、打印 `checkKernel` 的结果，在真实设备上提交并走 sync file 路径，打开计时器时按提交打印每次 dispatch 的耗时 |
 | 表布局 | 边界 | `layout_probe`：在选定的后端和设备上，给剔除和顶点读取的访问模式按各候选布局计时 |
+| 性能 | 测量 | `lrender_bench`：release 构建，场景和方法见 `benchmarks.md`；每一项性能工作都拿它和基线比 |
 | present | 边界 | `SdlPresenter` 在 SDL 的 offscreen（或 dummy）驱动和软件渲染器上测，读回像素比对；`present_probe`：每种 Presenter 显示测试图案 |
 
 Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设置 `LRENDER_TEST_DEVICE`（设备名的一部分，比如 `NVIDIA`）后，GPU 后端的测试改在那个设备上跑；Vulkan 上再打开验证层的同步检查（`VK_KHRONOS_VALIDATION_VALIDATE_SYNC=true`），检查两条时间线之间的排序。同步检查不能用 Ubuntu 24.04 自带的 1.3.275 版验证层：它不认 timeline semaphore 上的等待，会把已经排好序的拷贝报成冲突；LunarG SDK 的 1.4.363 没有这个问题，去掉拷贝前的 `waitFor` 时它报出冲突，加上时没有。
@@ -653,4 +655,4 @@ Mesa 的软件设备没有 sync file，也没有专用的传输队列族。设�
 7. **M6** scene 与脚本：`World`（SoA 组件、层级与帧池上的并行传播、带代数的实体、变化跟踪、资源的引用计数）、`ScriptTask` 与 `ScriptHost`（闸门、停止与关闭、两种放行模式）；`lrender_view` 改为由 World 和脚本驱动，包括 glTF 的加载和热重载，`--mesh` 运行文档里的 `orbitCamera`。
 8. **M7** Android：`SurfaceControlPresenter` 零拷贝上屏、API 29 以下的回读上屏、生命周期。
 
-还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了 ray query、只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。
+还没做的：Android（M7）；install 规则和包配置，等依赖库都有 install 规则之后再加；`gpu_probe`、`present_probe`、`asset_probe` 还没有写，`probes/` 里目前只有 `layout_probe` 和基准程序 `lrender_bench`。向 tc 提出的新能力见 `library-requirements.md`，四项都已在 tc 里实现，lrender 用上了 ray query、只在设备上的 buffer 和传输队列；硬件光栅的提案见 `hardware-raster.md`，实测之后暂缓到 M7。

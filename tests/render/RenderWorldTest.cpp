@@ -6,6 +6,7 @@
 
 #include <memory>
 #include <stdexcept>
+#include <vector>
 
 namespace {
 
@@ -101,6 +102,29 @@ TEST_CASE("a delta that refers to unknown ids is rejected and changes nothing") 
 
     CHECK_THROWS_AS(world.apply(bad), std::invalid_argument);
     CHECK(world.instanceCount() == 1);
+}
+
+TEST_CASE("a delta removes what the world has or what it upserts itself, and nothing else") {
+    auto world = render::RenderWorld{};
+    auto start = oneQuad();
+    start.lights = {{core::LightId{40}, core::PointLight{}}};
+    world.apply(start);
+    auto unknown = std::vector<core::RenderWorldDelta>(3);
+    unknown[0].removed.instances = {core::InstanceId{31}};
+    unknown[1].removed.lights = {core::LightId{41}};
+    unknown[2].removed.materials = {core::MaterialId{21}};
+    for (auto const &delta : unknown) {
+        CHECK_THROWS_AS(world.apply(delta), std::invalid_argument);
+    }
+
+    auto passing = core::RenderWorldDelta{};
+    passing.instances = {{core::InstanceId{32}, core::MeshId{10}, core::MaterialId{20}, core::mat4{1.0f}}};
+    passing.lights = {{core::LightId{42}, core::PointLight{}}};
+    passing.removed.instances = {core::InstanceId{30}, core::InstanceId{32}};
+    passing.removed.lights = {core::LightId{40}, core::LightId{42}};
+    CHECK_NOTHROW(world.apply(passing));
+    CHECK(world.instanceCount() == 0);
+    CHECK(world.lightCount() == 0);
 }
 
 TEST_CASE("a mesh in use cannot be removed, but can go together with its instances") {

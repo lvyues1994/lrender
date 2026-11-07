@@ -56,6 +56,15 @@ SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # �
 
 有相机就用文件里的第一个，否则按场景的包围盒取景；另外加一个天空，文件里没有灯时再加一个太阳。`lrender_cli` 会打印加载的网格、材质、纹理、灯光和相机数，以及没能加载的内容。`lrender_view` 由一个脚本加载场景，并监听场景用到的文件，改了就重新加载，在 World 里换掉旧场景；debug 构建在 GPU 后端上还监听 lrender 自己的 kernel 目录，改了 kernel 再构建一次，运行中的窗口就换上新程序（release 预设关掉了这个功能）。`lrender_view --mesh <文件>` 把 glTF 合并成一个网格，运行 `docs/architecture.md` 里的 `orbitCamera` 脚本。
 
+性能用 release 构建的 `lrender_bench` 测：先预热到 GPU 频率稳定，再让几种配置在同一个进程里一帧一帧交替渲染，输出每个 pass 的设备时间、主机上各线程的时间和帧图显存，可以写成 JSON。场景、方法和基线见 `docs/benchmarks.md`。
+
+```sh
+tools/fetch-scenes.sh          # Sponza 和 ABeautifulGame，下载到 build/scenes
+./build/release/probes/lrender_bench --device NVIDIA --scene sponza \
+    --config shared:aliasing=on --config separate:aliasing=off --json sponza.json
+./build/release/probes/lrender_bench --device NVIDIA --scene scale --instances 1000000
+```
+
 在自己的程序里加载 glTF：
 
 ```cpp
