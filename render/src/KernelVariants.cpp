@@ -59,7 +59,8 @@ std::unique_ptr<KernelCheck> makeKernelCheck(tc::Device const &device) {
 LrenderPrograms const &lrenderPrograms() {
     using namespace kernels;
     static auto const programs = LrenderPrograms{
-        {ClearUint::fileLocation, CullInstances::fileLocation, CompactVisible::fileLocation,
+        {ClearUint::fileLocation, CullInstances::fileLocation, SumVisibleBlocks::fileLocation,
+         ScanVisibleBlocks::fileLocation, WriteVisible::fileLocation,
          RasterVisibility::fileLocation, RasterVisibilityTiles::fileLocation, ScanLargeTriangles::fileLocation,
          CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
          AllocateModelLists::fileLocation, ScatterModelPixels::fileLocation,
@@ -67,7 +68,8 @@ LrenderPrograms const &lrenderPrograms() {
          TemporalMotion::fileLocation, TemporalResolve::fileLocation, ShowResolved::fileLocation,
          PathTrace::fileLocation, Tonemap::fileLocation, DownsampleTexture::fileLocation,
          CopyTextureLayer::fileLocation},
-        {CompactVisibleSubgroups::fileLocation, ClassifyPixelsSubgroups::fileLocation},
+        {SumVisibleBlocksSubgroups::fileLocation, WriteVisibleSubgroups::fileLocation,
+         ClassifyPixelsSubgroups::fileLocation},
         {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation,
          RasterPackedVisibilityTiles::fileLocation, UnpackVisibility::fileLocation},
         {PathTraceRayQuery::fileLocation, CopyPositions::fileLocation, WriteTopLevelInstances::fileLocation}};

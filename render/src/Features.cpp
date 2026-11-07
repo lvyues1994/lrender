@@ -54,7 +54,7 @@ void bindRange(PassContext &context, tc::BufferBinding<tc::uint, B> &binding, Wo
     context.device().bindBuffer(binding);
 }
 
-// The instances one raster pass draws (see CompactVisible) and its workgroup counts.
+// The instances one raster pass draws (see SumVisibleBlocks) and its workgroup counts.
 struct VisibleSet {
     BufferRef<tc::uvec4> visible;
     BufferRef<tc::DispatchIndirectCommand> arguments;
@@ -69,24 +69,47 @@ struct CullRequest {
 
 struct CompactRequest {
     BufferRef<tc::uint> triangleCounts;
+    BufferRef<tc::uvec2> blocks; // a pair of sums for each block of instances
     VisibleSet drawn;
     tc::uint instanceCount = 0;
 };
 
-// K is CompactVisible or CompactVisibleSubgroups, which have the same bindings.
-template <class K>
+// S and W are SumVisibleBlocks and WriteVisible, or their subgroup variants, which have
+// the same bindings.
+template <class S, class W>
 void recordCompaction(PassContext &context, CompactRequest const &request) {
     auto &device = context.device();
     auto const &scene = context.scene();
-    auto kernel = K{};
-    device.useKernel(kernel);
-    bind(device, kernel.instances, *scene.instances);
-    bind(device, kernel.meshes, *scene.meshes);
-    bind(device, kernel.triangleCounts, context.buffer(request.triangleCounts));
-    bind(device, kernel.visible, context.buffer(request.drawn.visible));
-    bind(device, kernel.rasterArguments, context.buffer(request.drawn.arguments));
-    set(device, kernel.instanceCount, request.instanceCount);
-    context.dispatch(kernel, tc::uvec3{1, 1, 1});
+    auto const blocks = kernels::compactBlocks(request.instanceCount);
+    auto &triangleCounts = context.buffer(request.triangleCounts);
+    auto &sums = context.buffer(request.blocks);
+    auto &visible = context.buffer(request.drawn.visible);
+    if (blocks > 0) {
+        auto sum = S{};
+        device.useKernel(sum);
+        bind(device, sum.triangleCounts, triangleCounts);
+        bind(device, sum.blocks, sums);
+        set(device, sum.instanceCount, request.instanceCount);
+        context.dispatch(sum, tc::uvec3{blocks, 1, 1});
+    }
+    auto scan = kernels::ScanVisibleBlocks{};
+    device.useKernel(scan);
+    bind(device, scan.blocks, sums);
+    bind(device, scan.visible, visible);
+    bind(device, scan.rasterArguments, context.buffer(request.drawn.arguments));
+    set(device, scan.blockCount, blocks);
+    context.dispatch(scan, tc::uvec3{1, 1, 1});
+    if (blocks > 0) {
+        auto write = W{};
+        device.useKernel(write);
+        bind(device, write.instances, *scene.instances);
+        bind(device, write.meshes, *scene.meshes);
+        bind(device, write.triangleCounts, triangleCounts);
+        bind(device, write.blocks, sums);
+        bind(device, write.visible, visible);
+        set(device, write.instanceCount, request.instanceCount);
+        context.dispatch(write, tc::uvec3{blocks, 1, 1});
+    }
 }
 
 VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, CullRequest const &request) {
@@ -95,6 +118,8 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
                                 graph.createBuffer<tc::DispatchIndirectCommand>(request.compactPass + ": arguments", 1)};
     auto const triangleCounts = graph.createBuffer<tc::uint>(request.cullPass + ": triangles", instanceCapacity);
     auto const instanceCount = static_cast<tc::uint>(view.instanceCount);
+    auto const blocks = graph.createBuffer<tc::uvec2>(
+        request.compactPass + ": blocks", std::max<std::size_t>(kernels::compactBlocks(instanceCount), 1));
 
     auto &cull = graph.addPass(request.cullPass);
     cull.write(triangleCounts);
@@ -119,14 +144,15 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
 
     auto &compact = graph.addPass(request.compactPass);
     compact.read(triangleCounts);
+    compact.write(blocks);
     compact.write(drawn.visible);
     compact.write(drawn.arguments);
-    compact.record([compaction = CompactRequest{triangleCounts, drawn, instanceCount},
+    compact.record([compaction = CompactRequest{triangleCounts, blocks, drawn, instanceCount},
                     subgroups = view.capabilities.subgroups](PassContext &context) {
         if (subgroups) {
-            recordCompaction<kernels::CompactVisibleSubgroups>(context, compaction);
+            recordCompaction<kernels::SumVisibleBlocksSubgroups, kernels::WriteVisibleSubgroups>(context, compaction);
         } else {
-            recordCompaction<kernels::CompactVisible>(context, compaction);
+            recordCompaction<kernels::SumVisibleBlocks, kernels::WriteVisible>(context, compaction);
         }
     });
     return drawn;

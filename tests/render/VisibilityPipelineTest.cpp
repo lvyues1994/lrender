@@ -634,4 +634,56 @@ TEST_CASE("more large triangles than the tile stage lists are all rasterized") {
     });
 }
 
+// More instances than the scan of block sums takes at once (256 blocks of 1024): every
+// 37th in view, boxes and quads in turn, and the others behind the camera.
+constexpr auto kManyInstances = std::uint32_t{300000};
+constexpr auto kEveryVisible = std::uint32_t{37};
+
+core::RenderWorldDelta manyInstances() {
+    auto delta = core::RenderWorldDelta{};
+    delta.meshes = {{core::MeshId{0}, test::share(core::makeQuad(core::vec2{0.01f}))},
+                    {core::MeshId{1}, test::share(core::makeBox(core::vec3{0.01f}))}};
+    delta.materials = {{kRed, test::emissive(kRedRadiance)}};
+    delta.instances.reserve(kManyInstances);
+    for (auto index = std::uint32_t{0}; index < kManyInstances; ++index) {
+        auto const seen = index % kEveryVisible == 0;
+        auto const slot = static_cast<float>(index / kEveryVisible);
+        auto const at = seen ? core::vec3{std::fmod(slot * 0.013f, 2.0f) - 1.0f, std::fmod(slot * 0.0071f, 1.6f) - 0.8f,
+                                          0.0f}
+                             : core::vec3{0.0f, 0.0f, 10.0f};
+        delta.instances.push_back({core::InstanceId{index}, core::MeshId{(index / kEveryVisible) % 2}, kRed,
+                                   test::translation(at)});
+    }
+    return delta;
+}
+
+TEST_CASE("the visible instances of many blocks are listed in instance order, each after the triangles before it") {
+    test::forEachBackend(test::HarnessOptions{}, [](RenderHarness &harness) {
+        auto const probe = std::make_shared<test::VisibilityProbe>();
+        auto &pipelines = harness.renderer->pipelines();
+        auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});
+        auto view = test::viewOf(target, frontCamera());
+        view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
+
+        auto const result = harness.render(test::frameOf(manyInstances(), view));
+
+        auto const &visible = *probe->visible;
+        auto expected = std::vector<tc::uvec2>{};
+        auto triangles = std::uint32_t{0};
+        for (auto index = std::uint32_t{0}; index < kManyInstances; index += kEveryVisible) {
+            expected.push_back(tc::uvec2{index, triangles});
+            triangles += (index / kEveryVisible) % 2 == 0 ? 2u : 12u;
+        }
+        REQUIRE(visible.size() > expected.size());
+        CHECK(visible[0].x == expected.size());
+        CHECK(visible[0].y == triangles);
+        CHECK(result.views[0].stats.visibleInstances == expected.size());
+        auto mismatches = 0;
+        for (auto k = std::size_t{0}; k < expected.size(); ++k) {
+            mismatches += visible[1 + k].x == expected[k].x and visible[1 + k].y == expected[k].y ? 0 : 1;
+        }
+        CHECK(mismatches == 0);
+    });
+}
+
 } // namespace

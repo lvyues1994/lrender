@@ -103,136 +103,196 @@ struct TC_KERNEL CullInstances {
     }
 };
 
-inline uint compactGroupSize() { return 256u; }
+// Compaction lists the visible instances in instance order, in three passes: the
+// workgroups of SumVisibleBlocks add up the visible instances and their triangles in a
+// block of compactBlockInstances() instances each, ScanVisibleBlocks (one workgroup) turns
+// those sums into each block's first slot and first triangle, and the workgroups of
+// WriteVisible write their block's entries from there. The outputs: visible[0] = (visible
+// instances, visible triangles, 0, 0); visible[1 + k] = (instance, first visible triangle,
+// first index, first vertex of its mesh) for the k-th visible instance; the workgroup
+// counts of the raster passes, an invocation per visible triangle. The block passes have
+// a variant that scans within subgroups.
+inline uint compactBlockInstances() { return 1024u; } // four per invocation
+inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; }
 
-// One workgroup: visible[0] = (visible instances, visible triangles, 0, 0), visible[1 + k]
-// = (instance, first visible triangle, first index, first vertex of its mesh) for the
-// k-th visible instance in instance order, and the workgroup counts of the raster passes,
-// one invocation per visible triangle. Scans each chunk of 256 instances in shared memory.
-struct TC_KERNEL CompactVisible {
-    static constexpr char fileLocation[] = "lr_compact_visible";
+// groupExclusiveScan(value, local): the sum of `value` over the invocations of the
+// 256-invocation workgroup before this one; scanTotal.value then holds the sum over all.
+// Every invocation calls it.
+#define LR_GROUP_SCAN                                                                                                 \
+    Shared<std::array<uvec2, 256>> scanned;                                                                           \
+    Shared<uvec2> scanTotal;                                                                                          \
+                                                                                                                      \
+    uvec2 groupExclusiveScan(uvec2 value, uint local) {                                                               \
+        scanned[local] = value;                                                                                       \
+        barrier();                                                                                                    \
+        for (uint offset = 1u; offset < 256u; offset <<= 1u) {                                                        \
+            uvec2 before = local >= offset ? scanned[local - offset] : uvec2{0u, 0u};                                 \
+            barrier();                                                                                                \
+            scanned[local] = scanned[local] + before;                                                                 \
+            barrier();                                                                                                \
+        }                                                                                                             \
+        uvec2 inclusive = scanned[local];                                                                             \
+        if (local == 255u) {                                                                                          \
+            scanTotal.value = inclusive;                                                                              \
+        }                                                                                                             \
+        barrier();                                                                                                    \
+        return inclusive - value;                                                                                     \
+    }
+
+// LR_GROUP_SCAN within subgroups; shared memory only holds the subgroups' sums.
+#define LR_GROUP_SCAN_SUBGROUPS                                                                                       \
+    Shared<std::array<uvec2, 256>> subgroupSums;                                                                      \
+    Shared<uvec2> scanTotal;                                                                                          \
+                                                                                                                      \
+    uvec2 groupExclusiveScan(uvec2 value, uint local) {                                                               \
+        uvec2 before = uvec2{subgroupExclusiveAdd(value.x), subgroupExclusiveAdd(value.y)};                           \
+        uvec2 sum = uvec2{subgroupAdd(value.x), subgroupAdd(value.y)};                                                \
+        if (subgroupElect()) {                                                                                        \
+            subgroupSums[gl_SubgroupID] = sum;                                                                        \
+        }                                                                                                             \
+        barrier();                                                                                                    \
+        for (uint s = 0u; s < gl_SubgroupID; ++s) {                                                                   \
+            before = before + subgroupSums[s];                                                                        \
+        }                                                                                                             \
+        if (local == 0u) {                                                                                            \
+            uvec2 all = uvec2{0u, 0u};                                                                                \
+            for (uint s = 0u; s < gl_NumSubgroups; ++s) {                                                             \
+                all = all + subgroupSums[s];                                                                          \
+            }                                                                                                         \
+            scanTotal.value = all;                                                                                    \
+        }                                                                                                             \
+        barrier();                                                                                                    \
+        return before;                                                                                                \
+    }
+
+// blocks[b] = (visible instances, visible triangles) of block b.
+#define LR_SUM_VISIBLE_BLOCKS                                                                                         \
+    BufferBinding<uint, 0> triangleCounts;                                                                            \
+    BufferBinding<uvec2, 1> blocks;                                                                                   \
+    Uniform<uint, 0> instanceCount{};                                                                                 \
+                                                                                                                      \
+    void main() {                                                                                                     \
+        uint local = gl_LocalInvocationIndex;                                                                         \
+        uint first = gl_WorkGroupID.x * compactBlockInstances() + local * 4u;                                         \
+        uvec2 sum = uvec2{0u, 0u};                                                                                    \
+        for (uint i = 0u; i < 4u; ++i) {                                                                              \
+            uint count = first + i < instanceCount.value ? triangleCounts[first + i] : 0u;                            \
+            sum = sum + uvec2{count > 0u ? 1u : 0u, count};                                                           \
+        }                                                                                                             \
+        groupExclusiveScan(sum, local);                                                                               \
+        if (local == 0u) {                                                                                            \
+            blocks[gl_WorkGroupID.x] = scanTotal.value;                                                               \
+        }                                                                                                             \
+    }
+
+// visible[1 + k] for the visible instances of block b, which start at blocks[b].
+#define LR_WRITE_VISIBLE                                                                                              \
+    InstanceTable<0> instances;                                                                                       \
+    MeshTable<1> meshes;                                                                                              \
+    BufferBinding<uint, 2> triangleCounts;                                                                            \
+    BufferBinding<uvec2, 3> blocks;                                                                                   \
+    BufferBinding<uvec4, 4> visible;                                                                                  \
+    Uniform<uint, 0> instanceCount{};                                                                                 \
+                                                                                                                      \
+    void main() {                                                                                                     \
+        uint local = gl_LocalInvocationIndex;                                                                         \
+        uint first = gl_WorkGroupID.x * compactBlockInstances() + local * 4u;                                         \
+        uvec4 counts = uvec4{0u, 0u, 0u, 0u};                                                                         \
+        uvec2 sum = uvec2{0u, 0u};                                                                                    \
+        for (uint i = 0u; i < 4u; ++i) {                                                                              \
+            uint count = first + i < instanceCount.value ? triangleCounts[first + i] : 0u;                            \
+            counts[i] = count;                                                                                        \
+            sum = sum + uvec2{count > 0u ? 1u : 0u, count};                                                           \
+        }                                                                                                             \
+        uvec2 next = blocks[gl_WorkGroupID.x] + groupExclusiveScan(sum, local);                                       \
+        for (uint i = 0u; i < 4u; ++i) {                                                                              \
+            if (counts[i] > 0u) {                                                                                     \
+                uint instance = first + i;                                                                            \
+                GpuMesh mesh = meshes[instances[instance].mesh];                                                      \
+                visible[1u + next.x] = uvec4{instance, next.y, mesh.firstIndex, mesh.firstVertex};                   \
+                next = next + uvec2{1u, counts[i]};                                                                   \
+            }                                                                                                         \
+        }                                                                                                             \
+    }
+
+struct TC_KERNEL SumVisibleBlocks {
+    static constexpr char fileLocation[] = "lr_sum_visible_blocks";
     static constexpr bool usesBarrier = true;
     uvec3 local_size{256, 1, 1};
 
-    InstanceTable<0> instances;
-    MeshTable<1> meshes;
-    BufferBinding<uint, 2> triangleCounts;
-    BufferBinding<uvec4, 3> visible;
-    BufferBinding<DispatchIndirectCommand, 4> rasterArguments;
-    Uniform<uint, 0> instanceCount{};
-    Shared<std::array<uint, 256>> slots;
-    Shared<std::array<uint, 256>> triangles;
-    Shared<uint> slotBase;
-    Shared<uint> triangleBase;
+    LR_GROUP_SCAN
+    LR_SUM_VISIBLE_BLOCKS
+};
+
+struct TC_KERNEL SumVisibleBlocksSubgroups {
+    static constexpr char fileLocation[] = "lr_sum_visible_blocks_subgroups";
+    static constexpr bool usesBarrier = true;
+    static constexpr bool usesSubgroups = true;
+    uvec3 local_size{256, 1, 1};
+
+    LR_GROUP_SCAN_SUBGROUPS
+    LR_SUM_VISIBLE_BLOCKS
+};
+
+// One workgroup: blocks[b] becomes the sums of the blocks before b, 256 blocks at a time,
+// and visible[0] and the raster workgroup counts get the totals.
+struct TC_KERNEL ScanVisibleBlocks {
+    static constexpr char fileLocation[] = "lr_scan_visible_blocks";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{256, 1, 1};
+
+    BufferBinding<uvec2, 0> blocks;
+    BufferBinding<uvec4, 1> visible;
+    BufferBinding<DispatchIndirectCommand, 2> rasterArguments;
+    Uniform<uint, 0> blockCount{};
+    Shared<uvec2> base;
+    LR_GROUP_SCAN
 
     void main() {
         uint local = gl_LocalInvocationIndex;
         if (local == 0u) {
-            slotBase.value = 0u;
-            triangleBase.value = 0u;
+            base.value = uvec2{0u, 0u};
         }
         barrier();
-        for (uint chunk = 0u; chunk < instanceCount.value; chunk += 256u) {
-            uint instance = chunk + local;
-            uint count = instance < instanceCount.value ? triangleCounts[instance] : 0u;
-            slots[local] = count > 0u ? 1u : 0u;
-            triangles[local] = count;
-            barrier();
-            for (uint offset = 1u; offset < 256u; offset <<= 1u) {
-                uint slotsBefore = local >= offset ? slots[local - offset] : 0u;
-                uint trianglesBefore = local >= offset ? triangles[local - offset] : 0u;
-                barrier();
-                slots[local] += slotsBefore;
-                triangles[local] += trianglesBefore;
-                barrier();
-            }
-            if (count > 0u) {
-                uint slot = slotBase.value + slots[local] - 1u;
-                GpuMesh mesh = meshes[instances[instance].mesh];
-                visible[1u + slot] =
-                    uvec4{instance, triangleBase.value + triangles[local] - count, mesh.firstIndex, mesh.firstVertex};
+        for (uint chunk = 0u; chunk < blockCount.value; chunk += 256u) {
+            uint block = chunk + local;
+            uvec2 sum = block < blockCount.value ? blocks[block] : uvec2{0u, 0u};
+            uvec2 before = groupExclusiveScan(sum, local);
+            if (block < blockCount.value) {
+                blocks[block] = base.value + before;
             }
             barrier();
-            if (local == 255u) {
-                slotBase.value += slots[255];
-                triangleBase.value += triangles[255];
+            if (local == 0u) {
+                base.value = base.value + scanTotal.value;
             }
             barrier();
         }
         if (local == 0u) {
-            visible[0] = uvec4{slotBase.value, triangleBase.value, 0u, 0u};
-            rasterArguments[0].x = (triangleBase.value + 63u) / 64u;
+            visible[0] = uvec4{base.value.x, base.value.y, 0u, 0u};
+            rasterArguments[0].x = (base.value.y + 63u) / 64u;
             rasterArguments[0].y = 1u;
             rasterArguments[0].z = 1u;
         }
     }
 };
 
-// CompactVisible's outputs, scanning within subgroups; shared memory only holds the
-// subgroups' totals, of which each invocation adds up those before its own.
-struct TC_KERNEL CompactVisibleSubgroups {
-    static constexpr char fileLocation[] = "lr_compact_visible_subgroups";
+struct TC_KERNEL WriteVisible {
+    static constexpr char fileLocation[] = "lr_write_visible";
+    static constexpr bool usesBarrier = true;
+    uvec3 local_size{256, 1, 1};
+
+    LR_GROUP_SCAN
+    LR_WRITE_VISIBLE
+};
+
+struct TC_KERNEL WriteVisibleSubgroups {
+    static constexpr char fileLocation[] = "lr_write_visible_subgroups";
     static constexpr bool usesBarrier = true;
     static constexpr bool usesSubgroups = true;
     uvec3 local_size{256, 1, 1};
 
-    InstanceTable<0> instances;
-    MeshTable<1> meshes;
-    BufferBinding<uint, 2> triangleCounts;
-    BufferBinding<uvec4, 3> visible;
-    BufferBinding<DispatchIndirectCommand, 4> rasterArguments;
-    Uniform<uint, 0> instanceCount{};
-    // Per subgroup, of which there are at most 256 (of one invocation each).
-    Shared<std::array<uint, 256>> slotTotals;
-    Shared<std::array<uint, 256>> triangleTotals;
-    Shared<uint> slotBase;
-    Shared<uint> triangleBase;
-
-    void main() {
-        uint local = gl_LocalInvocationIndex;
-        if (local == 0u) {
-            slotBase.value = 0u;
-            triangleBase.value = 0u;
-        }
-        barrier();
-        for (uint chunk = 0u; chunk < instanceCount.value; chunk += 256u) {
-            uint instance = chunk + local;
-            uint count = instance < instanceCount.value ? triangleCounts[instance] : 0u;
-            uint flag = count > 0u ? 1u : 0u;
-            uint slotsBefore = subgroupExclusiveAdd(flag);
-            uint trianglesBefore = subgroupExclusiveAdd(count);
-            uint slotSum = subgroupAdd(flag);
-            uint triangleSum = subgroupAdd(count);
-            if (subgroupElect()) {
-                slotTotals[gl_SubgroupID] = slotSum;
-                triangleTotals[gl_SubgroupID] = triangleSum;
-            }
-            barrier();
-            for (uint s = 0u; s < gl_SubgroupID; ++s) {
-                slotsBefore += slotTotals[s];
-                trianglesBefore += triangleTotals[s];
-            }
-            if (count > 0u) {
-                GpuMesh mesh = meshes[instances[instance].mesh];
-                visible[1u + slotBase.value + slotsBefore] =
-                    uvec4{instance, triangleBase.value + trianglesBefore, mesh.firstIndex, mesh.firstVertex};
-            }
-            barrier();
-            if (local == 0u) {
-                for (uint s = 0u; s < gl_NumSubgroups; ++s) {
-                    slotBase.value += slotTotals[s];
-                    triangleBase.value += triangleTotals[s];
-                }
-            }
-            barrier();
-        }
-        if (local == 0u) {
-            visible[0] = uvec4{slotBase.value, triangleBase.value, 0u, 0u};
-            rasterArguments[0].x = (triangleBase.value + 63u) / 64u;
-            rasterArguments[0].y = 1u;
-            rasterArguments[0].z = 1u;
-        }
-    }
+    LR_GROUP_SCAN_SUBGROUPS
+    LR_WRITE_VISIBLE
 };
 
 inline uint rasterDepth() { return 0u; }
