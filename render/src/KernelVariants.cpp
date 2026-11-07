@@ -61,7 +61,8 @@ LrenderPrograms const &lrenderPrograms() {
     static auto const programs = LrenderPrograms{
         {ClearUint::fileLocation, CullInstances::fileLocation, SumVisibleBlocks::fileLocation,
          ScanVisibleBlocks::fileLocation, WriteVisible::fileLocation, CullClusters::fileLocation,
-         SumClusterBlocks::fileLocation, WriteVisibleClusters::fileLocation,
+         SumClusterBlocks::fileLocation, WriteVisibleClusters::fileLocation, DownsampleDepth::fileLocation,
+         DownsamplePyramid::fileLocation, CullOccludedClusters::fileLocation,
          RasterVisibility::fileLocation, RasterVisibilityTiles::fileLocation, ScanLargeTriangles::fileLocation,
          CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
          AllocateModelLists::fileLocation, ScatterModelPixels::fileLocation,
@@ -72,7 +73,7 @@ LrenderPrograms const &lrenderPrograms() {
         {SumVisibleBlocksSubgroups::fileLocation, WriteVisibleSubgroups::fileLocation,
          SumClusterBlocksSubgroups::fileLocation, WriteVisibleClustersSubgroups::fileLocation,
          ClassifyPixelsSubgroups::fileLocation},
-        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation,
+        {ClearPackedVisibility::fileLocation, RasterPackedVisibility::fileLocation, DownsamplePackedDepth::fileLocation,
          RasterPackedVisibilityTiles::fileLocation, UnpackVisibility::fileLocation},
         {PathTraceRayQuery::fileLocation, CopyPositions::fileLocation, WriteTopLevelInstances::fileLocation}};
     return programs;

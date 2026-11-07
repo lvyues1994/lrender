@@ -54,6 +54,14 @@ struct HistoryImage {
     bool valid = false;
 };
 
+// A buffer a view keeps from frame to frame, the same way as HistoryImage.
+template <class T>
+struct HistoryBuffer {
+    BufferRef<T> previous;
+    BufferRef<T> current;
+    bool valid = false;
+};
+
 // Who touches a graph buffer besides the device.
 enum class BufferAccess : std::uint8_t {
     Device,   // nobody: a tc::DeviceBuffer, without a host copy (images too)
@@ -215,6 +223,14 @@ struct FrameGraphBuilder {
         return HistoryImage<G>{ImageRef<G>{declared.previous}, ImageRef<G>{declared.current}, declared.valid};
     }
 
+    // The view's history buffers called `name`, of `count` elements, device memory only; as
+    // history() for images.
+    template <class T>
+    HistoryBuffer<T> historyBuffer(std::string name, std::size_t const count) {
+        auto const declared = declareHistory(bufferDesc<T>(std::move(name), count, BufferAccess::Device));
+        return HistoryBuffer<T>{BufferRef<T>{declared.previous}, BufferRef<T>{declared.current}, declared.valid};
+    }
+
     virtual PassBuilder &addPass(std::string name) = 0;
 
     // Calls `handler` with the buffer's contents on the GPU thread once the frame is done.
@@ -336,8 +352,9 @@ struct ViewContext {
     core::mat4 inverseViewProjection{1.0f};
     std::optional<TemporalView> temporal;
     RendererCapabilities capabilities;
-    // RendererConfig::cullClusters.
+    // RendererConfig::cullClusters and cullOccluded.
     bool cullClusters = true;
+    bool cullOccluded = true;
     // The renderer's material models when the frame was prepared, by MaterialModelId.
     std::vector<std::shared_ptr<MaterialModel>> materialModels;
     std::uint32_t instanceCount = 0;

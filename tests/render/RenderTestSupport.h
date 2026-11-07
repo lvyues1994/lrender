@@ -40,6 +40,7 @@ struct HarnessOptions {
     render::ConversionDelivery textureConversions = render::ConversionDelivery::Deterministic;
     bool aliasGraphResources = true;
     bool cullClusters = true;
+    bool cullOccluded = true;
 };
 
 // A renderer with its own small runtime.
@@ -62,6 +63,7 @@ struct RenderHarness {
         config.textureConversions = options.textureConversions;
         config.aliasGraphResources = options.aliasGraphResources;
         config.cullClusters = options.cullClusters;
+        config.cullOccluded = options.cullOccluded;
         renderer = render::makeRenderer(config);
     }
 
@@ -232,10 +234,15 @@ struct VisibilityProbe final : render::RenderFeature {
         auto const count = static_cast<std::size_t>(view.extent.x) * static_cast<std::size_t>(view.extent.y);
         readBack(graph, "probed triangles", outputs.triangles, count, triangles);
         readBack(graph, "probed depth", outputs.depth, count, depth);
-        readBack(graph, "probed visible instances", outputs.visible, std::size_t{view.instanceCount} + 1, visible);
+        auto capacity = std::size_t{1};
+        while (capacity < view.instanceCount) {
+            capacity *= 2;
+        }
+        readBack(graph, "probed visible instances", outputs.visible, 1 + 2 * capacity, visible);
     }
 
-    // The last frame's: per pixel, rows from the top, and the visible instances.
+    // The last frame's: per pixel, rows from the top, and the list of visible instances
+    // with its tail (see LR_WRITE_VISIBLE).
     std::shared_ptr<std::vector<tc::uint>> triangles = std::make_shared<std::vector<tc::uint>>();
     std::shared_ptr<std::vector<tc::uint>> depth = std::make_shared<std::vector<tc::uint>>();
     std::shared_ptr<std::vector<tc::uvec4>> visible = std::make_shared<std::vector<tc::uvec4>>();

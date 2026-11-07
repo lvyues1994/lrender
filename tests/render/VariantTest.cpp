@@ -182,6 +182,7 @@ struct ProbedFrame {
     std::vector<tc::uint> triangles;
     std::vector<tc::uint> depth;
     std::vector<tc::uvec4> visible; // the visible instances, without what lies past them
+    std::vector<tc::uvec4> tails;   // theirs
     std::uint32_t visibleInstances = 0;
 };
 
@@ -193,10 +194,15 @@ ProbedFrame renderBusyScene(RenderHarness &harness) {
     auto view = test::viewOf(target, test::cameraAt(core::vec3{0.2f, 2.2f, 3.0f}, core::vec3{0.0f, 0.2f, 0.0f}));
     view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
     auto result = harness.render(test::frameOf(busyScene(flat), view));
-    auto frame = ProbedFrame{std::move(*result.views[0].image), *probe->triangles, *probe->depth, *probe->visible,
-                             result.views[0].stats.visibleInstances};
-    frame.visible.resize(std::size_t{frame.visibleInstances} + 1);
-    return frame;
+    auto const &list = *probe->visible;
+    auto const listed = std::size_t{result.views[0].stats.visibleInstances};
+    auto const tail = list.begin() + list[0].w;
+    return ProbedFrame{std::move(*result.views[0].image),
+                       *probe->triangles,
+                       *probe->depth,
+                       {list.begin(), list.begin() + static_cast<std::ptrdiff_t>(listed + 1)},
+                       {tail, tail + static_cast<std::ptrdiff_t>(listed)},
+                       result.views[0].stats.visibleInstances};
 }
 
 // The same backend and device as `harness`, with `options`' variants.
@@ -253,6 +259,7 @@ TEST_CASE("compaction and classification find the same with subgroups as with sh
         auto const b = renderBusyScene(shared);
         CHECK(a.visibleInstances == b.visibleInstances);
         CHECK(sameQuads(a.visible, b.visible));
+        CHECK(sameQuads(a.tails, b.tails));
         CHECK(a.triangles == b.triangles);
         CHECK(a.image.pixels == b.image.pixels);
     });

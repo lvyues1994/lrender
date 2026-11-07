@@ -14,6 +14,8 @@
 #include <cstdint>
 #include <cstdlib>
 #include <stdexcept>
+#include <utility>
+#include <vector>
 
 namespace {
 
@@ -680,21 +682,11 @@ struct ClusteredFrame {
     render::ViewStats stats;
 };
 
-ClusteredFrame renderClustered(test::HarnessOptions options, std::string const &backend, bool const cull) {
-    options.backend = backend;
-    options.device = test::deviceFor(backend);
-    options.cullClusters = cull;
-    auto harness = RenderHarness{options};
-    auto const probe = std::make_shared<test::VisibilityProbe>();
-    auto &pipelines = harness.renderer->pipelines();
-    auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});
-    auto view = test::viewOf(target, test::cameraAt(core::vec3{0.4f, 1.2f, 3.6f}, core::vec3{0.0f, 0.0f, 0.0f}));
-    view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
-    auto result = harness.render(test::frameOf(clusteredScene(), view));
+ClusteredFrame capture(render::FrameResult &result, test::VisibilityProbe const &probe) {
     auto frame =
-        ClusteredFrame{std::move(*result.views[0].image), *probe->triangles, *probe->depth, {}, result.views[0].stats};
-    auto const &visible = *probe->visible;
-    for (auto const triangle : *probe->triangles) {
+        ClusteredFrame{std::move(*result.views[0].image), *probe.triangles, *probe.depth, {}, result.views[0].stats};
+    auto const &visible = *probe.visible;
+    for (auto const triangle : *probe.triangles) {
         if (triangle == render::noTriangle()) {
             frame.resolved.push_back(tc::uvec2{render::noTriangle(), 0u});
             continue;
@@ -709,14 +701,39 @@ ClusteredFrame renderClustered(test::HarnessOptions options, std::string const &
     return frame;
 }
 
+// The frames from `cameras`, one after the other, of `scene`.
+std::vector<ClusteredFrame> renderClustered(test::HarnessOptions options, std::string const &backend,
+                                            core::RenderWorldDelta scene,
+                                            std::vector<core::CameraDesc> const &cameras) {
+    options.backend = backend;
+    options.device = test::deviceFor(backend);
+    auto harness = RenderHarness{options};
+    auto const probe = std::make_shared<test::VisibilityProbe>();
+    auto &pipelines = harness.renderer->pipelines();
+    auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});
+    auto frames = std::vector<ClusteredFrame>{};
+    for (auto const &camera : cameras) {
+        auto view = test::viewOf(target, camera);
+        view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
+        auto result = harness.render(test::frameOf(std::exchange(scene, core::RenderWorldDelta{}), view));
+        frames.push_back(capture(result, *probe));
+    }
+    return frames;
+}
+
+core::CameraDesc clusteredCamera() { return test::cameraAt(core::vec3{0.4f, 1.2f, 3.6f}, core::vec3{0.0f}); }
+
 TEST_CASE("culling clusters changes no pixel: the same visibility buffer, depths and image") {
     for (auto const &backend : tc::availableBackends()) {
         CAPTURE(backend);
         auto culled = ClusteredFrame{};
         auto all = ClusteredFrame{};
         try {
-            culled = renderClustered(test::HarnessOptions{}, backend, true);
-            all = renderClustered(test::HarnessOptions{}, backend, false);
+            auto options = test::HarnessOptions{};
+            options.cullOccluded = false;
+            culled = std::move(renderClustered(options, backend, clusteredScene(), {clusteredCamera()})[0]);
+            options.cullClusters = false;
+            all = std::move(renderClustered(options, backend, clusteredScene(), {clusteredCamera()})[0]);
         } catch (tc::DeviceError const &error) {
             MESSAGE("skipped: " << error.what());
             continue;
@@ -731,6 +748,64 @@ TEST_CASE("culling clusters changes no pixel: the same visibility buffer, depths
         CHECK(culled.depth == all.depth);
         CHECK(culled.resolved == all.resolved);
         CHECK(culled.image.pixels == all.image.pixels);
+    }
+}
+
+// The clustered scene with a wall in front of the middle of its spheres, and a camera
+// moving round it.
+core::RenderWorldDelta occludedScene() {
+    auto delta = clusteredScene();
+    delta.meshes.push_back({core::MeshId{3}, test::share(core::makeBox(core::vec3{1.6f, 0.9f, 0.05f}))});
+    delta.instances.push_back({core::InstanceId{100}, core::MeshId{3}, kRed,
+                               test::translation(core::vec3{0.0f, 0.3f, 0.9f})});
+    return delta;
+}
+
+std::vector<core::CameraDesc> movingCameras() {
+    auto cameras = std::vector<core::CameraDesc>{};
+    for (auto frame = 0; frame < 4; ++frame) {
+        auto const step = static_cast<float>(frame);
+        cameras.push_back(
+            test::cameraAt(core::vec3{0.2f + 0.25f * step, 1.1f, 3.6f - 0.15f * step}, core::vec3{0.0f, 0.1f, 0.0f}));
+    }
+    return cameras;
+}
+
+TEST_CASE("occlusion culling changes no pixel of a moving view, and draws less once a frame before shows what hides") {
+    for (auto const &backend : tc::availableBackends()) {
+        for (auto const singlePass : {render::VariantUse::Auto, render::VariantUse::Off}) {
+            CAPTURE(backend);
+            CAPTURE(singlePass == render::VariantUse::Auto);
+            auto occluded = std::vector<ClusteredFrame>{};
+            auto bounded = std::vector<ClusteredFrame>{};
+            auto all = std::vector<ClusteredFrame>{};
+            try {
+                auto options = test::HarnessOptions{};
+                options.singlePassVisibility = singlePass;
+                occluded = renderClustered(options, backend, occludedScene(), movingCameras());
+                options.cullOccluded = false;
+                bounded = renderClustered(options, backend, occludedScene(), movingCameras());
+                options.cullClusters = false;
+                all = renderClustered(options, backend, occludedScene(), movingCameras());
+            } catch (tc::DeviceError const &error) {
+                MESSAGE("skipped: " << error.what());
+                continue;
+            }
+            for (auto frame = std::size_t{0}; frame < occluded.size(); ++frame) {
+                CAPTURE(frame);
+                MESSAGE(occluded[frame].stats.visibleTriangles << " of " << bounded[frame].stats.visibleTriangles
+                                                               << " triangles");
+                CHECK(occluded[frame].triangles == all[frame].triangles);
+                CHECK(occluded[frame].depth == all[frame].depth);
+                CHECK(occluded[frame].resolved == all[frame].resolved);
+                CHECK(occluded[frame].image.pixels == all[frame].image.pixels);
+                if (frame == 0) {
+                    CHECK(occluded[frame].stats.visibleTriangles == bounded[frame].stats.visibleTriangles);
+                } else {
+                    CHECK(occluded[frame].stats.visibleTriangles < bounded[frame].stats.visibleTriangles);
+                }
+            }
+        }
     }
 }
 

@@ -104,8 +104,9 @@ inline bool outsideRaster(mat4 const &toClip, vec3 const &low, vec3 const &high)
     return left == 8u or right == 8u or bottom == 8u or top == 8u or nearSide == 8u;
 }
 
-// counts[i]: (clusters, triangles) of instance i if it may be visible and its material
-// blends (`blended` 1) or does not (`blended` 0), else 0.
+// counts[i] = (clusters, triangles, 0) of instance i if it may be visible and its material
+// blends (`blended` 1) or does not (`blended` 0), else (0, 0, 0), with its mesh's clusters
+// in w either way: they number the scene's clusters for occlusion culling's history.
 struct TC_KERNEL CullInstances {
     static constexpr char fileLocation[] = "lr_cull_instances";
     uvec3 local_size{64, 1, 1};
@@ -113,7 +114,7 @@ struct TC_KERNEL CullInstances {
     InstanceTable<0> instances;
     MeshTable<1> meshes;
     MaterialTable<2> materials;
-    BufferBinding<uvec2, 3> counts;
+    BufferBinding<uvec4, 3> counts;
     Uniform<mat4, 0> viewProjection{};
     Uniform<uint, 1> instanceCount{};
     Uniform<uint, 2> blended{};
@@ -128,12 +129,30 @@ struct TC_KERNEL CullInstances {
         uint blends = (materials[instances[i].material].flags & materialAlphaBlend()) != 0u ? 1u : 0u;
         mat4 toClip = viewProjection.value * instances[i].objectToWorld.value;
         if (blends != blended.value or outsideFrustum(toClip, mesh.boundsMin, mesh.boundsMax)) {
-            counts[i] = uvec2{0u, 0u};
+            counts[i] = uvec4{0u, 0u, 0u, mesh.clusterCount};
         } else {
-            counts[i] = uvec2{mesh.clusterCount, mesh.triangleCount};
+            counts[i] = uvec4{mesh.clusterCount, mesh.triangleCount, 0u, mesh.clusterCount};
         }
     }
 };
+
+// findInstance(candidate): the slot in `list`, a list of instances, of the visible
+// instance whose clusters include candidate cluster `candidate`.
+#define LR_FIND_INSTANCE(list)                                                                                        \
+    uint findInstance(uint candidate) {                                                                               \
+        uint tail = list[0].w;                                                                                        \
+        uint low = 0u;                                                                                                \
+        uint high = list[0].x;                                                                                        \
+        while (high - low > 1u) {                                                                                     \
+            uint middle = (low + high) / 2u;                                                                          \
+            if (list[tail + middle].x <= candidate) {                                                                 \
+                low = middle;                                                                                         \
+            } else {                                                                                                  \
+                high = middle;                                                                                        \
+            }                                                                                                         \
+        }                                                                                                             \
+        return low;                                                                                                   \
+    }
 
 inline uint cullClusterBoxes() { return 1u; }
 inline uint cullClusterCones() { return 2u; }
@@ -152,16 +171,21 @@ inline bool facesAway(GpuCluster const &cluster, vec4 const &viewer) {
     return dot(toCenter, cluster.coneAxis) >= cutoff * length(toCenter) + cluster.radius;
 }
 
+// Occlusion culling's phases for CullClusters (see CullOccludedClusters).
+inline uint occlusionOff() { return 0u; }
+inline uint occlusionWithHistory() { return 1u; }
+inline uint occlusionWithoutHistory() { return 2u; }
+
 // The clusters of the visible instances a compaction listed (see compactBlockInstances()),
 // whose tail holds the first cluster of each among them and visible[0].z their number:
 // an invocation each (the compaction's workgroup counts). counts[c] are the triangles of
-// candidate c if they may show, else 0; records[c] = (instance, first index of its
-// triangles, first vertex of its mesh, the number of its first triangle among those of
-// the visible instances, which is what the raster passes write for it). With
-// cullClusterBoxes() in `tests` a cluster
+// candidate c if they may show, else 0. With cullClusterBoxes() in `tests` a cluster
 // whose box lies where the rasterizer covers nothing goes, with cullClusterCones() one
 // of a single-sided material that faces away from `viewer`: in world space, a position
-// (w 1) or the direction the view looks along (w 0).
+// (w 1) or the direction the view looks along (w 0). With occlusion culling, only the
+// clusters that stay and were visible the frame before (previous[their number among the
+// scene's], if occlusionWithHistory()) are counted, and states[c] records whether
+// candidate c stayed (bit 0) and was visible (bit 1).
 struct TC_KERNEL CullClusters {
     static constexpr char fileLocation[] = "lr_cull_clusters";
     uvec3 local_size{64, 1, 1};
@@ -172,26 +196,14 @@ struct TC_KERNEL CullClusters {
     MaterialTable<3> materials;
     BufferBinding<uvec4, 4> visible;
     BufferBinding<uint, 5> counts;
-    BufferBinding<uvec4, 6> records;
+    BufferBinding<uint, 6> previous;
+    BufferBinding<uint, 7> states;
     Uniform<mat4, 0> viewProjection{};
     Uniform<vec4, 1> viewer{};
     Uniform<uint, 2> tests{};
+    Uniform<uint, 3> occlusion{};
 
-    // The visible instance whose clusters include candidate `candidate`.
-    uint findInstance(uint candidate) {
-        uint tail = visible[0].w;
-        uint low = 0u;
-        uint high = visible[0].x;
-        while (high - low > 1u) {
-            uint middle = (low + high) / 2u;
-            if (visible[tail + middle].x <= candidate) {
-                low = middle;
-            } else {
-                high = middle;
-            }
-        }
-        return low;
-    }
+    LR_FIND_INSTANCE(visible)
 
     void main() {
         uint candidate = gl_GlobalInvocationID.x;
@@ -199,10 +211,10 @@ struct TC_KERNEL CullClusters {
             return;
         }
         uint slot = findInstance(candidate);
-        uvec4 entry = visible[1u + slot];
-        uint instance = entry.x;
+        uint instance = visible[1u + slot].x;
+        uvec4 tail = visible[visible[0].w + slot];
         GpuMesh mesh = meshes[instances[instance].mesh];
-        GpuCluster cluster = clusters[mesh.firstCluster + candidate - visible[visible[0].w + slot].x];
+        GpuCluster cluster = clusters[mesh.firstCluster + candidate - tail.x];
         bool keep = true;
         if ((tests.value & cullClusterBoxes()) != 0u) {
             mat4 toClip = viewProjection.value * instances[instance].objectToWorld.value;
@@ -212,9 +224,12 @@ struct TC_KERNEL CullClusters {
             and (materials[instances[instance].material].flags & materialDoubleSided()) == 0u) {
             keep = not facesAway(cluster, instances[instance].worldToObject.value * viewer.value);
         }
-        counts[candidate] = keep ? cluster.triangleCount : 0u;
-        records[candidate] = uvec4{instance, mesh.firstIndex + 3u * cluster.firstTriangle, mesh.firstVertex,
-                                   entry.y + cluster.firstTriangle};
+        bool seen = occlusion.value == occlusionWithHistory() and previous[tail.y + candidate - tail.x] != 0u;
+        bool counted = keep and (occlusion.value == occlusionOff() or seen);
+        counts[candidate] = counted ? cluster.triangleCount : 0u;
+        if (occlusion.value != occlusionOff()) {
+            states[candidate] = (keep ? 1u : 0u) | (seen ? 2u : 0u);
+        }
     }
 };
 
@@ -228,8 +243,9 @@ struct TC_KERNEL CullClusters {
 // A list: visible[0] = (items listed, the sums in all, where its tail starts); visible[1 +
 // k] = (instance, its first triangle, first index, first vertex) for the k-th, the first
 // index that of the cluster's triangles for clusters; the tail, visible[visible[0].w + k],
-// holds one more word for each in x: an instance's first cluster among the candidates, the
-// number a cluster's first triangle has among those of the visible instances. The first
+// holds more for each: an instance's first cluster among the candidates in x and among
+// all the scene's clusters (instances in order) in y; in x the number a cluster's first
+// triangle has among those of the visible instances. The first
 // triangles count from 0 in each list; the raster passes write the clusters' numbers, so
 // what they write does not depend on which clusters a list holds, and shading resolves
 // them through the list of instances. ScanVisibleBlocks also writes the workgroup counts
@@ -270,8 +286,8 @@ inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; 
                                                                                                                       \
     uvec4 groupExclusiveScan(uvec4 value, uint local) {                                                               \
         uvec4 before = uvec4{subgroupExclusiveAdd(value.x), subgroupExclusiveAdd(value.y),                            \
-                             subgroupExclusiveAdd(value.z), 0u};                                                      \
-        uvec4 sum = uvec4{subgroupAdd(value.x), subgroupAdd(value.y), subgroupAdd(value.z), 0u};                     \
+                             subgroupExclusiveAdd(value.z), subgroupExclusiveAdd(value.w)};                           \
+        uvec4 sum = uvec4{subgroupAdd(value.x), subgroupAdd(value.y), subgroupAdd(value.z), subgroupAdd(value.w)};   \
         if (subgroupElect()) {                                                                                        \
             subgroupSums[gl_SubgroupID] = sum;                                                                        \
         }                                                                                                             \
@@ -309,8 +325,8 @@ inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; 
 
 #define LR_INSTANCE_SUMS                                                                                              \
     uvec4 valueOf(uint instance) {                                                                                    \
-        uvec2 count = counts[instance];                                                                               \
-        return uvec4{count.x > 0u ? 1u : 0u, count.y, count.x, 0u};                                                   \
+        uvec4 count = counts[instance];                                                                               \
+        return uvec4{count.x > 0u ? 1u : 0u, count.y, count.x, count.w};                                              \
     }
 
 #define LR_CLUSTER_SUMS                                                                                               \
@@ -320,7 +336,7 @@ inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; 
     }
 
 #define LR_SUM_VISIBLE_BLOCKS                                                                                         \
-    BufferBinding<uvec2, 0> counts;                                                                                   \
+    BufferBinding<uvec4, 0> counts;                                                                                   \
     BufferBinding<uvec4, 1> blocks;                                                                                   \
     Uniform<uint, 0> instanceCount{};                                                                                 \
     LR_INSTANCE_SUMS                                                                                                  \
@@ -358,7 +374,7 @@ inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; 
 #define LR_WRITE_VISIBLE                                                                                              \
     InstanceTable<0> instances;                                                                                       \
     MeshTable<1> meshes;                                                                                              \
-    BufferBinding<uvec2, 2> counts;                                                                                   \
+    BufferBinding<uvec4, 2> counts;                                                                                   \
     BufferBinding<uvec4, 3> blocks;                                                                                   \
     BufferBinding<uvec4, 4> visible;                                                                                  \
     Uniform<uint, 0> instanceCount{};                                                                                 \
@@ -367,22 +383,31 @@ inline uint compactBlocks(uint instances) { return (instances + 1023u) / 1024u; 
     void writeEntry(uint instance, uvec4 at) {                                                                        \
         GpuMesh mesh = meshes[instances[instance].mesh];                                                              \
         visible[1u + at.x] = uvec4{instance, at.y, mesh.firstIndex, mesh.firstVertex};                                \
-        visible[visible[0].w + at.x] = uvec4{at.z, 0u, 0u, 0u};                                                       \
+        visible[visible[0].w + at.x] = uvec4{at.z, at.w, 0u, 0u};                                                     \
     }                                                                                                                 \
     LR_WRITE_ENTRIES(instanceCount.value)
 
+// The visible clusters of CullClusters: (instance, first triangle in this list, first index
+// of the cluster's triangles, first vertex of its mesh), its first triangle's number among
+// those of the visible instances in the tail.
 #define LR_WRITE_VISIBLE_CLUSTERS                                                                                     \
     BufferBinding<uint, 0> counts;                                                                                    \
-    BufferBinding<uvec4, 1> records;                                                                                  \
-    BufferBinding<uvec4, 2> blocks;                                                                                   \
-    BufferBinding<uvec4, 3> visible;                                                                                  \
-    BufferBinding<uvec4, 4> candidates;                                                                               \
+    BufferBinding<uvec4, 1> blocks;                                                                                   \
+    BufferBinding<uvec4, 2> visible;                                                                                  \
+    BufferBinding<uvec4, 3> candidates;                                                                               \
+    InstanceTable<4> instances;                                                                                       \
+    MeshTable<5> meshes;                                                                                              \
+    ClusterTable<6> clusters;                                                                                         \
     LR_CLUSTER_SUMS                                                                                                   \
+    LR_FIND_INSTANCE(candidates)                                                                                      \
                                                                                                                       \
     void writeEntry(uint candidate, uvec4 at) {                                                                       \
-        uvec4 record = records[candidate];                                                                            \
-        visible[1u + at.x] = uvec4{record.x, at.y, record.y, record.z};                                               \
-        visible[visible[0].w + at.x] = uvec4{record.w, 0u, 0u, 0u};                                                   \
+        uint slot = findInstance(candidate);                                                                          \
+        uvec4 entry = candidates[1u + slot];                                                                          \
+        GpuMesh mesh = meshes[instances[entry.x].mesh];                                                               \
+        GpuCluster cluster = clusters[mesh.firstCluster + candidate - candidates[candidates[0].w + slot].x];          \
+        visible[1u + at.x] = uvec4{entry.x, at.y, mesh.firstIndex + 3u * cluster.firstTriangle, mesh.firstVertex};    \
+        visible[visible[0].w + at.x] = uvec4{entry.y + cluster.firstTriangle, 0u, 0u, 0u};                            \
     }                                                                                                                 \
     LR_WRITE_ENTRIES(candidates[0].z)
 
@@ -447,6 +472,167 @@ struct TC_KERNEL ScanVisibleBlocks {
             rasterArguments[0].y = 1u;
             rasterArguments[0].z = 1u;
         }
+    }
+};
+
+// The depth pyramid of occlusion culling: level 0 has half the view's pixels across and
+// down (rounded up), each the farthest floatBitsToUint(depth) of the up to 2x2 pixels under
+// it, and each level after it half the one before it the same way, down to 1x1; level L's
+// texel (x, y) holds the pixels [x, x + 1) * 2^(L + 1) by [y, y + 1) * 2^(L + 1). Pixels
+// nothing covers hold the cleared 0xFFFFFFFF, which occludes nothing. The levels follow
+// each other in one buffer.
+inline ivec2 pyramidLevelSize(ivec2 size) { return (size + ivec2(1)) / 2; }
+
+// hiz[target texel] = the farthest of the 2x2 under it at sourceOffset (a level, or pixels).
+#define LR_DOWNSAMPLE_DEPTH(read)                                                                                     \
+    Uniform<ivec2, 0> sourceSize{};                                                                                   \
+    Uniform<ivec2, 1> targetSize{};                                                                                   \
+    Uniform<uint, 2> sourceOffset{};                                                                                  \
+    Uniform<uint, 3> targetOffset{};                                                                                  \
+                                                                                                                      \
+    void main() {                                                                                                     \
+        ivec2 texel = ivec2(gl_GlobalInvocationID.xy());                                                              \
+        if (texel.x >= targetSize.value.x or texel.y >= targetSize.value.y) {                                         \
+            return;                                                                                                   \
+        }                                                                                                             \
+        uint farthest = 0u;                                                                                           \
+        for (int y = 0; y < 2; ++y) {                                                                                 \
+            for (int x = 0; x < 2; ++x) {                                                                             \
+                ivec2 from = min(texel * 2 + ivec2{x, y}, sourceSize.value - ivec2(1));                               \
+                farthest = max(farthest, read(sourceOffset.value + uint(from.y * sourceSize.value.x + from.x)));      \
+            }                                                                                                         \
+        }                                                                                                             \
+        hiz[targetOffset.value + uint(texel.y * targetSize.value.x + texel.x)] = farthest;                            \
+    }
+
+struct TC_KERNEL DownsampleDepth {
+    static constexpr char fileLocation[] = "lr_downsample_depth";
+    uvec3 local_size{8, 8, 1};
+
+    BufferBinding<uint, 0> depth;
+    BufferBinding<uint, 1> hiz;
+
+    uint depthAt(uint pixel) { return depth[pixel]; }
+    LR_DOWNSAMPLE_DEPTH(depthAt)
+};
+
+// The first level from a packed visibility buffer (see RasterPackedVisibility).
+struct TC_KERNEL DownsamplePackedDepth {
+    static constexpr char fileLocation[] = "lr_downsample_packed_depth";
+    uvec3 local_size{8, 8, 1};
+
+    BufferBinding<u64, 0> packed;
+    BufferBinding<uint, 1> hiz;
+
+    uint depthAt(uint pixel) { return uint(packed[pixel] >> 32u); }
+    LR_DOWNSAMPLE_DEPTH(depthAt)
+};
+
+struct TC_KERNEL DownsamplePyramid {
+    static constexpr char fileLocation[] = "lr_downsample_pyramid";
+    uvec3 local_size{8, 8, 1};
+
+    BufferBinding<uint, 0> hiz;
+
+    uint depthAt(uint texel) { return hiz[texel]; }
+    LR_DOWNSAMPLE_DEPTH(depthAt)
+};
+
+// Depth that the rasterizer's interpolation may round below a box's nearest corner.
+inline float occlusionMargin() { return 1.0e-5f; }
+
+// The second phase of occlusion culling, after the clusters CullClusters counted are drawn
+// and the pyramid is built from their depth: every candidate that stayed (states[c] bit 0)
+// is tested against the pyramid, current[its number among the scene's] records whether it
+// may show, and counts[c] are its triangles if it may show and was not drawn yet (bit 1),
+// else 0. `current` must be cleared first: clusters that were not candidates are not
+// visible either. A cluster goes only when its nearest point is behind the farthest depth
+// drawn over every pixel its box may cover: what the box holds can cover no pixel then,
+// nor tie with what is there.
+struct TC_KERNEL CullOccludedClusters {
+    static constexpr char fileLocation[] = "lr_cull_occluded_clusters";
+    uvec3 local_size{64, 1, 1};
+
+    InstanceTable<0> instances;
+    MeshTable<1> meshes;
+    ClusterTable<2> clusters;
+    BufferBinding<uvec4, 3> visible;
+    BufferBinding<uint, 4> counts;
+    BufferBinding<uint, 5> states;
+    BufferBinding<uint, 6> current;
+    BufferBinding<uint, 7> hiz;
+    Uniform<mat4, 0> viewProjection{};
+    Uniform<ivec2, 1> size{};
+    Uniform<uint, 2> levels{};
+
+    LR_FIND_INSTANCE(visible)
+
+    bool occluded(mat4 toClip, vec3 low, vec3 high) {
+        vec2 lowPixel = vec2(3.0e38f);
+        vec2 highPixel = vec2(-3.0e38f);
+        float nearest = 1.0f;
+        for (uint corner = 0u; corner < 8u; ++corner) {
+            vec3 point = vec3{(corner & 1u) != 0u ? high.x : low.x, (corner & 2u) != 0u ? high.y : low.y,
+                              (corner & 4u) != 0u ? high.z : low.z};
+            vec4 clip = toClip * vec4(point, 1.0f);
+            if (clip.w <= 0.0f or clip.z < 0.0f) {
+                return false; // crosses the near plane: its depth over the screen is unbounded
+            }
+            float inverseW = 1.0f / clip.w;
+            vec2 pixel = vec2{(clip.x * inverseW * 0.5f + 0.5f) * float(size.value.x),
+                              (0.5f - clip.y * inverseW * 0.5f) * float(size.value.y)};
+            lowPixel = min(lowPixel, pixel);
+            highPixel = max(highPixel, pixel);
+            nearest = min(nearest, clip.z * inverseW);
+        }
+        vec2 bound = vec2(size.value);
+        ivec2 first = max(ivec2(floor(clamp(lowPixel, vec2(-1.0f), bound))) - ivec2(1), ivec2(0));
+        ivec2 last = min(ivec2(floor(clamp(highPixel, vec2(-1.0f), bound))) + ivec2(1), size.value - ivec2(1));
+        if (last.x < first.x or last.y < first.y) {
+            return false;
+        }
+        uint span = uint(max(last.x - first.x, last.y - first.y)) + 1u;
+        uint level = 0u;
+        while (level + 1u < levels.value and (2u << level) < span) {
+            level += 1u;
+        }
+        ivec2 levelSize = pyramidLevelSize(size.value);
+        uint offset = 0u;
+        for (uint l = 0u; l < level; ++l) {
+            offset += uint(levelSize.x * levelSize.y);
+            levelSize = pyramidLevelSize(levelSize);
+        }
+        int texel = int(2u << level);
+        ivec2 from = min(first / texel, levelSize - ivec2(1));
+        ivec2 to = min(last / texel, levelSize - ivec2(1));
+        uint farthest = 0u;
+        for (int y = from.y; y <= to.y; ++y) {
+            for (int x = from.x; x <= to.x; ++x) {
+                farthest = max(farthest, hiz[offset + uint(y * levelSize.x + x)]);
+            }
+        }
+        return floatBitsToUint(max(nearest - occlusionMargin(), 0.0f)) > farthest;
+    }
+
+    void main() {
+        uint candidate = gl_GlobalInvocationID.x;
+        if (candidate >= visible[0].z) {
+            return;
+        }
+        uint state = states[candidate];
+        if ((state & 1u) == 0u) {
+            counts[candidate] = 0u;
+            return;
+        }
+        uint slot = findInstance(candidate);
+        uint instance = visible[1u + slot].x;
+        uvec4 tail = visible[visible[0].w + slot];
+        GpuMesh mesh = meshes[instances[instance].mesh];
+        GpuCluster cluster = clusters[mesh.firstCluster + candidate - tail.x];
+        mat4 toClip = viewProjection.value * instances[instance].objectToWorld.value;
+        bool shows = not occluded(toClip, cluster.boundsMin, cluster.boundsMax);
+        current[tail.y + candidate - tail.x] = shows ? 1u : 0u;
+        counts[candidate] = shows and (state & 2u) == 0u ? cluster.triangleCount : 0u;
     }
 };
 
@@ -994,16 +1180,25 @@ struct TC_KERNEL UnpackVisibility {
 };
 
 // Copies the counts in visible[0] to where the host reads them after the frame.
-// totals[0] = (visible instances, visible clusters, their triangles, 0).
+// totals[0] = (visible instances, visible clusters, their triangles, 0): those of `visible`,
+// and of `late` too where there are `lists` 2.
 struct TC_KERNEL CopyVisibleTotals {
     static constexpr char fileLocation[] = "lr_copy_visible_totals";
     uvec3 local_size{1, 1, 1};
 
     BufferBinding<uvec4, 0> instances;
     BufferBinding<uvec4, 1> visible;
-    BufferBinding<uvec4, 2> totals;
+    BufferBinding<uvec4, 2> late;
+    BufferBinding<uvec4, 3> totals;
+    Uniform<uint, 0> lists{};
 
-    void main() { totals[0] = uvec4{instances[0].x, visible[0].x, visible[0].y, 0u}; }
+    void main() {
+        uvec2 drawn = visible[0].xy();
+        if (lists.value == 2u) {
+            drawn = drawn + late[0].xy();
+        }
+        totals[0] = uvec4{instances[0].x, drawn.x, drawn.y, 0u};
+    }
 };
 
 } // namespace lr::render::kernels

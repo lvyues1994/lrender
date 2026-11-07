@@ -8,7 +8,7 @@
 //
 // Every --config gets a renderer of its own on the same device. Their frames alternate, each
 // waited for before the next starts, so that whatever the GPU's clocks do affects them alike.
-// Settings: aliasing=on|off, clusters=on|off, subgroups=auto|off, singlepass=auto|off, rayqueries=auto|off,
+// Settings: aliasing=on|off, clusters=on|off, occlusion=on|off, subgroups=auto|off, singlepass=auto|off, rayqueries=auto|off,
 // taa=on|off, pipeline=visibility|pathtrace, present=drop|readback|shared. Before the --frames that count (a full turn of
 // the orbit unless given), every configuration renders --warmup frames from where the orbit
 // starts, then more until the medians of its last two windows of 30 frames agree within 2%
@@ -60,6 +60,7 @@ struct Settings {
     Presentation present = Presentation::Drop;
     bool aliasing = true;
     bool clusters = true;
+    bool occlusion = true;
     VariantUse subgroups = VariantUse::Auto;
     VariantUse singlePass = VariantUse::Auto;
     VariantUse rayQueries = VariantUse::Auto;
@@ -117,6 +118,8 @@ bool applySetting(Settings &settings, std::string const &key, std::string const 
         settings.aliasing = *on;
     } else if (key == "clusters" and on) {
         settings.clusters = *on;
+    } else if (key == "occlusion" and on) {
+        settings.occlusion = *on;
     } else if (key == "subgroups" and use) {
         settings.subgroups = *use;
     } else if (key == "singlepass" and use) {
@@ -378,6 +381,7 @@ Run makeRun(ConfigSpec spec, Options const &options, lr::runtime::Runtime &runti
     config.textureConversions = lr::render::ConversionDelivery::Deterministic;
     config.aliasGraphResources = spec.settings.aliasing;
     config.cullClusters = spec.settings.clusters;
+    config.cullOccluded = spec.settings.occlusion;
     config.subgroups = spec.settings.subgroups;
     config.singlePassVisibility = spec.settings.singlePass;
     config.rayQueries = spec.settings.rayQueries;

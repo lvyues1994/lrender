@@ -139,6 +139,10 @@ struct RendererConfig {
     // Raster passes draw only the clusters of the visible instances that lie in view and,
     // for single-sided materials, do not face away; the pixels are the same either way.
     bool cullClusters = true;
+    // With cullClusters, the visibility pipeline draws the clusters visible the frame before
+    // first, builds a depth pyramid from them and draws only the others that may show in
+    // front of what is there; the pixels are the same either way.
+    bool cullOccluded = true;
     // Optional kernel variants (RendererCapabilities), each used where the device runs it
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;

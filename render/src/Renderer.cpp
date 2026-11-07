@@ -322,6 +322,7 @@ struct RendererImpl final : Renderer {
           gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
           timers(config.gpuTimers and gpu->info().timers),
           cullClusters(config.cullClusters),
+          cullOccluded(config.cullOccluded),
           chosen(chooseFor(*gpu, config)),
           models(*gpu),
           targetSet(gpu->info()),
@@ -451,6 +452,7 @@ private:
         auto context = makeViewContext(plan, world);
         context.capabilities = chosen;
         context.cullClusters = cullClusters;
+        context.cullOccluded = cullOccluded;
         context.materialModels = modelList;
         if (jitters(plan)) {
             auto const temporal = temporalViews.advance(TemporalRequest{plan.desc.id, frameIndex, context.extent,
@@ -494,6 +496,7 @@ private:
     std::unique_ptr<gpu::GpuQueue> gpu;
     bool timers;
     bool cullClusters;
+    bool cullOccluded;
     RendererCapabilities chosen;
     MaterialModelsImpl models;
     runtime::SerialThread renderThread;

@@ -10,6 +10,8 @@
 #include <lr/render/MaterialModel.h>
 
 #include <algorithm>
+#include <optional>
+#include <type_traits>
 #include <cstddef>
 #include <stdexcept>
 #include <string>
@@ -103,7 +105,7 @@ void recordScan(PassContext &context, CompactRequest const &request, tc::uint co
 // S and W are SumVisibleBlocks and WriteVisible, or their subgroup variants, which have
 // the same bindings.
 template <class S, class W>
-void recordCompaction(PassContext &context, CompactRequest const &request, BufferRef<tc::uvec2> const countsRef) {
+void recordCompaction(PassContext &context, CompactRequest const &request, BufferRef<tc::uvec4> const countsRef) {
     auto &device = context.device();
     auto const &scene = context.scene();
     auto const blocks = kernels::compactBlocks(request.items);
@@ -131,10 +133,9 @@ void recordCompaction(PassContext &context, CompactRequest const &request, Buffe
     }
 }
 
-// The clusters' counts, their records and the list of instances they came from.
+// The candidate clusters' counts and the list of instances they came from.
 struct ClusterSource {
     BufferRef<tc::uint> counts;
-    BufferRef<tc::uvec4> records;
     BufferRef<tc::uvec4> candidates;
 };
 
@@ -142,6 +143,7 @@ struct ClusterSource {
 template <class S, class W>
 void recordClusterCompaction(PassContext &context, CompactRequest const &request, ClusterSource const &source) {
     auto &device = context.device();
+    auto const &scene = context.scene();
     auto const blocks = kernels::compactBlocks(request.items);
     auto &counts = context.buffer(source.counts);
     auto &sums = context.buffer(request.blocks);
@@ -156,31 +158,75 @@ void recordClusterCompaction(PassContext &context, CompactRequest const &request
     auto write = W{};
     device.useKernel(write);
     bind(device, write.counts, counts);
-    bind(device, write.records, context.buffer(source.records));
     bind(device, write.blocks, sums);
     bind(device, write.visible, context.buffer(request.visible));
     bind(device, write.candidates, candidates);
+    bind(device, write.instances, *scene.instances);
+    bind(device, write.meshes, *scene.meshes);
+    bind(device, write.clusters, *scene.clusters);
     context.dispatch(write, tc::uvec3{blocks, 1, 1});
 }
 
-// The instances in view, then their clusters that may show, each step listed in order.
-VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, CullRequest const &request) {
+// The candidates' counts compacted, in order, into `drawn`.
+void compactClusters(FrameGraphBuilder &graph, std::string const &pass, ClusterSource const &source,
+                     VisibleSet const &drawn, std::size_t const candidateCapacity, bool const subgroups) {
+    auto const blocks = graph.createBuffer<tc::uvec4>(
+        pass + ": blocks", std::max<std::size_t>(kernels::compactBlocks(static_cast<tc::uint>(candidateCapacity)), 1));
+    auto &compact = graph.addPass(pass);
+    compact.read(source.counts);
+    compact.read(source.candidates);
+    compact.write(blocks);
+    compact.write(drawn.visible);
+    compact.write(drawn.arguments);
+    compact.record([request = CompactRequest{blocks, drawn.visible, drawn.arguments,
+                                             static_cast<tc::uint>(candidateCapacity),
+                                             static_cast<tc::uint>(candidateCapacity)},
+                    source, subgroups](PassContext &context) {
+        if (subgroups) {
+            recordClusterCompaction<kernels::SumClusterBlocksSubgroups, kernels::WriteVisibleClustersSubgroups>(
+                context, request, source);
+        } else {
+            recordClusterCompaction<kernels::SumClusterBlocks, kernels::WriteVisibleClusters>(context, request, source);
+        }
+    });
+}
+
+VisibleSet clusterListOf(FrameGraphBuilder &graph, std::string const &pass, VisibleSet const &instances,
+                         std::size_t const candidateCapacity) {
+    return VisibleSet{graph.createBuffer<tc::uvec4>(pass + ": visible", listWords(candidateCapacity)),
+                      graph.createBuffer<tc::DispatchIndirectCommand>(pass + ": arguments", 1), instances.instances};
+}
+
+// A raster pass's culling: what it draws, and what occlusion culling's second phase needs
+// of the candidates.
+struct Culled {
+    VisibleSet drawn;
+    BufferRef<tc::uint> counts;
+    BufferRef<tc::uint> states;
+    BufferRef<tc::DispatchIndirectCommand> candidateArguments;
+    std::size_t candidateCapacity = 0;
+};
+
+// The instances in view, then their clusters that may show (with `history`, those of them
+// visible the frame before), each step listed in order.
+Culled cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, CullRequest const &request,
+                      HistoryBuffer<tc::uint> const *const history = nullptr) {
     auto const instanceCapacity = roundUpToPowerOfTwo(std::max<std::size_t>(view.instanceCount, 1));
     auto const instanceCount = static_cast<tc::uint>(view.instanceCount);
     auto const candidateCapacity = roundUpToPowerOfTwo(std::max<std::size_t>(view.clusterInstanceCount, 1));
-    auto const clusterCounts = graph.createBuffer<tc::uvec2>(request.cullPass + ": clusters", instanceCapacity);
+    auto const clusterCounts = graph.createBuffer<tc::uvec4>(request.cullPass + ": clusters", instanceCapacity);
     auto const instanceBlocks = graph.createBuffer<tc::uvec4>(
         request.compactPass + ": blocks", std::max<std::size_t>(kernels::compactBlocks(instanceCount), 1));
     auto const instances = graph.createBuffer<tc::uvec4>(request.compactPass + ": visible", listWords(instanceCapacity));
     auto const clusterArguments = graph.createBuffer<tc::DispatchIndirectCommand>(request.compactPass + ": arguments", 1);
     auto const triangleCounts = graph.createBuffer<tc::uint>(request.clusterPass + ": triangles", candidateCapacity);
-    auto const records = graph.createBuffer<tc::uvec4>(request.clusterPass + ": records", candidateCapacity);
-    auto const clusterBlocks = graph.createBuffer<tc::uvec4>(
-        request.compactClustersPass + ": blocks",
-        std::max<std::size_t>(kernels::compactBlocks(static_cast<tc::uint>(candidateCapacity)), 1));
-    auto const drawn = VisibleSet{
-        graph.createBuffer<tc::uvec4>(request.compactClustersPass + ": visible", listWords(candidateCapacity)),
-        graph.createBuffer<tc::DispatchIndirectCommand>(request.compactClustersPass + ": arguments", 1), instances};
+    auto const states =
+        graph.createBuffer<tc::uint>(request.clusterPass + ": states", history != nullptr ? candidateCapacity : 1);
+    // CullClusters reads no history without it.
+    auto const previous = history != nullptr ? history->previous : states;
+    auto const culled = Culled{clusterListOf(graph, request.compactClustersPass,
+                                             VisibleSet{{}, {}, instances}, candidateCapacity),
+                               triangleCounts, states, clusterArguments, candidateCapacity};
 
     auto &cull = graph.addPass(request.cullPass);
     cull.write(clusterCounts);
@@ -220,15 +266,21 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
         }
     });
 
+    auto const occlusion = history == nullptr ? kernels::occlusionOff()
+                         : history->valid     ? kernels::occlusionWithHistory()
+                                              : kernels::occlusionWithoutHistory();
     auto &cullClusters = graph.addPass(request.clusterPass);
     cullClusters.read(instances);
     cullClusters.read(clusterArguments);
+    if (history != nullptr) {
+        cullClusters.read(previous);
+    }
     cullClusters.write(triangleCounts);
-    cullClusters.write(records);
-    cullClusters.record([instances, clusterArguments, triangleCounts, records, viewProjection = request.viewProjection,
-                         viewer = request.viewer,
-                         tests = view.cullClusters ? kernels::cullClusterBoxes() | kernels::cullClusterCones() : 0u](
-                            PassContext &context) {
+    cullClusters.write(states);
+    cullClusters.record([instances, clusterArguments, triangleCounts, previous, states,
+                         viewProjection = request.viewProjection, viewer = request.viewer,
+                         tests = view.cullClusters ? kernels::cullClusterBoxes() | kernels::cullClusterCones() : 0u,
+                         occlusion](PassContext &context) {
         auto &device = context.device();
         auto const &scene = context.scene();
         auto kernel = kernels::CullClusters{};
@@ -239,33 +291,117 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
         bind(device, kernel.materials, *scene.materials);
         bind(device, kernel.visible, context.buffer(instances));
         bind(device, kernel.counts, context.buffer(triangleCounts));
-        bind(device, kernel.records, context.buffer(records));
+        bind(device, kernel.previous, context.buffer(previous));
+        bind(device, kernel.states, context.buffer(states));
         set(device, kernel.viewProjection, viewProjection);
         set(device, kernel.viewer, viewer);
         set(device, kernel.tests, tests);
+        set(device, kernel.occlusion, occlusion);
         context.dispatchIndirect(kernel, clusterArguments);
     });
 
-    auto &compactClusters = graph.addPass(request.compactClustersPass);
-    compactClusters.read(triangleCounts);
-    compactClusters.read(records);
-    compactClusters.read(instances);
-    compactClusters.write(clusterBlocks);
-    compactClusters.write(drawn.visible);
-    compactClusters.write(drawn.arguments);
-    compactClusters.record([compaction = CompactRequest{clusterBlocks, drawn.visible, drawn.arguments,
-                                                        static_cast<tc::uint>(candidateCapacity),
-                                                        static_cast<tc::uint>(candidateCapacity)},
-                            source = ClusterSource{triangleCounts, records, instances}, subgroups](PassContext &context) {
-        if (subgroups) {
-            recordClusterCompaction<kernels::SumClusterBlocksSubgroups, kernels::WriteVisibleClustersSubgroups>(
-                context, compaction, source);
+    compactClusters(graph, request.compactClustersPass, ClusterSource{triangleCounts, instances}, culled.drawn,
+                    candidateCapacity, subgroups);
+    return culled;
+}
+
+// The levels of a view's depth pyramid (see pyramidLevelSize()): their sizes, and the words
+// all of them take.
+struct Pyramid {
+    std::vector<core::ivec2> sizes;
+    std::size_t words = 0;
+};
+
+Pyramid pyramidOf(core::ivec2 const extent) {
+    auto pyramid = Pyramid{};
+    auto size = kernels::pyramidLevelSize(extent);
+    for (;;) {
+        pyramid.sizes.push_back(size);
+        pyramid.words += static_cast<std::size_t>(size.x) * static_cast<std::size_t>(size.y);
+        if (size.x == 1 and size.y == 1) {
+            return pyramid;
+        }
+        size = kernels::pyramidLevelSize(size);
+    }
+}
+
+// Builds the pyramid from the depth of `source`, plain depths or packed visibility.
+template <class First, class T>
+void buildPyramid(FrameGraphBuilder &graph, ViewContext const &view, BufferRef<T> const source,
+                  BufferRef<tc::uint> const pyramid) {
+    auto &pass = graph.addPass("build depth pyramid");
+    pass.read(source);
+    pass.write(pyramid);
+    pass.record([source, pyramid, levels = pyramidOf(view.extent), extent = view.extent](PassContext &context) {
+        auto &device = context.device();
+        auto first = First{};
+        device.useKernel(first);
+        bind(device, first.hiz, context.buffer(pyramid));
+        if constexpr (std::is_same_v<T, tc::u64>) {
+            bind(device, first.packed, context.buffer(source));
         } else {
-            recordClusterCompaction<kernels::SumClusterBlocks, kernels::WriteVisibleClusters>(context, compaction,
-                                                                                              source);
+            bind(device, first.depth, context.buffer(source));
+        }
+        set(device, first.sourceSize, extent);
+        set(device, first.targetSize, levels.sizes[0]);
+        set(device, first.sourceOffset, 0u);
+        set(device, first.targetOffset, 0u);
+        context.dispatch(first, groupsCovering(levels.sizes[0]));
+        auto offset = tc::uint{0};
+        for (auto level = std::size_t{1}; level < levels.sizes.size(); ++level) {
+            auto const below = levels.sizes[level - 1];
+            auto const next = offset + static_cast<tc::uint>(below.x * below.y);
+            auto kernel = kernels::DownsamplePyramid{};
+            device.useKernel(kernel);
+            bind(device, kernel.hiz, context.buffer(pyramid));
+            set(device, kernel.sourceSize, below);
+            set(device, kernel.targetSize, levels.sizes[level]);
+            set(device, kernel.sourceOffset, offset);
+            set(device, kernel.targetOffset, next);
+            context.dispatch(kernel, groupsCovering(levels.sizes[level]));
+            offset = next;
         }
     });
-    return drawn;
+}
+
+// Occlusion culling's second phase: the candidates that stayed tested against the pyramid,
+// the history of this frame written, and those not drawn yet listed.
+VisibleSet cullOccluded(FrameGraphBuilder &graph, ViewContext const &view, Culled const &early,
+                        BufferRef<tc::uint> const pyramid, HistoryBuffer<tc::uint> const &history,
+                        std::size_t const historyCapacity) {
+    auto const late = clusterListOf(graph, "compact late clusters", early.drawn, early.candidateCapacity);
+    auto &pass = graph.addPass("cull occluded clusters");
+    pass.read(early.drawn.instances);
+    pass.read(early.candidateArguments);
+    pass.read(early.states);
+    pass.read(pyramid);
+    pass.write(early.counts);
+    pass.write(history.current);
+    pass.record([instances = early.drawn.instances, arguments = early.candidateArguments, counts = early.counts,
+                 states = early.states, current = history.current, pyramid, historyCapacity,
+                 viewProjection = view.viewProjection, extent = view.extent,
+                 levels = static_cast<tc::uint>(pyramidOf(view.extent).sizes.size())](PassContext &context) {
+        clearWords(context, current, 0, historyCapacity, 0u);
+        auto &device = context.device();
+        auto const &scene = context.scene();
+        auto kernel = kernels::CullOccludedClusters{};
+        device.useKernel(kernel);
+        bind(device, kernel.instances, *scene.instances);
+        bind(device, kernel.meshes, *scene.meshes);
+        bind(device, kernel.clusters, *scene.clusters);
+        bind(device, kernel.visible, context.buffer(instances));
+        bind(device, kernel.counts, context.buffer(counts));
+        bind(device, kernel.states, context.buffer(states));
+        bind(device, kernel.current, context.buffer(current));
+        bind(device, kernel.hiz, context.buffer(pyramid));
+        set(device, kernel.viewProjection, viewProjection);
+        set(device, kernel.size, extent);
+        set(device, kernel.levels, levels);
+        context.dispatchIndirect(kernel, arguments);
+    });
+    compactClusters(graph, "compact late clusters", ClusterSource{early.counts, early.drawn.instances}, late,
+                    early.candidateCapacity, view.capabilities.subgroups);
+    return late;
 }
 
 // The large triangles one raster pass lists for its tile stage (see largeTriangleWord()),
@@ -416,37 +552,71 @@ ShadowOutputs shadowsOf(FrameGraphBuilder &graph) {
 struct VisibilityFeature final : RenderFeature {
     FeatureStage stage() const noexcept override { return FeatureStage::Visibility; }
 
+    // With occlusion culling, the clusters visible the frame before are drawn first, the
+    // depth pyramid is built from them, and the others that may show after them (see
+    // CullOccludedClusters).
     void setup(FrameGraphBuilder &graph, ViewContext const &view) override {
         auto const pixels = pixelsOf(view.extent);
         auto const triangles = graph.createBuffer<tc::uint>("visibility", pixels);
         auto const depth = graph.createBuffer<tc::uint>("depth", pixels);
         auto const totals = graph.createReadbackBuffer<tc::uvec4>("visible totals", 1);
-        if (not view.capabilities.singlePassVisibility) {
+        auto const singlePass = view.capabilities.singlePassVisibility;
+        if (not singlePass) {
             clearSeparate(graph, depth, triangles, pixels);
         }
-        auto const drawn =
-            cullAndCompact(graph, view,
-                           CullRequest{"cull instances", "compact visible instances", "cull clusters",
-                                       "compact visible clusters", view.viewProjection,
-                                       core::vec4{view.camera.position, 1.0f}, false});
-        auto const outputs = VisibilityOutputs{drawn.instances, triangles, depth};
-        if (view.capabilities.singlePassVisibility) {
-            rasterizeOnce(graph, view, drawn, outputs);
+        auto const occlusion = view.cullClusters and view.cullOccluded;
+        auto const historyCapacity = roundUpToPowerOfTwo(std::max<std::size_t>(view.clusterInstanceCount, 1));
+        auto const history = occlusion ? std::optional<HistoryBuffer<tc::uint>>{graph.historyBuffer<tc::uint>(
+                                             "cluster visibility", historyCapacity)}
+                                       : std::nullopt;
+        auto const early = cullAndCompact(graph, view,
+                                          CullRequest{"cull instances", "compact visible instances", "cull clusters",
+                                                      "compact visible clusters", view.viewProjection,
+                                                      core::vec4{view.camera.position, 1.0f}, false},
+                                          history ? &*history : nullptr);
+        auto const outputs = VisibilityOutputs{early.drawn.instances, triangles, depth};
+        auto late = std::optional<VisibleSet>{};
+        auto const cullLate = [&](auto const source, auto const first) {
+            auto const pyramid = graph.createBuffer<tc::uint>("depth pyramid", pyramidOf(view.extent).words);
+            buildPyramid<decltype(first)>(graph, view, source, pyramid);
+            late = cullOccluded(graph, view, early, pyramid, *history, historyCapacity);
+        };
+        if (singlePass) {
+            auto const packed = clearPacked(graph, view);
+            rasterPacked(graph, view, "rasterize visibility", early.drawn, packed);
+            if (occlusion) {
+                cullLate(packed, kernels::DownsamplePackedDepth{});
+                rasterPacked(graph, view, "rasterize late visibility", *late, packed);
+            }
+            unpack(graph, view, packed, outputs);
         } else {
-            rasterizeTwice(graph, view, drawn, outputs);
+            rasterTargets(graph, view, "rasterize depth", early.drawn, outputs, kernels::rasterDepth());
+            if (occlusion) {
+                cullLate(depth, kernels::DownsampleDepth{});
+                rasterTargets(graph, view, "rasterize late depth", *late, outputs, kernels::rasterDepth());
+            }
+            rasterTargets(graph, view, "rasterize triangles", early.drawn, outputs, kernels::rasterTriangles());
+            if (late) {
+                rasterTargets(graph, view, "rasterize late triangles", *late, outputs, kernels::rasterTriangles());
+            }
         }
 
+        auto const lateList = late ? late->visible : early.drawn.visible;
         auto &stats = graph.addPass("visibility statistics");
-        stats.read(drawn.instances);
-        stats.read(drawn.visible);
+        stats.read(early.drawn.instances);
+        stats.read(early.drawn.visible);
+        stats.read(lateList);
         stats.write(totals);
-        stats.record([instances = drawn.instances, visible = drawn.visible, totals](PassContext &context) {
+        stats.record([instances = early.drawn.instances, visible = early.drawn.visible, lateList, totals,
+                      lists = late ? 2u : 1u](PassContext &context) {
             auto &device = context.device();
             auto kernel = kernels::CopyVisibleTotals{};
             device.useKernel(kernel);
             bind(device, kernel.instances, context.buffer(instances));
             bind(device, kernel.visible, context.buffer(visible));
+            bind(device, kernel.late, context.buffer(lateList));
             bind(device, kernel.totals, context.buffer(totals));
+            set(device, kernel.lists, lists);
             context.dispatch(kernel, tc::uvec3{1, 1, 1});
         });
         graph.readback<tc::uvec4>(totals, [](tc::uvec4 const *data, std::size_t, ViewResult &result) {
@@ -469,37 +639,32 @@ private:
         });
     }
 
-    // The depth first, then the triangles at the nearest depth.
-    static void rasterizeTwice(FrameGraphBuilder &graph, ViewContext const &view, VisibleSet const &drawn,
-                               VisibilityOutputs const &outputs) {
-        for (auto const mode : {kernels::rasterDepth(), kernels::rasterTriangles()}) {
-            auto const name = std::string{mode == kernels::rasterDepth() ? "rasterize depth" : "rasterize triangles"};
-            auto const large = largeTrianglesOf(graph, name);
-            auto &raster = graph.addPass(name);
-            declareRaster(raster, drawn, large);
-            raster.read(outputs.depth);
-            if (mode == kernels::rasterDepth()) {
-                raster.write(outputs.depth);
-            } else {
-                raster.read(outputs.triangles);
-                raster.write(outputs.triangles);
-            }
-            auto request = RasterRequest{};
-            request.inputs = RasterInputs{drawn, large, view.viewProjection, view.extent};
-            request.mode = mode;
-            request.depth = WordRange{outputs.depth};
-            request.triangles = WordRange{outputs.triangles};
-            raster.record([request](PassContext &context) { recordRaster(context, request); });
+    // Two of these, the depth first, then the triangles at the nearest depth.
+    static void rasterTargets(FrameGraphBuilder &graph, ViewContext const &view, std::string const &name,
+                              VisibleSet const &drawn, VisibilityOutputs const &outputs, tc::uint const mode) {
+        auto const large = largeTrianglesOf(graph, name);
+        auto &raster = graph.addPass(name);
+        declareRaster(raster, drawn, large);
+        raster.read(outputs.depth);
+        if (mode == kernels::rasterDepth()) {
+            raster.write(outputs.depth);
+        } else {
+            raster.read(outputs.triangles);
+            raster.write(outputs.triangles);
         }
+        auto request = RasterRequest{};
+        request.inputs = RasterInputs{drawn, large, view.viewProjection, view.extent};
+        request.mode = mode;
+        request.depth = WordRange{outputs.depth};
+        request.triangles = WordRange{outputs.triangles};
+        raster.record([request](PassContext &context) { recordRaster(context, request); });
     }
 
-    // Both at once with 64-bit atomics, then unpacked into the buffers rasterizeTwice()
-    // fills, so the passes after see the same.
-    static void rasterizeOnce(FrameGraphBuilder &graph, ViewContext const &view, VisibleSet const &drawn,
-                              VisibilityOutputs const &outputs) {
+    // Both at once with 64-bit atomics, into a buffer that unpack() turns into those that
+    // rasterTargets() fills, so the passes after see the same.
+    static BufferRef<tc::u64> clearPacked(FrameGraphBuilder &graph, ViewContext const &view) {
         auto const pixels = static_cast<tc::uint>(pixelsOf(view.extent));
         auto const packed = graph.createBuffer<tc::u64>("packed visibility", pixels);
-
         auto &clearPass = graph.addPass("clear packed visibility");
         clearPass.write(packed);
         clearPass.record([packed, pixels](PassContext &context) {
@@ -510,9 +675,13 @@ private:
             set(device, kernel.count, pixels);
             context.dispatch(kernel, tc::uvec3{groupsFor(pixels, 64), 1, 1});
         });
+        return packed;
+    }
 
-        auto const large = largeTrianglesOf(graph, "rasterize visibility");
-        auto &raster = graph.addPass("rasterize visibility");
+    static void rasterPacked(FrameGraphBuilder &graph, ViewContext const &view, std::string const &name,
+                             VisibleSet const &drawn, BufferRef<tc::u64> const packed) {
+        auto const large = largeTrianglesOf(graph, name);
+        auto &raster = graph.addPass(name);
         declareRaster(raster, drawn, large);
         raster.read(packed);
         raster.write(packed);
@@ -521,12 +690,16 @@ private:
             recordRasterStages<kernels::RasterPackedVisibility, kernels::RasterPackedVisibilityTiles>(
                 context, inputs, [&](auto &kernel) { bind(context.device(), kernel.packed, context.buffer(packed)); });
         });
+    }
 
-        auto &unpack = graph.addPass("unpack visibility");
-        unpack.read(packed);
-        unpack.write(outputs.depth);
-        unpack.write(outputs.triangles);
-        unpack.record([packed, depth = outputs.depth, triangles = outputs.triangles, pixels](PassContext &context) {
+    static void unpack(FrameGraphBuilder &graph, ViewContext const &view, BufferRef<tc::u64> const packed,
+                       VisibilityOutputs const &outputs) {
+        auto const pixels = static_cast<tc::uint>(pixelsOf(view.extent));
+        auto &unpackPass = graph.addPass("unpack visibility");
+        unpackPass.read(packed);
+        unpackPass.write(outputs.depth);
+        unpackPass.write(outputs.triangles);
+        unpackPass.record([packed, depth = outputs.depth, triangles = outputs.triangles, pixels](PassContext &context) {
             auto &device = context.device();
             auto kernel = kernels::UnpackVisibility{};
             device.useKernel(kernel);
@@ -601,11 +774,13 @@ struct ShadowFeature final : RenderFeature {
 
         for (auto index = std::size_t{0}; index < cascades.size(); ++index) {
             auto const name = std::to_string(index);
-            auto const drawn = cullAndCompact(
-                graph, view,
-                CullRequest{"cull shadow casters " + name, "compact shadow casters " + name,
-                            "cull shadow clusters " + name, "compact shadow clusters " + name,
-                            cascades[index].viewProjection, core::vec4{view.shadowLight->direction, 0.0f}, false});
+            auto const drawn =
+                cullAndCompact(graph, view,
+                               CullRequest{"cull shadow casters " + name, "compact shadow casters " + name,
+                                           "cull shadow clusters " + name, "compact shadow clusters " + name,
+                                           cascades[index].viewProjection,
+                                           core::vec4{view.shadowLight->direction, 0.0f}, false})
+                    .drawn;
             auto const large = largeTrianglesOf(graph, "rasterize shadow cascade " + name);
             auto &raster = graph.addPass("rasterize shadow cascade " + name);
             declareRaster(raster, drawn, large);
@@ -795,7 +970,8 @@ struct TransparencyFeature final : RenderFeature {
                                           CullRequest{"cull transparent instances", "compact transparent instances",
                                                       "cull transparent clusters", "compact transparent clusters",
                                                       view.viewProjection, core::vec4{view.camera.position, 1.0f},
-                                                      true});
+                                                      true})
+                              .drawn;
         auto const large = largeTrianglesOf(graph, "rasterize transparent");
         auto &raster = graph.addPass("rasterize transparent");
         declareRaster(raster, drawn, large);

@@ -30,6 +30,9 @@ nvidia)
     measure scale-1m --scene scale --instances 1000000
     measure sponza-taa --scene sponza --config none --config taa:taa=on
     measure sponza-aliasing --scene sponza --config shared:aliasing=on --config separate:aliasing=off
+    measure sponza-occlusion --scene sponza --config occlusion:occlusion=on --config frustum:occlusion=off
+    measure scale-1m-occlusion --scene scale --instances 1000000 --config occlusion:occlusion=on \
+        --config frustum:occlusion=off
     measure sponza-pathtrace --scene sponza --config rayqueries:pipeline=pathtrace \
         --config hierarchies:pipeline=pathtrace,rayqueries=off
     ;;
