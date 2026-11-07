@@ -75,7 +75,8 @@ inline ImageRgba8View imageView(ImageRgba8 const &image) noexcept {
 
 struct ViewStats {
     std::uint32_t visibleInstances = 0;
-    std::uint32_t visibleTriangles = 0;
+    std::uint32_t visibleClusters = 0; // of the visible instances, those culling kept
+    std::uint32_t visibleTriangles = 0; // of the visible clusters
     // The samples per pixel the path tracer has averaged since its last reset; 0 for
     // pipelines that do not accumulate.
     std::uint32_t accumulatedSamples = 0;

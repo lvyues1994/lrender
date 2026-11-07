@@ -63,6 +63,8 @@ struct RenderWorld {
     std::uint32_t instanceCount() const noexcept { return static_cast<std::uint32_t>(instances.size()); }
     std::uint32_t lightCount() const noexcept { return static_cast<std::uint32_t>(lights.size()); }
     std::uint32_t transparentInstanceCount() const noexcept { return transparentInstances; }
+    // The clusters of every instance's mesh, added up.
+    std::uint32_t clusterInstanceCount() const noexcept { return clusterInstances; }
     // Of every instance; empty (min > max) without instances.
     core::Aabb bounds() const noexcept { return sceneBounds; }
     // The first directional light that casts shadows.
@@ -140,6 +142,7 @@ private:
     // Upserted by the last apply(): their previous transform is out of date at the next.
     std::vector<core::InstanceId> movedInstances;
     std::uint32_t transparentInstances = 0;
+    std::uint32_t clusterInstances = 0;
     std::uint32_t materialModels = 1;
     core::Aabb sceneBounds{core::vec3{INFINITY}, core::vec3{-INFINITY}};
 

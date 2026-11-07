@@ -136,6 +136,9 @@ struct RendererConfig {
     // places them, DeviceInfo::placedImages) in one heap, those whose passes do not overlap
     // in the same memory; otherwise each gets memory of its own (ViewStats::graphBytes).
     bool aliasGraphResources = true;
+    // Raster passes draw only the clusters of the visible instances that lie in view and,
+    // for single-sided materials, do not face away; the pixels are the same either way.
+    bool cullClusters = true;
     // Optional kernel variants (RendererCapabilities), each used where the device runs it
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;

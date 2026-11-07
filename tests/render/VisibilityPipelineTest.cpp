@@ -634,6 +634,103 @@ TEST_CASE("more large triangles than the tile stage lists are all rasterized") {
     });
 }
 
+// Spheres all around and partly out of view, one mirrored, a double-sided quad behind
+// them, a blended sphere and the sun's shadows: clusters to cull for every reason.
+core::RenderWorldDelta clusteredScene() {
+    auto delta = core::RenderWorldDelta{};
+    delta.meshes = {{core::MeshId{0}, test::share(core::makeSphere(0.6f, 48, 24))},
+                    {core::MeshId{1}, test::share(core::makePlane(core::vec2{6.0f}))},
+                    {core::MeshId{2}, test::share(core::makeQuad(core::vec2{1.5f}))}};
+    auto twoSided = test::emissive(kBlueRadiance);
+    twoSided.doubleSided = true;
+    auto glass = core::MaterialDesc{};
+    glass.baseColor = core::vec4{0.6f, 0.7f, 0.9f, 0.4f};
+    glass.alphaMode = core::AlphaMode::Blend;
+    auto lit = core::MaterialDesc{};
+    lit.baseColor = core::vec4{0.8f, 0.5f, 0.3f, 1.0f};
+    delta.materials = {{kRed, lit}, {kBlue, twoSided}, {core::MaterialId{2}, glass}};
+    auto next = std::uint32_t{0};
+    delta.instances.push_back({core::InstanceId{next++}, core::MeshId{1}, kRed, test::translation(core::vec3{0.0f, -0.6f, 0.0f})});
+    for (auto row = 0; row < 5; ++row) {
+        for (auto column = 0; column < 5; ++column) {
+            auto const at = core::vec3{-3.0f + 1.5f * static_cast<float>(column), 0.0f, -3.0f + 1.5f * static_cast<float>(row)};
+            delta.instances.push_back({core::InstanceId{next++}, core::MeshId{0}, kRed, test::translation(at)});
+        }
+    }
+    auto mirrored = core::Transform{};
+    mirrored.translation = core::vec3{0.75f, 0.4f, 2.2f};
+    mirrored.scale = core::vec3{-0.8f, 0.8f, 0.8f};
+    delta.instances.push_back({core::InstanceId{next++}, core::MeshId{0}, kRed, core::matrixOf(mirrored)});
+    delta.instances.push_back({core::InstanceId{next++}, core::MeshId{2}, kBlue, test::translation(core::vec3{0.0f, 0.6f, -4.0f})});
+    delta.instances.push_back({core::InstanceId{next++}, core::MeshId{0}, core::MaterialId{2},
+                               test::translation(core::vec3{-0.6f, 0.5f, 1.5f})});
+    auto sun = core::DirectionalLight{};
+    sun.direction = core::vec3{-0.4f, -1.0f, -0.3f};
+    sun.castsShadows = true;
+    delta.lights = {{core::LightId{0}, sun}};
+    delta.environment = core::EnvironmentDesc{kSky};
+    return delta;
+}
+
+struct ClusteredFrame {
+    render::ImageRgba8 image;
+    std::vector<tc::uint> depth;
+    std::vector<tc::uvec2> resolved; // per pixel: (instance, first index of its triangle), or noTriangle()
+    render::ViewStats stats;
+};
+
+ClusteredFrame renderClustered(test::HarnessOptions options, std::string const &backend, bool const cull) {
+    options.backend = backend;
+    options.device = test::deviceFor(backend);
+    options.cullClusters = cull;
+    auto harness = RenderHarness{options};
+    auto const probe = std::make_shared<test::VisibilityProbe>();
+    auto &pipelines = harness.renderer->pipelines();
+    auto const target = harness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{kSize, kSize}});
+    auto view = test::viewOf(target, test::cameraAt(core::vec3{0.4f, 1.2f, 3.6f}, core::vec3{0.0f, 0.0f, 0.0f}));
+    view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
+    auto result = harness.render(test::frameOf(clusteredScene(), view));
+    auto frame = ClusteredFrame{std::move(*result.views[0].image), *probe->depth, {}, result.views[0].stats};
+    auto const &visible = *probe->visible;
+    for (auto const triangle : *probe->triangles) {
+        if (triangle == render::noTriangle()) {
+            frame.resolved.push_back(tc::uvec2{render::noTriangle(), 0u});
+            continue;
+        }
+        auto slot = std::size_t{0};
+        while (slot + 1 < visible[0].x and visible[slot + 2].y <= triangle) {
+            ++slot;
+        }
+        auto const &entry = visible[1 + slot];
+        frame.resolved.push_back(tc::uvec2{entry.x, entry.z + 3u * (triangle - entry.y)});
+    }
+    return frame;
+}
+
+TEST_CASE("culling clusters changes no pixel: the same nearest triangles, depths and image") {
+    for (auto const &backend : tc::availableBackends()) {
+        CAPTURE(backend);
+        auto culled = ClusteredFrame{};
+        auto all = ClusteredFrame{};
+        try {
+            culled = renderClustered(test::HarnessOptions{}, backend, true);
+            all = renderClustered(test::HarnessOptions{}, backend, false);
+        } catch (tc::DeviceError const &error) {
+            MESSAGE("skipped: " << error.what());
+            continue;
+        }
+        MESSAGE(culled.stats.visibleClusters << " of " << all.stats.visibleClusters << " clusters, "
+                                             << culled.stats.visibleTriangles << " of " << all.stats.visibleTriangles
+                                             << " triangles");
+        CHECK(culled.stats.visibleInstances == all.stats.visibleInstances);
+        CHECK(culled.stats.visibleClusters < all.stats.visibleClusters);
+        CHECK(culled.stats.visibleTriangles < all.stats.visibleTriangles);
+        CHECK(culled.depth == all.depth);
+        CHECK(culled.resolved == all.resolved);
+        CHECK(culled.image.pixels == all.image.pixels);
+    }
+}
+
 // More instances than the scan of block sums takes at once (256 blocks of 1024): every
 // 37th in view, boxes and quads in turn, and the others behind the camera.
 constexpr auto kManyInstances = std::uint32_t{300000};

@@ -335,9 +335,13 @@ struct ViewContext {
     core::mat4 inverseViewProjection{1.0f};
     std::optional<TemporalView> temporal;
     RendererCapabilities capabilities;
+    // RendererConfig::cullClusters.
+    bool cullClusters = true;
     // The renderer's material models when the frame was prepared, by MaterialModelId.
     std::vector<std::shared_ptr<MaterialModel>> materialModels;
     std::uint32_t instanceCount = 0;
+    // The clusters of every instance's mesh, added up: what a pass may draw at most.
+    std::uint32_t clusterInstanceCount = 0;
     std::uint32_t lightCount = 0;
     // Instances whose material blends.
     std::uint32_t transparentInstanceCount = 0;

@@ -39,6 +39,7 @@ struct HarnessOptions {
     // So that tests know which frame shows a converted texture.
     render::ConversionDelivery textureConversions = render::ConversionDelivery::Deterministic;
     bool aliasGraphResources = true;
+    bool cullClusters = true;
 };
 
 // A renderer with its own small runtime.
@@ -60,6 +61,7 @@ struct RenderHarness {
         config.rayQueries = options.rayQueries;
         config.textureConversions = options.textureConversions;
         config.aliasGraphResources = options.aliasGraphResources;
+        config.cullClusters = options.cullClusters;
         renderer = render::makeRenderer(config);
     }
 
@@ -230,7 +232,7 @@ struct VisibilityProbe final : render::RenderFeature {
         auto const count = static_cast<std::size_t>(view.extent.x) * static_cast<std::size_t>(view.extent.y);
         readBack(graph, "probed triangles", outputs.triangles, count, triangles);
         readBack(graph, "probed depth", outputs.depth, count, depth);
-        readBack(graph, "probed visible instances", outputs.visible, std::size_t{view.instanceCount} + 1, visible);
+        readBack(graph, "probed visible clusters", outputs.visible, std::size_t{view.clusterInstanceCount} + 1, visible);
     }
 
     // The last frame's: per pixel, rows from the top, and the visible instances.

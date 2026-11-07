@@ -341,12 +341,14 @@ std::optional<ShadowLight> RenderWorld::shadowLight() const {
 
 void RenderWorld::updateSummaries() {
     transparentInstances = 0;
+    clusterInstances = 0;
     sceneBounds = core::Aabb{core::vec3{INFINITY}, core::vec3{-INFINITY}};
     for (auto const &record : instances) {
         if (materials.at(record.material).desc.alphaMode == core::AlphaMode::Blend) {
             ++transparentInstances;
         }
         auto const &mesh = meshes.at(record.mesh).gpu;
+        clusterInstances += mesh.clusterCount;
         if (mesh.triangleCount != 0) {
             auto const box = core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, record.objectToWorld);
             sceneBounds.min = tc::min(sceneBounds.min, box.min);

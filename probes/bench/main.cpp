@@ -8,7 +8,7 @@
 //
 // Every --config gets a renderer of its own on the same device. Their frames alternate, each
 // waited for before the next starts, so that whatever the GPU's clocks do affects them alike.
-// Settings: aliasing=on|off, subgroups=auto|off, singlepass=auto|off, rayqueries=auto|off,
+// Settings: aliasing=on|off, clusters=on|off, subgroups=auto|off, singlepass=auto|off, rayqueries=auto|off,
 // taa=on|off, pipeline=visibility|pathtrace, present=drop|readback|shared. Before the --frames that count (a full turn of
 // the orbit unless given), every configuration renders --warmup frames from where the orbit
 // starts, then more until the medians of its last two windows of 30 frames agree within 2%
@@ -59,6 +59,7 @@ enum class Presentation : std::uint8_t { Drop, Readback, Shared };
 struct Settings {
     Presentation present = Presentation::Drop;
     bool aliasing = true;
+    bool clusters = true;
     VariantUse subgroups = VariantUse::Auto;
     VariantUse singlePass = VariantUse::Auto;
     VariantUse rayQueries = VariantUse::Auto;
@@ -114,6 +115,8 @@ bool applySetting(Settings &settings, std::string const &key, std::string const 
     auto const on = parseSwitch(value);
     if (key == "aliasing" and on) {
         settings.aliasing = *on;
+    } else if (key == "clusters" and on) {
+        settings.clusters = *on;
     } else if (key == "subgroups" and use) {
         settings.subgroups = *use;
     } else if (key == "singlepass" and use) {
@@ -374,6 +377,7 @@ Run makeRun(ConfigSpec spec, Options const &options, lr::runtime::Runtime &runti
     config.gpuTimers = options.timers;
     config.textureConversions = lr::render::ConversionDelivery::Deterministic;
     config.aliasGraphResources = spec.settings.aliasing;
+    config.cullClusters = spec.settings.clusters;
     config.subgroups = spec.settings.subgroups;
     config.singlePassVisibility = spec.settings.singlePass;
     config.rayQueries = spec.settings.rayQueries;
@@ -566,6 +570,7 @@ std::string json(Report const &report, std::vector<Run> const &runs) {
             << measured.clockChanges << ", \"graphBytes\": " << measured.stats.graphBytes
             << ", \"unaliasedBytes\": " << measured.stats.unaliasedBytes
             << ", \"visibleInstances\": " << measured.stats.visibleInstances
+            << ", \"visibleClusters\": " << measured.stats.visibleClusters
             << ", \"visibleTriangles\": " << measured.stats.visibleTriangles << ",\n     \"sceneBytes\": {\"geometry\": "
             << measured.memory.geometry << ", \"clusters\": " << measured.memory.clusters
             << ", \"objects\": " << measured.memory.objects << ", \"hierarchies\": " << measured.memory.hierarchies
@@ -598,9 +603,10 @@ void print(Report const &report, std::vector<Run> const &runs) {
                 report.clocksAfter.c_str());
     for (auto const &run : runs) {
         auto const &measured = run.measured;
-        std::printf("%s%s%s: %u instances and %u triangles visible, frame graph %.1f MiB\n", run.spec.name.c_str(),
-                    run.spec.text.empty() ? "" : " ", run.spec.text.c_str(), measured.stats.visibleInstances,
-                    measured.stats.visibleTriangles, static_cast<double>(measured.stats.graphBytes) / 1048576.0);
+        std::printf("%s%s%s: %u instances, %u clusters and %u triangles visible, frame graph %.1f MiB\n",
+                    run.spec.name.c_str(), run.spec.text.empty() ? "" : " ", run.spec.text.c_str(),
+                    measured.stats.visibleInstances, measured.stats.visibleClusters, measured.stats.visibleTriangles,
+                    static_cast<double>(measured.stats.graphBytes) / 1048576.0);
         auto const mib = [](std::uint64_t const bytes) { return static_cast<double>(bytes) / 1048576.0; };
         std::printf("  scene: geometry %.1f MiB, clusters %.1f MiB, objects %.1f MiB, hierarchies %.1f MiB, "
                     "textures %.1f MiB\n",

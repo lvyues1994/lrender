@@ -495,8 +495,9 @@ TEST_CASE("with device timers on, every pass reports the time of its dispatches"
                                                   "scatter material model pixels",
                                                   "shade lr_shade_metallic_roughness",
                                                   "tonemap"};
-    auto twoPass = std::vector<std::string>{"clear visibility", "cull instances", "compact visible instances",
-                                            "rasterize depth", "rasterize triangles"};
+    auto twoPass =
+        std::vector<std::string>{"clear visibility", "cull instances",  "compact visible instances", "cull clusters",
+                                 "compact visible clusters", "rasterize depth", "rasterize triangles"};
     twoPass.insert(twoPass.end(), shading.begin(), shading.end());
     CHECK(passNames(result.views[0]) == twoPass);
     CHECK(result.views[0].passTimings[0].dispatches == 2);
@@ -509,8 +510,10 @@ TEST_CASE("with device timers on, every pass reports the time of its dispatches"
     REQUIRE(onePassHarness.renderer->capabilities().singlePassVisibility);
     auto const onePassTarget =
         onePassHarness.renderer->targets().createImage(render::ImageTargetDesc{core::ivec2{16, 16}});
-    auto onePass = std::vector<std::string>{"cull instances", "compact visible instances", "clear packed visibility",
-                                            "rasterize visibility", "unpack visibility"};
+    auto onePass = std::vector<std::string>{"cull instances",          "compact visible instances",
+                                            "cull clusters",           "compact visible clusters",
+                                            "clear packed visibility", "rasterize visibility",
+                                            "unpack visibility"};
     onePass.insert(onePass.end(), shading.begin(), shading.end());
     auto const onePassResult = onePassHarness.render(
         frameOf(litPlane(core::DirectionalLight{}), test::viewOf(onePassTarget, overheadCamera())));

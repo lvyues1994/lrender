@@ -273,6 +273,7 @@ ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     context.instanceCount = world.instanceCount();
     context.lightCount = world.lightCount();
     context.transparentInstanceCount = world.transparentInstanceCount();
+    context.clusterInstanceCount = world.clusterInstanceCount();
     context.sceneBounds = world.bounds();
     context.shadowLight = world.shadowLight();
     context.sceneVersion = world.version();
@@ -320,6 +321,7 @@ struct RendererImpl final : Renderer {
         : framesInFlight(checkedFramesInFlight(config)),
           gpu(gpu::makeGpuQueue(gpu::GpuQueueConfig{config.backend, config.deviceNameContains, config.runtime})),
           timers(config.gpuTimers and gpu->info().timers),
+          cullClusters(config.cullClusters),
           chosen(chooseFor(*gpu, config)),
           models(*gpu),
           targetSet(gpu->info()),
@@ -448,6 +450,7 @@ private:
     ViewContext viewContextOf(ViewPlan const &plan, std::uint64_t const frameIndex, ModelList const &modelList) {
         auto context = makeViewContext(plan, world);
         context.capabilities = chosen;
+        context.cullClusters = cullClusters;
         context.materialModels = modelList;
         if (jitters(plan)) {
             auto const temporal = temporalViews.advance(TemporalRequest{plan.desc.id, frameIndex, context.extent,
@@ -490,6 +493,7 @@ private:
     std::uint32_t framesInFlight;
     std::unique_ptr<gpu::GpuQueue> gpu;
     bool timers;
+    bool cullClusters;
     RendererCapabilities chosen;
     MaterialModelsImpl models;
     runtime::SerialThread renderThread;
