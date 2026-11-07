@@ -4,8 +4,10 @@
 
 #include <algorithm>
 #include <cmath>
+#include <iterator>
 #include <stdexcept>
 #include <string>
+#include <unordered_map>
 #include <unordered_set>
 #include <utility>
 #include <variant>
@@ -253,44 +255,187 @@ RenderWorld::RenderWorld(TextureLimits const &limits, ParallelFor &parallel_, Im
                          ConversionDelivery const delivery)
     : parallel(&parallel_), textures(limits, conversions, delivery) {}
 
-// Each mesh's vertices and indices go after those before it, as they come; the encoding
-// and the bounds of each are an item of `parallel`.
-void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &upserts, SceneUpdate &update) {
+// Each mesh's vertices, indices and clusters take ranges of their tables, after a replaced
+// mesh gives its own back; the encoding and the bounds of each are an item of `parallel`.
+// Of the upserts of one id, the last one counts.
+void RenderWorld::upsertMeshes(std::vector<core::MeshUpsert> const &all, SceneUpdate &update) {
+    auto upserts = std::vector<core::MeshUpsert const *>{};
+    auto last = std::unordered_map<core::MeshId, std::size_t>{};
+    for (auto index = std::size_t{0}; index < all.size(); ++index) {
+        last[all[index].id] = index;
+    }
+    for (auto index = std::size_t{0}; index < all.size(); ++index) {
+        if (last.at(all[index].id) == index) {
+            upserts.push_back(&all[index]);
+        }
+    }
     auto geometry = std::vector<GeometryUpload>(upserts.size());
     auto bounds = std::vector<core::Aabb>(upserts.size());
     auto clusters = std::vector<std::vector<GpuCluster>>(upserts.size());
     auto firsts = std::vector<std::pair<std::uint32_t, std::uint32_t>>{};
     firsts.reserve(upserts.size());
-    for (auto const &upsert : upserts) {
-        firsts.emplace_back(vertexEnd, indexEnd);
-        vertexEnd += static_cast<std::uint32_t>(upsert.mesh->positions.size());
-        indexEnd += static_cast<std::uint32_t>(upsert.mesh->indices.size());
+    for (auto const *upsert : upserts) {
+        auto const found = meshes.find(upsert->id);
+        if (found != meshes.end()) {
+            releaseGeometry(found->second);
+            releaseHierarchy(found->second);
+        }
+        firsts.emplace_back(vertexRanges.allocate(static_cast<std::uint32_t>(upsert->mesh->positions.size())),
+                            indexRanges.allocate(static_cast<std::uint32_t>(upsert->mesh->indices.size())));
     }
     parallel->run(upserts.size(), [&](std::size_t const index) {
-        auto const &data = *upserts[index].mesh;
+        auto const &data = *upserts[index]->mesh;
         geometry[index] = encodeGeometry(data, firsts[index].first, firsts[index].second);
         bounds[index] = core::boundsOf(data);
         clusters[index] = buildClusters(data);
     });
     for (auto index = std::size_t{0}; index < upserts.size(); ++index) {
-        auto const &upsert = upserts[index];
+        auto const &upsert = *upserts[index];
         auto const found = meshes.find(upsert.id);
         auto const slot = found != meshes.end() ? found->second.slot : takeSlot(freeMeshSlots, meshSlotEnd);
         auto const clusterCount = static_cast<std::uint32_t>(clusters[index].size());
+        auto const firstCluster = clusterRanges.allocate(clusterCount);
         auto const gpu = GpuMesh{geometry[index].firstVertex,
                                  geometry[index].firstIndex,
                                  static_cast<std::uint32_t>(upsert.mesh->indices.size() / 3),
                                  bounds[index].min,
                                  bounds[index].max,
                                  static_cast<std::uint32_t>(geometry[index].vertices.size()),
-                                 clusterEnd,
+                                 firstCluster,
                                  clusterCount};
-        geometry[index].firstCluster = clusterEnd;
+        geometry[index].firstCluster = firstCluster;
         geometry[index].clusters = clusters[index];
-        clusterEnd += clusterCount;
         meshes[upsert.id] = MeshRecord{slot, gpu, upsert.mesh, noBvhNode(), core::Aabb{}, std::move(clusters[index])};
         update.geometry.push_back(std::move(geometry[index]));
         update.meshes.push_back(Indexed<GpuMesh>{slot, gpu});
+    }
+}
+
+void RenderWorld::releaseGeometry(MeshRecord const &record) {
+    vertexRanges.release(record.gpu.firstVertex, record.gpu.vertexCount);
+    indexRanges.release(record.gpu.firstIndex, 3 * record.gpu.triangleCount);
+    clusterRanges.release(record.gpu.firstCluster, record.gpu.clusterCount);
+}
+
+void RenderWorld::releaseHierarchy(MeshRecord &record) {
+    if (record.blasRoot != noBvhNode()) {
+        blasNodeRanges.release(record.blasRoot, record.blasNodeCount);
+        blasTriangleRanges.release(record.blasTriangleFirst, record.blasTriangleCount);
+    }
+    record.blasRoot = noBvhNode();
+    record.blasNodeCount = 0;
+    record.blasTriangleCount = 0;
+}
+
+bool RenderWorld::fragmented() const noexcept {
+    auto const wasteful = [](RangeAllocator const &ranges) { return ranges.wasted() > ranges.used(); };
+    return wasteful(vertexRanges) or wasteful(indexRanges) or wasteful(clusterRanges)
+        or wasteful(blasNodeRanges) or wasteful(blasTriangleRanges);
+}
+
+namespace {
+
+// Places `count(record)` elements of each record one after the other from 0, in the order
+// their `first(record)` has them now: the new firsts, and the moves to them.
+template <class Record, class First, class Count>
+std::vector<std::uint32_t> pack(std::vector<Record *> const &records, First const &first, Count const &count,
+                                RangeAllocator &ranges, std::vector<RangeMove> &moves) {
+    auto order = std::vector<std::size_t>(records.size());
+    for (auto index = std::size_t{0}; index < order.size(); ++index) {
+        order[index] = index;
+    }
+    std::sort(order.begin(), order.end(),
+              [&](std::size_t const a, std::size_t const b) { return first(*records[a]) < first(*records[b]); });
+    auto placed = std::vector<std::uint32_t>(records.size(), 0);
+    auto next = std::uint32_t{0};
+    for (auto const index : order) {
+        auto const elements = count(*records[index]);
+        if (elements == 0) {
+            continue;
+        }
+        placed[index] = next;
+        moves.push_back(RangeMove{first(*records[index]), next, elements});
+        next += elements;
+    }
+    ranges.reset(next);
+    return placed;
+}
+
+} // namespace
+
+// Every mesh's geometry and hierarchy packed to the start of their tables, in the order they
+// lie there.
+void RenderWorld::compactGeometry(SceneUpdate &update) {
+    auto records = std::vector<MeshRecord *>{};
+    for (auto &[id, record] : meshes) {
+        records.push_back(&record);
+    }
+    auto vertexMoves = std::vector<RangeMove>{};
+    auto const vertices = pack(
+        records, [](MeshRecord const &r) { return r.gpu.firstVertex; },
+        [](MeshRecord const &r) { return r.gpu.vertexCount; }, vertexRanges, vertexMoves);
+    auto indexMoves = std::vector<RangeMove>{};
+    auto const indices = pack(
+        records, [](MeshRecord const &r) { return r.gpu.firstIndex; },
+        [](MeshRecord const &r) { return 3 * r.gpu.triangleCount; }, indexRanges, indexMoves);
+    auto clusterMoves = std::vector<RangeMove>{};
+    auto const firstClusters = pack(
+        records, [](MeshRecord const &r) { return r.gpu.firstCluster; },
+        [](MeshRecord const &r) { return r.gpu.clusterCount; }, clusterRanges, clusterMoves);
+    auto nodeMoves = std::vector<RangeMove>{};
+    auto const roots = pack(
+        records, [](MeshRecord const &r) { return r.blasRoot; }, [](MeshRecord const &r) { return r.blasNodeCount; },
+        blasNodeRanges, nodeMoves);
+    auto triangleMoves = std::vector<RangeMove>{};
+    auto const triangles = pack(
+        records, [](MeshRecord const &r) { return r.blasTriangleFirst; },
+        [](MeshRecord const &r) { return r.blasTriangleCount; }, blasTriangleRanges, triangleMoves);
+
+    auto const moved = [](RangeMove const &move) { return move.from != move.to; };
+    std::copy_if(vertexMoves.begin(), vertexMoves.end(), std::back_inserter(update.moves.vertices), moved);
+    std::copy_if(indexMoves.begin(), indexMoves.end(), std::back_inserter(update.moves.indices), moved);
+    std::copy_if(clusterMoves.begin(), clusterMoves.end(), std::back_inserter(update.moves.clusters), moved);
+    auto recordOfNode = std::unordered_map<std::uint32_t, std::size_t>{};
+    auto recordOfTriangle = std::unordered_map<std::uint32_t, std::size_t>{};
+    for (auto index = std::size_t{0}; index < records.size(); ++index) {
+        if (records[index]->blasNodeCount != 0) {
+            recordOfNode[records[index]->blasRoot] = index;
+            recordOfTriangle[records[index]->blasTriangleFirst] = index;
+        }
+    }
+    for (auto const &move : nodeMoves) {
+        auto const &record = *records[recordOfNode.at(move.from)];
+        auto const toTriangle = triangles[recordOfNode.at(move.from)];
+        if (move.from != move.to or record.blasTriangleFirst != toTriangle) {
+            update.moves.blasNodes.push_back(NodeMove{move, record.blasTriangleFirst, toTriangle});
+        }
+    }
+    for (auto const &move : triangleMoves) {
+        auto const index = recordOfTriangle.at(move.from);
+        auto const &record = *records[index];
+        if (move.from != move.to or record.gpu.firstVertex != vertices[index]) {
+            update.moves.blasTriangles.push_back(TriangleMove{move, record.gpu.firstVertex, vertices[index]});
+        }
+    }
+
+    for (auto index = std::size_t{0}; index < records.size(); ++index) {
+        auto &record = *records[index];
+        auto gpu = record.gpu;
+        gpu.firstVertex = record.gpu.vertexCount != 0 ? vertices[index] : 0u;
+        gpu.firstIndex = record.gpu.triangleCount != 0 ? indices[index] : 0u;
+        gpu.firstCluster = record.gpu.clusterCount != 0 ? firstClusters[index] : 0u;
+        if (gpu.firstVertex != record.gpu.firstVertex or gpu.firstIndex != record.gpu.firstIndex
+            or gpu.firstCluster != record.gpu.firstCluster) {
+            record.gpu = gpu;
+            update.meshes.push_back(Indexed<GpuMesh>{record.slot, gpu});
+        }
+        if (record.blasNodeCount != 0) {
+            record.blasTriangleFirst = triangles[index];
+            if (record.blasRoot != roots[index]) {
+                record.blasRoot = roots[index];
+                update.blasRoots.push_back(Indexed<tc::uint>{record.slot, record.blasRoot});
+            }
+        }
     }
 }
 
@@ -327,6 +472,11 @@ std::vector<core::TextureId> RenderWorld::takeLostTextures() {
     std::sort(lost.begin(), lost.end());
     lostTextures.clear();
     return lost;
+}
+
+std::optional<std::uint32_t> RenderWorld::meshSlot(core::MeshId const id) const {
+    auto const found = meshes.find(id);
+    return found != meshes.end() ? std::optional<std::uint32_t>{found->second.slot} : std::nullopt;
 }
 
 std::optional<ShadowLight> RenderWorld::shadowLight() const {
@@ -434,13 +584,21 @@ void RenderWorld::buildBlases(std::vector<MeshRecord *> const &records, SceneUpd
 
 void RenderWorld::placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &update) {
     auto const &data = *record.data;
-    record.blasRoot = bvh.nodes.empty() ? noBvhNode() : blasNodeEnd;
+    releaseHierarchy(record);
+    auto const nodeCount = static_cast<std::uint32_t>(bvh.nodes.size());
+    auto const triangleCount = static_cast<std::uint32_t>(bvh.order.size());
+    auto const firstNode = blasNodeRanges.allocate(nodeCount);
+    auto const firstTriangle = blasTriangleRanges.allocate(triangleCount);
+    record.blasRoot = bvh.nodes.empty() ? noBvhNode() : firstNode;
     record.blasBounds = bvh.nodes.empty() ? core::Aabb{} : boundsOf(bvh.nodes[0]);
+    record.blasNodeCount = bvh.nodes.empty() ? 0u : nodeCount;
+    record.blasTriangleFirst = firstTriangle;
+    record.blasTriangleCount = bvh.nodes.empty() ? 0u : triangleCount;
     update.blasRoots.push_back(Indexed<tc::uint>{record.slot, record.blasRoot});
     for (auto index = std::size_t{0}; index < bvh.nodes.size(); ++index) {
         auto node = bvh.nodes[index];
-        node.first += node.count == 0 ? blasNodeEnd : blasTriangleEnd;
-        update.blasNodes.push_back(Indexed<GpuBvhNode>{blasNodeEnd + static_cast<std::uint32_t>(index), node});
+        node.first += node.count == 0 ? firstNode : firstTriangle;
+        update.blasNodes.push_back(Indexed<GpuBvhNode>{firstNode + static_cast<std::uint32_t>(index), node});
     }
     auto const firstVertex = record.gpu.firstVertex;
     for (auto index = std::size_t{0}; index < bvh.order.size(); ++index) {
@@ -448,11 +606,9 @@ void RenderWorld::placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &upd
         auto const first = std::size_t{primitive} * 3;
         auto const corners = tc::uvec3{firstVertex + data.indices[first], firstVertex + data.indices[first + 1],
                                        firstVertex + data.indices[first + 2]};
-        update.blasTriangles.push_back(Indexed<GpuBvhTriangle>{blasTriangleEnd + static_cast<std::uint32_t>(index),
+        update.blasTriangles.push_back(Indexed<GpuBvhTriangle>{firstTriangle + static_cast<std::uint32_t>(index),
                                                                GpuBvhTriangle{corners, primitive}});
     }
-    blasNodeEnd += static_cast<std::uint32_t>(bvh.nodes.size());
-    blasTriangleEnd += static_cast<std::uint32_t>(bvh.order.size());
 }
 
 // Instances of meshes without triangles are left out.
@@ -512,8 +668,13 @@ SceneUpdate RenderWorld::fullUpdate() {
     }
     if (hierarchies) {
         hierarchies = false;
-        blasNodeEnd = 0;
-        blasTriangleEnd = 0;
+        blasNodeRanges.clear();
+        blasTriangleRanges.clear();
+        for (auto &[id, record] : meshes) {
+            record.blasRoot = noBvhNode();
+            record.blasNodeCount = 0;
+            record.blasTriangleCount = 0;
+        }
         keepHierarchies(update);
     }
     update.capacity = capacity();
@@ -541,16 +702,19 @@ void RenderWorld::keepHierarchies(SceneUpdate &update) {
 
 SceneCapacity RenderWorld::capacity() const noexcept {
     auto const kept = [this](std::uint32_t const count) { return hierarchies ? roundUpToPowerOfTwo(count) : 0u; };
-    return SceneCapacity{roundUpToPowerOfTwo(vertexEnd),       roundUpToPowerOfTwo(indexEnd),
-                         roundUpToPowerOfTwo(clusterEnd),      roundUpToPowerOfTwo(meshSlotEnd),
-                         roundUpToPowerOfTwo(instanceCount()), roundUpToPowerOfTwo(materialSlotEnd),
-                         roundUpToPowerOfTwo(lightCount()),    kept(blasNodeEnd),
-                         kept(blasTriangleEnd),                kept(tlasNodeCount)};
+    return SceneCapacity{roundUpToPowerOfTwo(vertexRanges.end()),  roundUpToPowerOfTwo(indexRanges.end()),
+                         roundUpToPowerOfTwo(clusterRanges.end()), roundUpToPowerOfTwo(meshSlotEnd),
+                         roundUpToPowerOfTwo(instanceCount()),     roundUpToPowerOfTwo(materialSlotEnd),
+                         roundUpToPowerOfTwo(lightCount()),        kept(blasNodeRanges.end()),
+                         kept(blasTriangleRanges.end()),           kept(tlasNodeCount)};
 }
 
 SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     validate(delta);
     auto update = SceneUpdate{};
+    if (fragmented()) {
+        compactGeometry(update);
+    }
     upsertMeshes(delta.meshes, update);
     applyTextures(delta, update);
     textures.deliverConversions(update);
@@ -583,8 +747,11 @@ SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
         removeLight(id, update);
     }
     for (auto const id : delta.removed.meshes) {
-        freeMeshSlots.push_back(meshes.at(id).slot);
-        update.removedMeshes.push_back(meshes.at(id).slot);
+        auto &record = meshes.at(id);
+        releaseGeometry(record);
+        releaseHierarchy(record);
+        freeMeshSlots.push_back(record.slot);
+        update.removedMeshes.push_back(record.slot);
         meshes.erase(id);
     }
     for (auto const id : delta.removed.materials) {

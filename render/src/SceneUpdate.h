@@ -26,6 +26,44 @@ struct GeometryUpload {
     std::vector<GpuCluster> clusters;
 };
 
+// Elements [from, from + count) of a table, moved to [to, to + count).
+struct RangeMove {
+    std::uint32_t from = 0;
+    std::uint32_t to = 0;
+    std::uint32_t count = 0;
+};
+
+// A mesh's hierarchy nodes, moved: inner nodes' children move with them, leaves'
+// triangles from `fromTriangle` on to `toTriangle` on.
+struct NodeMove {
+    RangeMove nodes;
+    std::uint32_t fromTriangle = 0;
+    std::uint32_t toTriangle = 0;
+};
+
+// A mesh's hierarchy triangles, moved, their corners with the mesh's vertices from
+// `fromVertex` on to `toVertex` on.
+struct TriangleMove {
+    RangeMove triangles;
+    std::uint32_t fromVertex = 0;
+    std::uint32_t toVertex = 0;
+};
+
+inline RangeMove const &rangeOf(RangeMove const &move) noexcept { return move; }
+inline RangeMove const &rangeOf(NodeMove const &move) noexcept { return move.nodes; }
+inline RangeMove const &rangeOf(TriangleMove const &move) noexcept { return move.triangles; }
+
+// What packing the meshes together moves: every move goes to a lower place or stays, and
+// each list is in the order of its moves' places, so that moving one element after the
+// other overwrites nothing a later move reads.
+struct GeometryMoves {
+    std::vector<RangeMove> vertices;
+    std::vector<RangeMove> indices;
+    std::vector<RangeMove> clusters;
+    std::vector<NodeMove> blasNodes;
+    std::vector<TriangleMove> blasTriangles;
+};
+
 // A material and the textures it refers to (base colour, metallic-roughness, emissive,
 // normal; invalid ids for none). The GPU thread fills in GpuMaterial::textures with the
 // textures that have finished streaming in.
@@ -52,8 +90,8 @@ struct TextureUpload {
     std::uint32_t levels = 1;
 };
 
-// Elements each table must hold. The hierarchy tables stay 0, and are not created, until
-// RenderWorld keeps hierarchies.
+// Elements each table must hold: a table more than four times as large shrinks to it. The
+// hierarchy tables stay 0, and are not created, until RenderWorld keeps hierarchies.
 struct SceneCapacity {
     std::uint32_t vertices = 1;
     std::uint32_t indices = 1;
@@ -70,6 +108,8 @@ struct SceneCapacity {
 // What the GPU copy of the scene must change for one frame: built on the render thread,
 // applied on the GPU thread.
 struct SceneUpdate {
+    // Before everything else.
+    GeometryMoves moves;
     SceneCapacity capacity;
     std::vector<GeometryUpload> geometry;
     std::vector<Indexed<GpuMesh>> meshes;

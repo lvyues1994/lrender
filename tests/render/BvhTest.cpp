@@ -369,8 +369,10 @@ TEST_CASE("hierarchies follow the deltas after they are first built") {
     CHECK(afterMove.tlasNodes.size() == afterMove.tlasNodeCount);
     REQUIRE(afterMove.blasRoots.size() == 1);
     CHECK(afterMove.blasRoots[0].index == first.meshes[0].index);
-    CHECK(afterMove.blasRoots[0].value >= first.blasNodes.size()); // appended after the first hierarchies
-    CHECK(afterMove.blasTriangles.size() == 12);
+    // In the place the sphere's larger hierarchy gave back.
+    CHECK(afterMove.blasRoots[0].value == gather(first.blasRoots)[first.meshes[0].index]);
+    REQUIRE(afterMove.blasTriangles.size() == 12);
+    CHECK(afterMove.blasTriangles[0].index == 0);
 }
 
 bool sameNodes(std::vector<render::Indexed<render::GpuBvhNode>> const &a,

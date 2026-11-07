@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Bvh.h"
+#include "RangeAllocator.h"
 #include "RenderWork.h"
 #include "SceneUpdate.h"
 #include "TextureLayout.h"
@@ -21,8 +22,10 @@ namespace lr::render {
 // The render thread's copy of the scene. Each frame applies a RenderWorldDelta and turns
 // the changes into the SceneUpdate the GPU thread applies to its tables. Instances and
 // lights stay dense (removal moves the last one into the gap) because kernels loop over
-// them; meshes and materials keep their slots. Geometry, clusters and hierarchies of
-// replaced or removed meshes are not reclaimed yet. Texture images pass through to the GPU
+// them; meshes and materials keep their slots. A mesh's vertices, indices, clusters and
+// hierarchy take ranges of their tables, which a replaced or removed mesh gives back; once
+// more of a table lies free than taken, the next apply() packs the meshes together
+// (SceneUpdate::moves). Texture images pass through to the GPU
 // thread (TextureLayout places them); the world keeps only their ids. The meshes of a delta
 // are encoded and cut into clusters, and their hierarchies built, as items of `parallel`;
 // the textures that need converting are converted on `conversions` and upload with the
@@ -60,6 +63,8 @@ struct RenderWorld {
     std::vector<core::TextureId> takeLostTextures();
     TextureLayout const &textureLayout() const noexcept { return textures; }
 
+    // The slot `id` has in the mesh table, while the world holds it.
+    std::optional<std::uint32_t> meshSlot(core::MeshId id) const;
     std::uint32_t instanceCount() const noexcept { return static_cast<std::uint32_t>(instances.size()); }
     std::uint32_t lightCount() const noexcept { return static_cast<std::uint32_t>(lights.size()); }
     std::uint32_t transparentInstanceCount() const noexcept { return transparentInstances; }
@@ -78,10 +83,14 @@ private:
         std::uint32_t slot;
         GpuMesh gpu;
         core::MeshHandle data;
-        // While hierarchies are kept: the root of the mesh's, and the bounds of its triangles.
+        // While hierarchies are kept: the root of the mesh's (its first node), and the bounds
+        // of its triangles.
         std::uint32_t blasRoot;
         core::Aabb blasBounds;
         std::vector<GpuCluster> clusters; // for a full update
+        std::uint32_t blasNodeCount = 0;
+        std::uint32_t blasTriangleFirst = 0;
+        std::uint32_t blasTriangleCount = 0;
     };
     struct MaterialRecord {
         std::uint32_t slot;
@@ -102,6 +111,11 @@ private:
     void validate(core::RenderWorldDelta const &delta) const;
     std::uint32_t takeSlot(std::vector<std::uint32_t> &freeSlots, std::uint32_t &end);
     void upsertMeshes(std::vector<core::MeshUpsert> const &upserts, SceneUpdate &update);
+    void releaseGeometry(MeshRecord const &record);
+    void releaseHierarchy(MeshRecord &record);
+    // Whether some table has more elements free before its end than taken.
+    bool fragmented() const noexcept;
+    void compactGeometry(SceneUpdate &update);
     void upsertMaterial(core::MaterialUpsert const &upsert, SceneUpdate &update);
     void writeInstance(std::uint32_t index, SceneUpdate &update) const;
     void writeLight(std::uint32_t index, SceneUpdate &update) const;
@@ -125,9 +139,9 @@ private:
     std::unordered_map<core::MeshId, MeshRecord> meshes;
     std::vector<std::uint32_t> freeMeshSlots;
     std::uint32_t meshSlotEnd = 0;
-    std::uint32_t vertexEnd = 0;
-    std::uint32_t indexEnd = 0;
-    std::uint32_t clusterEnd = 0;
+    RangeAllocator vertexRanges;
+    RangeAllocator indexRanges;
+    RangeAllocator clusterRanges;
 
     TextureLayout textures;
     std::unordered_set<core::TextureId> textureIds;
@@ -153,8 +167,8 @@ private:
     std::uint64_t changes = 0;
 
     bool hierarchies = false;
-    std::uint32_t blasNodeEnd = 0;
-    std::uint32_t blasTriangleEnd = 0;
+    RangeAllocator blasNodeRanges;
+    RangeAllocator blasTriangleRanges;
     std::uint32_t tlasNodeCount = 0;
 };
 

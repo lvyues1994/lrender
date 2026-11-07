@@ -150,7 +150,7 @@ TEST_CASE("malformed meshes are rejected") {
     CHECK_THROWS_AS(world.apply(delta), std::invalid_argument);
 }
 
-TEST_CASE("a replaced mesh keeps its slot and gets new geometry") {
+TEST_CASE("a replaced mesh keeps its slot and gets new geometry in the place the old one gave back") {
     auto world = render::RenderWorld{};
     auto const first = world.apply(oneQuad());
     auto replace = core::RenderWorldDelta{};
@@ -161,7 +161,8 @@ TEST_CASE("a replaced mesh keeps its slot and gets new geometry") {
     REQUIRE(second.meshes.size() == 1);
     CHECK(second.meshes[0].index == first.meshes[0].index);
     CHECK(second.meshes[0].value.triangleCount == 12);
-    CHECK(second.geometry[0].firstVertex >= 4);
+    CHECK(second.geometry[0].firstVertex == 0);
+    CHECK(second.capacity.vertices == 32);
 }
 
 TEST_CASE("a full update writes everything the world holds now, hierarchies included") {

@@ -16,8 +16,10 @@
 namespace lr::render {
 
 // The GPU thread's copy of the scene: device tables kept in step with RenderWorld by
-// applying its SceneUpdates in frame order. Grown tables are uploaded whole and the ones
-// they replace go to `retired`; otherwise only the ranges an update writes move. Uploads
+// applying its SceneUpdates in frame order, their moves first. Resized tables (grown, or
+// shrunk once more than four times as large as they need to be) are uploaded whole and
+// the ones they replace go to `retired`; otherwise only the ranges an update moves to or
+// writes go up. Uploads
 // copy the host tables at the call, so an update may be applied while earlier frames
 // still read the tables on the device. Materials refer to the textures that are resident
 // in `textures`, and are written again whenever that changes.
