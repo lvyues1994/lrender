@@ -1,5 +1,6 @@
 #include "KernelVariants.h"
 
+#include "kernels/Lights.h"
 #include "kernels/PathTrace.h"
 #include "kernels/Post.h"
 #include "kernels/Shading.h"
@@ -62,7 +63,7 @@ LrenderPrograms const &lrenderPrograms() {
         {ClearUint::fileLocation, CullInstances::fileLocation, SumVisibleBlocks::fileLocation,
          ScanVisibleBlocks::fileLocation, WriteVisible::fileLocation, CullClusters::fileLocation,
          SumClusterBlocks::fileLocation, WriteVisibleClusters::fileLocation, DownsampleDepth::fileLocation,
-         DownsamplePyramid::fileLocation, CullOccludedClusters::fileLocation,
+         DownsamplePyramid::fileLocation, CullOccludedClusters::fileLocation, AssignLights::fileLocation,
          RasterVisibility::fileLocation, RasterVisibilityTiles::fileLocation, ScanLargeTriangles::fileLocation,
          CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
          AllocateModelLists::fileLocation, ScatterModelPixels::fileLocation,

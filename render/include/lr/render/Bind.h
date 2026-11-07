@@ -78,6 +78,7 @@ void bindMaterialTextures(tc::Device &device, K &kernel, MaterialTextures const 
 // What the bindings and uniforms of LR_SURFACE_SHADING take.
 struct SurfaceShadingResources {
     SceneTables const *scene = nullptr;
+    tc::BufferResource<tc::uint> *lights = nullptr;   // LightGridOutputs::grid
     tc::BufferResource<tc::uvec4> *visible = nullptr; // VisibilityOutputs::visible, or its like
     tc::BufferResource<tc::uint> *shadow = nullptr;   // ShadowOutputs::map
     tc::mat4 inverseViewProjection{1.0f};
@@ -97,7 +98,7 @@ void bindSurfaceShading(tc::Device &device, K &kernel, SurfaceShadingResources c
     bind(device, kernel.vertices, *scene.vertices);
     bind(device, kernel.indices, *scene.indices);
     bind(device, kernel.materials, *scene.materials);
-    bind(device, kernel.lights, *scene.lights);
+    bind(device, kernel.lightGrid, *resources.lights);
     bind(device, kernel.visible, *resources.visible);
     bind(device, kernel.shadow, *resources.shadow);
     set(device, kernel.inverseViewProjection, resources.inverseViewProjection);

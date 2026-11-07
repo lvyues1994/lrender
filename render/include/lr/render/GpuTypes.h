@@ -166,6 +166,22 @@ inline constexpr tc::uint maxShadowCascades() { return 4u; }
 inline constexpr tc::uint shadowHeaderWords() { return 128u; }
 inline tc::uint shadowCascadeWord(tc::uint cascade) { return 8u + 20u * cascade; }
 
+// The light grid of a view: its pixels in tiles of lightTileSize() across and down, its
+// depth in lightSlices() slices that grow geometrically from the near plane (the first and
+// the last reach on to the camera and to infinity), and per cell of a tile and a slice a
+// mask of the lights that may light a point in it: bit i % 32 of word i / 32 for light i.
+// One buffer of words: a header of lightGridHeaderWords() words, then a copy of the light
+// table, lightRecordWords() per light (kind, radiance, vector, range), then the cells'
+// masks, lightMaskWords(lights) each, cell (slice * tiles down + y) * tiles across + x.
+// Header words: [0] tiles across, [1] tiles down, [2] slices, [4] the near plane and [5]
+// slices per unit of log(depth / near plane) as float bits, from [8] rows 0, 1 and 3 of
+// the view-projection the grid is for (4 floats each).
+inline constexpr tc::uint lightGridHeaderWords() { return 32u; }
+inline constexpr tc::uint lightRecordWords() { return 8u; }
+inline constexpr tc::uint lightTileSize() { return 64u; }
+inline constexpr tc::uint lightSlices() { return 32u; }
+inline tc::uint lightMaskWords(tc::uint lights) { return (lights + 31u) / 32u; }
+
 // Material models a renderer holds at most, the built-in one included.
 inline constexpr tc::uint maxMaterialModels() { return 16u; }
 // The pixels each material model shades, in one buffer of uvec2: entry m < maxMaterialModels()

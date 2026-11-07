@@ -41,6 +41,7 @@ struct HarnessOptions {
     bool aliasGraphResources = true;
     bool cullClusters = true;
     bool cullOccluded = true;
+    bool clusterLights = true;
 };
 
 // A renderer with its own small runtime.
@@ -64,6 +65,7 @@ struct RenderHarness {
         config.aliasGraphResources = options.aliasGraphResources;
         config.cullClusters = options.cullClusters;
         config.cullOccluded = options.cullOccluded;
+        config.clusterLights = options.clusterLights;
         renderer = render::makeRenderer(config);
     }
 

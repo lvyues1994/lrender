@@ -26,6 +26,7 @@ namespace lr::render::kernels {
 using namespace tc;
 
 inline uint noShadowLight() { return 0xFFFFFFFFu; }
+inline uint noLightCell() { return 0xFFFFFFFFu; }
 
 // What a material model gets of the point a pixel sees.
 struct ShadingInputs {
@@ -91,8 +92,9 @@ inline float pcfWeight(uint texel, float fraction) {
 } // namespace lr::render::kernels
 
 // Bindings FIRST to FIRST + 19: the material textures (LR_MATERIAL_TEXTURES), the
-// environment table, then the scene's tables, the visible instances (VisibilityOutputs)
-// and the shadow map (shadowHeaderWords()). Uniforms 0 to 4.
+// environment table, then the scene's tables, the view's light grid (lightGridHeaderWords()),
+// the visible instances (VisibilityOutputs) and the shadow map (shadowHeaderWords()).
+// Uniforms 0 to 4.
 #define LR_SURFACE_SHADING(FIRST)                                                                                      \
     LR_MATERIAL_TEXTURES(FIRST)                                                                                        \
     EnvironmentBrdfTexture<(FIRST) + 12u> environmentBrdf;                                                             \
@@ -100,7 +102,7 @@ inline float pcfWeight(uint texel, float fraction) {
     VertexTable<(FIRST) + 14u> vertices;                                                                               \
     BufferBinding<uint, (FIRST) + 15u> indices;                                                                        \
     MaterialTable<(FIRST) + 16u> materials;                                                                            \
-    LightTable<(FIRST) + 17u> lights;                                                                                  \
+    BufferBinding<uint, (FIRST) + 17u> lightGrid;                                                                      \
     BufferBinding<uvec4, (FIRST) + 18u> visible;                                                                       \
     BufferBinding<uint, (FIRST) + 19u> shadow;                                                                         \
     Uniform<mat4, 0> inverseViewProjection{};                                                                          \
@@ -117,6 +119,48 @@ inline float pcfWeight(uint texel, float fraction) {
     }                                                                                                                  \
                                                                                                                        \
     float shadowFloat(uint word) { return uintBitsToFloat(shadow[word]); }                                             \
+                                                                                                                       \
+    float lightGridFloat(uint word) { return uintBitsToFloat(lightGrid[word]); }                                       \
+                                                                                                                       \
+    vec4 lightGridRow(uint row) {                                                                                      \
+        uint base = 8u + 4u * row;                                                                                     \
+        return vec4{lightGridFloat(base), lightGridFloat(base + 1u), lightGridFloat(base + 2u),                        \
+                    lightGridFloat(base + 3u)};                                                                        \
+    }                                                                                                                  \
+                                                                                                                       \
+    GpuLight gridLight(uint index) {                                                                                   \
+        uint base = lightGridHeaderWords() + lightRecordWords() * index;                                               \
+        return GpuLight{lightGrid[base],                                                                               \
+                        vec3{lightGridFloat(base + 1u), lightGridFloat(base + 2u), lightGridFloat(base + 3u)},         \
+                        vec3{lightGridFloat(base + 4u), lightGridFloat(base + 5u), lightGridFloat(base + 6u)},         \
+                        lightGridFloat(base + 7u)};                                                                    \
+    }                                                                                                                  \
+                                                                                                                       \
+    /* The light grid's cell that holds `position`, or noLightCell() off the screen. */                               \
+    uint lightCellAt(vec3 position) {                                                                                  \
+        vec4 row3 = lightGridRow(2u);                                                                                  \
+        float w = dot(row3.xyz(), position) + row3.w;                                                                  \
+        if (not(w > 0.0f)) {                                                                                           \
+            return noLightCell();                                                                                      \
+        }                                                                                                              \
+        vec4 row0 = lightGridRow(0u);                                                                                  \
+        vec4 row1 = lightGridRow(1u);                                                                                  \
+        vec2 extent = vec2(size.value);                                                                                \
+        vec2 pixel = vec2{((dot(row0.xyz(), position) + row0.w) / w * 0.5f + 0.5f) * extent.x,                        \
+                          (0.5f - (dot(row1.xyz(), position) + row1.w) / w * 0.5f) * extent.y};                       \
+        if (not(pixel.x >= 0.0f and pixel.y >= 0.0f and pixel.x < extent.x and pixel.y < extent.y)) {                 \
+            return noLightCell();                                                                                      \
+        }                                                                                                              \
+        uint tilesAcross = lightGrid[0];                                                                               \
+        uint tilesDown = lightGrid[1];                                                                                 \
+        uint slices = lightGrid[2];                                                                                    \
+        uint x = min(uint(pixel.x) / lightTileSize(), tilesAcross - 1u);                                               \
+        uint y = min(uint(pixel.y) / lightTileSize(), tilesDown - 1u);                                                 \
+        float near = lightGridFloat(4u);                                                                               \
+        float slice = w > near ? log(w / near) * lightGridFloat(5u) : 0.0f;                                            \
+        uint z = uint(min(slice, float(slices - 1u)));                                                                 \
+        return (z * tilesDown + y) * tilesAcross + x;                                                                  \
+    }                                                                                                                  \
                                                                                                                        \
     mat4 shadowMatrix(uint cascade) {                                                                                  \
         uint base = shadowCascadeWord(cascade);                                                                        \
@@ -262,14 +306,28 @@ inline float pcfWeight(uint texel, float fraction) {
         vec3 radiance = surface.emitted                                                                                \
                       + environment.value.xyz()                                                                        \
                             * (baseColor * (1.0f - surface.metallic) + environmentSpecular(scaleBias, f0));            \
-        for (uint i = 0u; i < lightCount.value; ++i) {                                                                 \
-            IncidentLight light = incidentLight(lights[i], inputs.position);                                           \
-            vec3 reflected = reflectedLight(surface.normal, inputs.toViewer, light.toLight, light.irradiance,          \
-                                            baseColor, surface.metallic, surface.roughness);                           \
-            if (i == shadowLight.value and reflected != vec3(0.0f)) {                                                  \
-                reflected = reflected * shadowFactor(inputs.position, inputs.geometricNormal, light.toLight);          \
+        /* The lights the cell leaves out add exactly nothing: they are out of range. The                             \
+           others come in the order of the light table, as if every light were added. */                              \
+        uint count = lightCount.value;                                                                                 \
+        uint words = lightMaskWords(count);                                                                            \
+        uint cell = lightCellAt(inputs.position);                                                                      \
+        uint masks = lightGridHeaderWords() + lightRecordWords() * count + cell * words;                               \
+        for (uint word = 0u; word < words; ++word) {                                                                   \
+            uint left = count - 32u * word;                                                                            \
+            uint bits = cell != noLightCell() ? lightGrid[masks + word]                                                \
+                      : left >= 32u           ? 0xFFFFFFFFu                                                            \
+                                              : (1u << left) - 1u;                                                     \
+            while (bits != 0u) {                                                                                       \
+                uint i = 32u * word + uint(findLSB(bits));                                                             \
+                bits &= bits - 1u;                                                                                     \
+                IncidentLight light = incidentLight(gridLight(i), inputs.position);                                    \
+                vec3 reflected = reflectedLight(surface.normal, inputs.toViewer, light.toLight, light.irradiance,      \
+                                                baseColor, surface.metallic, surface.roughness);                       \
+                if (i == shadowLight.value and reflected != vec3(0.0f)) {                                              \
+                    reflected = reflected * shadowFactor(inputs.position, inputs.geometricNormal, light.toLight);      \
+                }                                                                                                      \
+                radiance += reflected;                                                                                 \
             }                                                                                                          \
-            radiance += reflected;                                                                                     \
         }                                                                                                              \
         return radiance;                                                                                               \
     }

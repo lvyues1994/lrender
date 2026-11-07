@@ -323,6 +323,7 @@ struct RendererImpl final : Renderer {
           timers(config.gpuTimers and gpu->info().timers),
           cullClusters(config.cullClusters),
           cullOccluded(config.cullOccluded),
+          clusterLights(config.clusterLights),
           chosen(chooseFor(*gpu, config)),
           models(*gpu),
           targetSet(gpu->info()),
@@ -453,6 +454,7 @@ private:
         context.capabilities = chosen;
         context.cullClusters = cullClusters;
         context.cullOccluded = cullOccluded;
+        context.clusterLights = clusterLights;
         context.materialModels = modelList;
         if (jitters(plan)) {
             auto const temporal = temporalViews.advance(TemporalRequest{plan.desc.id, frameIndex, context.extent,
@@ -497,6 +499,7 @@ private:
     bool timers;
     bool cullClusters;
     bool cullOccluded;
+    bool clusterLights;
     RendererCapabilities chosen;
     MaterialModelsImpl models;
     runtime::SerialThread renderThread;

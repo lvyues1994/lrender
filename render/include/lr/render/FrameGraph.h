@@ -352,9 +352,10 @@ struct ViewContext {
     core::mat4 inverseViewProjection{1.0f};
     std::optional<TemporalView> temporal;
     RendererCapabilities capabilities;
-    // RendererConfig::cullClusters and cullOccluded.
+    // RendererConfig::cullClusters, cullOccluded and clusterLights.
     bool cullClusters = true;
     bool cullOccluded = true;
+    bool clusterLights = true;
     // The renderer's material models when the frame was prepared, by MaterialModelId.
     std::vector<std::shared_ptr<MaterialModel>> materialModels;
     std::uint32_t instanceCount = 0;

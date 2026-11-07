@@ -10,6 +10,7 @@ target_link_libraries(lr_render
 
 tc_add_kernels(lr_render HEADERS
     kernels/Visibility.h
+    kernels/Lights.h
     kernels/Shading.h
     kernels/Temporal.h
     kernels/PathTrace.h

@@ -489,6 +489,7 @@ TEST_CASE("with device timers on, every pass reports the time of its dispatches"
     REQUIRE(result.views.size() == 2);
     auto const shading = std::vector<std::string>{"visibility statistics",
                                                   "clear shadow map",
+                                                  "assign lights",
                                                   "clear material model counts",
                                                   "classify pixels",
                                                   "allocate material model lists",

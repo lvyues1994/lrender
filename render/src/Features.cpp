@@ -2,6 +2,7 @@
 
 #include "PassHelpers.h"
 #include "ShadowCascades.h"
+#include "kernels/Lights.h"
 #include "kernels/PathTrace.h"
 #include "kernels/Post.h"
 #include "kernels/Shading.h"
@@ -10,11 +11,12 @@
 #include <lr/render/MaterialModel.h>
 
 #include <algorithm>
-#include <optional>
-#include <type_traits>
+#include <cmath>
 #include <cstddef>
+#include <optional>
 #include <stdexcept>
 #include <string>
+#include <type_traits>
 #include <unordered_map>
 #include <vector>
 
@@ -510,11 +512,50 @@ struct ShadingView {
     core::ivec2 extent{0};
     tc::uint lightCount = 0;
     ShadowOutputs shadows;
+    LightGridOutputs lights;
 };
 
-ShadingView shadingViewOf(ViewContext const &view, ShadowOutputs const &shadows) {
+ShadingView shadingViewOf(ViewContext const &view, ShadowOutputs const &shadows, LightGridOutputs const &lights) {
     return ShadingView{view.inverseViewProjection, tc::vec4{view.environment.radiance, 0.0f}, view.extent,
-                       view.lightCount, shadows};
+                       view.lightCount, shadows, lights};
+}
+
+// The view's light grid, assigned by the first feature that shades.
+LightGridOutputs lightGridOf(FrameGraphBuilder &graph, ViewContext const &view) {
+    auto &board = graph.blackboard();
+    if (board.contains<LightGridOutputs>()) {
+        return board.get<LightGridOutputs>();
+    }
+    auto const tiles = [](int const pixels) {
+        return static_cast<tc::uint>((pixels + static_cast<int>(lightTileSize()) - 1) / static_cast<int>(lightTileSize()));
+    };
+    auto const shape = view.clusterLights ? tc::uvec4{tiles(view.extent.x), tiles(view.extent.y), lightSlices(), 1u}
+                                          : tc::uvec4{1u, 1u, 1u, 0u};
+    auto const lightCount = static_cast<tc::uint>(view.lightCount);
+    auto const maskWords = static_cast<std::size_t>(shape.x * shape.y * shape.z) * lightMaskWords(lightCount);
+    auto const grid = graph.createBuffer<tc::uint>(
+        "light grid", lightGridHeaderWords() + std::size_t{lightRecordWords()} * lightCount + maskWords);
+    auto const near = std::max(view.camera.nearPlane, 1.0e-6f);
+    auto const depths =
+        tc::vec2{near, static_cast<float>(lightSlices()) / std::max(std::log(view.camera.farPlane / near), 1.0e-3f)};
+    auto &pass = graph.addPass("assign lights");
+    pass.write(grid);
+    pass.record([grid, shape, depths, lightCount, viewProjection = view.viewProjection, extent = view.extent,
+                 invocations = std::max<std::size_t>({maskWords, lightCount, 1})](PassContext &context) {
+        auto &device = context.device();
+        auto kernel = kernels::AssignLights{};
+        device.useKernel(kernel);
+        bind(device, kernel.lights, *context.scene().lights);
+        bind(device, kernel.grid, context.buffer(grid));
+        set(device, kernel.viewProjection, viewProjection);
+        set(device, kernel.size, extent);
+        set(device, kernel.shape, shape);
+        set(device, kernel.depths, depths);
+        set(device, kernel.lightCount, lightCount);
+        context.dispatch(kernel, tc::uvec3{groupsFor(invocations, 64), 1, 1});
+    });
+    board.put(LightGridOutputs{grid});
+    return LightGridOutputs{grid};
 }
 
 SurfaceShadingResources surfaceResources(PassContext &context, ShadingView const &view,
@@ -523,6 +564,7 @@ SurfaceShadingResources surfaceResources(PassContext &context, ShadingView const
     resources.scene = &context.scene();
     resources.visible = &context.buffer(visible);
     resources.shadow = &context.buffer(view.shadows.map);
+    resources.lights = &context.buffer(view.lights.grid);
     resources.inverseViewProjection = view.inverseViewProjection;
     resources.environment = view.environment;
     resources.size = view.extent;
@@ -854,7 +896,8 @@ struct ShadingFeature final : RenderFeature {
 
     void setup(FrameGraphBuilder &graph, ViewContext const &view) override {
         auto const visibility = graph.blackboard().get<VisibilityOutputs>();
-        auto const shading = shadingViewOf(view, shadowsOf(graph));
+        auto const shadows = shadowsOf(graph);
+        auto const shading = shadingViewOf(view, shadows, lightGridOf(graph, view));
         auto const lists = classify(graph, view, visibility);
         for (auto index = std::size_t{0}; index < view.materialModels.size(); ++index) {
             auto const &model = view.materialModels[index];
@@ -863,6 +906,7 @@ struct ShadingFeature final : RenderFeature {
             pass.read(lists.arguments);
             pass.read(visibility.visible);
             pass.read(shading.shadows.map);
+            pass.read(shading.lights.grid);
             pass.write(view.sceneColor);
             pass.record([model, lists, shading, visible = visibility.visible, color = view.sceneColor,
                          id = core::MaterialModelId{static_cast<std::uint32_t>(index)}](PassContext &context) {
@@ -999,12 +1043,14 @@ struct TransparencyFeature final : RenderFeature {
             context.dispatch(kernel, groupsCovering(extent));
         });
 
-        auto const shading = shadingViewOf(view, shadowsOf(graph));
+        auto const shadows = shadowsOf(graph);
+        auto const shading = shadingViewOf(view, shadows, lightGridOf(graph, view));
         auto &blend = graph.addPass("blend transparent");
         blend.read(drawn.instances);
         blend.read(lists);
         blend.read(opaque);
         blend.read(shading.shadows.map);
+        blend.read(shading.lights.grid);
         blend.write(view.sceneColor);
         blend.record([shading, visible = drawn.instances, lists, opaque, color = view.sceneColor](PassContext &context) {
             auto &device = context.device();

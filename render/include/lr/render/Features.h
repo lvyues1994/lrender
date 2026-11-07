@@ -26,6 +26,12 @@ struct ShadowOutputs {
     std::uint32_t light = 0xFFFFFFFFu; // its index in the light table, or none
 };
 
+// What the first feature that shades puts on the blackboard: the view's light grid (see
+// lightGridHeaderWords()), which every kernel that expands LR_SURFACE_SHADING reads.
+struct LightGridOutputs {
+    BufferRef<tc::uint> grid;
+};
+
 // What the temporal anti-aliasing feature puts on the blackboard when it runs.
 struct TemporalOutputs {
     // Per pixel, in pixels right and down: where the surface it shows is on the screen

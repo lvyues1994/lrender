@@ -33,6 +33,8 @@ nvidia)
     measure sponza-occlusion --scene sponza --config occlusion:occlusion=on --config frustum:occlusion=off
     measure scale-1m-occlusion --scene scale --instances 1000000 --config occlusion:occlusion=on \
         --config frustum:occlusion=off
+    measure scale-lights --scene scale --instances 100000 --lights 1000 --config grid:lightgrid=on \
+        --config all:lightgrid=off
     measure sponza-pathtrace --scene sponza --config rayqueries:pipeline=pathtrace \
         --config hierarchies:pipeline=pathtrace,rayqueries=off
     ;;

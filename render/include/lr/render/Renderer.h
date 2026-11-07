@@ -143,6 +143,9 @@ struct RendererConfig {
     // first, builds a depth pyramid from them and draws only the others that may show in
     // front of what is there; the pixels are the same either way.
     bool cullOccluded = true;
+    // Shading lights each point with the lights of its cell of a grid over the view (see
+    // lightGridHeaderWords()) instead of every light; the pixels are the same either way.
+    bool clusterLights = true;
     // Optional kernel variants (RendererCapabilities), each used where the device runs it
     // unless turned off here.
     VariantUse subgroups = VariantUse::Auto;
