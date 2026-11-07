@@ -55,7 +55,8 @@ void bindRange(PassContext &context, tc::BufferBinding<tc::uint, B> &binding, Wo
 }
 
 // What one raster pass draws: its visible clusters (see CullClusters) and its workgroup
-// counts, and the visible instances the clusters came from.
+// counts, and the visible instances the clusters came from, through which the triangles
+// the pass writes resolve (see compactBlockInstances()).
 struct VisibleSet {
     BufferRef<tc::uvec4> visible;
     BufferRef<tc::DispatchIndirectCommand> arguments;
@@ -73,19 +74,20 @@ struct CullRequest {
     bool blended = false; // the instances whose material blends, or the others
 };
 
-// One compaction: of instances, or of the candidate clusters, which come `blocks` blocks
-// at most and as many as candidates[0].y.
+// One compaction: of instances, or of the candidate clusters, which come `items` at most
+// and as many as candidates[0].z.
 struct CompactRequest {
-    BufferRef<tc::uint> counts;
-    BufferRef<tc::uvec2> blocks; // a pair of sums for each block of items
+    BufferRef<tc::uvec4> blocks; // the sums of each block of items
     BufferRef<tc::uvec4> visible;
     BufferRef<tc::DispatchIndirectCommand> arguments;
     tc::uint items = 0;
-    BufferRef<tc::uvec4> records;    // clusters
-    BufferRef<tc::uvec4> candidates; // clusters
+    tc::uint capacity = 0; // entries `visible` holds
 };
 
-void recordScan(PassContext &context, CompactRequest const &request, tc::uint const blocks) {
+// Entries and their tails, after the totals.
+std::size_t listWords(std::size_t const capacity) { return 1 + 2 * capacity; }
+
+void recordScan(PassContext &context, CompactRequest const &request, tc::uint const blocks, tc::uint const counted) {
     auto &device = context.device();
     auto scan = kernels::ScanVisibleBlocks{};
     device.useKernel(scan);
@@ -93,17 +95,19 @@ void recordScan(PassContext &context, CompactRequest const &request, tc::uint co
     bind(device, scan.visible, context.buffer(request.visible));
     bind(device, scan.rasterArguments, context.buffer(request.arguments));
     set(device, scan.blockCount, blocks);
+    set(device, scan.counted, counted);
+    set(device, scan.capacity, request.capacity);
     context.dispatch(scan, tc::uvec3{1, 1, 1});
 }
 
 // S and W are SumVisibleBlocks and WriteVisible, or their subgroup variants, which have
 // the same bindings.
 template <class S, class W>
-void recordCompaction(PassContext &context, CompactRequest const &request) {
+void recordCompaction(PassContext &context, CompactRequest const &request, BufferRef<tc::uvec2> const countsRef) {
     auto &device = context.device();
     auto const &scene = context.scene();
     auto const blocks = kernels::compactBlocks(request.items);
-    auto &counts = context.buffer(request.counts);
+    auto &counts = context.buffer(countsRef);
     auto &sums = context.buffer(request.blocks);
     if (blocks > 0) {
         auto sum = S{};
@@ -113,7 +117,7 @@ void recordCompaction(PassContext &context, CompactRequest const &request) {
         set(device, sum.instanceCount, request.items);
         context.dispatch(sum, tc::uvec3{blocks, 1, 1});
     }
-    recordScan(context, request, blocks);
+    recordScan(context, request, blocks, 2);
     if (blocks > 0) {
         auto write = W{};
         device.useKernel(write);
@@ -127,25 +131,32 @@ void recordCompaction(PassContext &context, CompactRequest const &request) {
     }
 }
 
+// The clusters' counts, their records and the list of instances they came from.
+struct ClusterSource {
+    BufferRef<tc::uint> counts;
+    BufferRef<tc::uvec4> records;
+    BufferRef<tc::uvec4> candidates;
+};
+
 // S and W are SumClusterBlocks and WriteVisibleClusters, or their subgroup variants.
 template <class S, class W>
-void recordClusterCompaction(PassContext &context, CompactRequest const &request) {
+void recordClusterCompaction(PassContext &context, CompactRequest const &request, ClusterSource const &source) {
     auto &device = context.device();
     auto const blocks = kernels::compactBlocks(request.items);
-    auto &counts = context.buffer(request.counts);
+    auto &counts = context.buffer(source.counts);
     auto &sums = context.buffer(request.blocks);
-    auto &candidates = context.buffer(request.candidates);
+    auto &candidates = context.buffer(source.candidates);
     auto sum = S{};
     device.useKernel(sum);
     bind(device, sum.counts, counts);
     bind(device, sum.blocks, sums);
     bind(device, sum.candidates, candidates);
     context.dispatch(sum, tc::uvec3{blocks, 1, 1});
-    recordScan(context, request, blocks);
+    recordScan(context, request, blocks, 1);
     auto write = W{};
     device.useKernel(write);
     bind(device, write.counts, counts);
-    bind(device, write.records, context.buffer(request.records));
+    bind(device, write.records, context.buffer(source.records));
     bind(device, write.blocks, sums);
     bind(device, write.visible, context.buffer(request.visible));
     bind(device, write.candidates, candidates);
@@ -157,18 +168,18 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
     auto const instanceCapacity = roundUpToPowerOfTwo(std::max<std::size_t>(view.instanceCount, 1));
     auto const instanceCount = static_cast<tc::uint>(view.instanceCount);
     auto const candidateCapacity = roundUpToPowerOfTwo(std::max<std::size_t>(view.clusterInstanceCount, 1));
-    auto const clusterCounts = graph.createBuffer<tc::uint>(request.cullPass + ": clusters", instanceCapacity);
-    auto const instanceBlocks = graph.createBuffer<tc::uvec2>(
+    auto const clusterCounts = graph.createBuffer<tc::uvec2>(request.cullPass + ": clusters", instanceCapacity);
+    auto const instanceBlocks = graph.createBuffer<tc::uvec4>(
         request.compactPass + ": blocks", std::max<std::size_t>(kernels::compactBlocks(instanceCount), 1));
-    auto const instances = graph.createBuffer<tc::uvec4>(request.compactPass + ": visible", instanceCapacity + 1);
+    auto const instances = graph.createBuffer<tc::uvec4>(request.compactPass + ": visible", listWords(instanceCapacity));
     auto const clusterArguments = graph.createBuffer<tc::DispatchIndirectCommand>(request.compactPass + ": arguments", 1);
     auto const triangleCounts = graph.createBuffer<tc::uint>(request.clusterPass + ": triangles", candidateCapacity);
     auto const records = graph.createBuffer<tc::uvec4>(request.clusterPass + ": records", candidateCapacity);
-    auto const clusterBlocks = graph.createBuffer<tc::uvec2>(
+    auto const clusterBlocks = graph.createBuffer<tc::uvec4>(
         request.compactClustersPass + ": blocks",
         std::max<std::size_t>(kernels::compactBlocks(static_cast<tc::uint>(candidateCapacity)), 1));
     auto const drawn = VisibleSet{
-        graph.createBuffer<tc::uvec4>(request.compactClustersPass + ": visible", candidateCapacity + 1),
+        graph.createBuffer<tc::uvec4>(request.compactClustersPass + ": visible", listWords(candidateCapacity)),
         graph.createBuffer<tc::DispatchIndirectCommand>(request.compactClustersPass + ": arguments", 1), instances};
 
     auto &cull = graph.addPass(request.cullPass);
@@ -198,13 +209,14 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
     compact.write(instanceBlocks);
     compact.write(instances);
     compact.write(clusterArguments);
-    compact.record([compaction = CompactRequest{clusterCounts, instanceBlocks, instances, clusterArguments,
-                                                instanceCount, {}, {}},
-                    subgroups](PassContext &context) {
+    compact.record([compaction = CompactRequest{instanceBlocks, instances, clusterArguments, instanceCount,
+                                                static_cast<tc::uint>(instanceCapacity)},
+                    clusterCounts, subgroups](PassContext &context) {
         if (subgroups) {
-            recordCompaction<kernels::SumVisibleBlocksSubgroups, kernels::WriteVisibleSubgroups>(context, compaction);
+            recordCompaction<kernels::SumVisibleBlocksSubgroups, kernels::WriteVisibleSubgroups>(context, compaction,
+                                                                                                  clusterCounts);
         } else {
-            recordCompaction<kernels::SumVisibleBlocks, kernels::WriteVisible>(context, compaction);
+            recordCompaction<kernels::SumVisibleBlocks, kernels::WriteVisible>(context, compaction, clusterCounts);
         }
     });
 
@@ -241,14 +253,16 @@ VisibleSet cullAndCompact(FrameGraphBuilder &graph, ViewContext const &view, Cul
     compactClusters.write(clusterBlocks);
     compactClusters.write(drawn.visible);
     compactClusters.write(drawn.arguments);
-    compactClusters.record([compaction = CompactRequest{triangleCounts, clusterBlocks, drawn.visible, drawn.arguments,
-                                                        static_cast<tc::uint>(candidateCapacity), records, instances},
-                            subgroups](PassContext &context) {
+    compactClusters.record([compaction = CompactRequest{clusterBlocks, drawn.visible, drawn.arguments,
+                                                        static_cast<tc::uint>(candidateCapacity),
+                                                        static_cast<tc::uint>(candidateCapacity)},
+                            source = ClusterSource{triangleCounts, records, instances}, subgroups](PassContext &context) {
         if (subgroups) {
             recordClusterCompaction<kernels::SumClusterBlocksSubgroups, kernels::WriteVisibleClustersSubgroups>(
-                context, compaction);
+                context, compaction, source);
         } else {
-            recordClusterCompaction<kernels::SumClusterBlocks, kernels::WriteVisibleClusters>(context, compaction);
+            recordClusterCompaction<kernels::SumClusterBlocks, kernels::WriteVisibleClusters>(context, compaction,
+                                                                                              source);
         }
     });
     return drawn;
@@ -415,7 +429,7 @@ struct VisibilityFeature final : RenderFeature {
                            CullRequest{"cull instances", "compact visible instances", "cull clusters",
                                        "compact visible clusters", view.viewProjection,
                                        core::vec4{view.camera.position, 1.0f}, false});
-        auto const outputs = VisibilityOutputs{drawn.visible, triangles, depth};
+        auto const outputs = VisibilityOutputs{drawn.instances, triangles, depth};
         if (view.capabilities.singlePassVisibility) {
             rasterizeOnce(graph, view, drawn, outputs);
         } else {
@@ -811,12 +825,12 @@ struct TransparencyFeature final : RenderFeature {
 
         auto const shading = shadingViewOf(view, shadowsOf(graph));
         auto &blend = graph.addPass("blend transparent");
-        blend.read(drawn.visible);
+        blend.read(drawn.instances);
         blend.read(lists);
         blend.read(opaque);
         blend.read(shading.shadows.map);
         blend.write(view.sceneColor);
-        blend.record([shading, visible = drawn.visible, lists, opaque, color = view.sceneColor](PassContext &context) {
+        blend.record([shading, visible = drawn.instances, lists, opaque, color = view.sceneColor](PassContext &context) {
             auto &device = context.device();
             auto kernel = kernels::BlendTransparent{};
             device.useKernel(kernel);

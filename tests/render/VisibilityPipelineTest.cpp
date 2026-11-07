@@ -674,6 +674,7 @@ core::RenderWorldDelta clusteredScene() {
 
 struct ClusteredFrame {
     render::ImageRgba8 image;
+    std::vector<tc::uint> triangles; // as the visibility buffer holds them
     std::vector<tc::uint> depth;
     std::vector<tc::uvec2> resolved; // per pixel: (instance, first index of its triangle), or noTriangle()
     render::ViewStats stats;
@@ -690,7 +691,8 @@ ClusteredFrame renderClustered(test::HarnessOptions options, std::string const &
     auto view = test::viewOf(target, test::cameraAt(core::vec3{0.4f, 1.2f, 3.6f}, core::vec3{0.0f, 0.0f, 0.0f}));
     view.pipeline = pipelines.create(render::PipelineDesc{pipelines.visibility(), {probe}});
     auto result = harness.render(test::frameOf(clusteredScene(), view));
-    auto frame = ClusteredFrame{std::move(*result.views[0].image), *probe->depth, {}, result.views[0].stats};
+    auto frame =
+        ClusteredFrame{std::move(*result.views[0].image), *probe->triangles, *probe->depth, {}, result.views[0].stats};
     auto const &visible = *probe->visible;
     for (auto const triangle : *probe->triangles) {
         if (triangle == render::noTriangle()) {
@@ -707,7 +709,7 @@ ClusteredFrame renderClustered(test::HarnessOptions options, std::string const &
     return frame;
 }
 
-TEST_CASE("culling clusters changes no pixel: the same nearest triangles, depths and image") {
+TEST_CASE("culling clusters changes no pixel: the same visibility buffer, depths and image") {
     for (auto const &backend : tc::availableBackends()) {
         CAPTURE(backend);
         auto culled = ClusteredFrame{};
@@ -725,6 +727,7 @@ TEST_CASE("culling clusters changes no pixel: the same nearest triangles, depths
         CHECK(culled.stats.visibleInstances == all.stats.visibleInstances);
         CHECK(culled.stats.visibleClusters < all.stats.visibleClusters);
         CHECK(culled.stats.visibleTriangles < all.stats.visibleTriangles);
+        CHECK(culled.triangles == all.triangles);
         CHECK(culled.depth == all.depth);
         CHECK(culled.resolved == all.resolved);
         CHECK(culled.image.pixels == all.image.pixels);

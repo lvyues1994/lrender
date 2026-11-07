@@ -232,7 +232,7 @@ struct VisibilityProbe final : render::RenderFeature {
         auto const count = static_cast<std::size_t>(view.extent.x) * static_cast<std::size_t>(view.extent.y);
         readBack(graph, "probed triangles", outputs.triangles, count, triangles);
         readBack(graph, "probed depth", outputs.depth, count, depth);
-        readBack(graph, "probed visible clusters", outputs.visible, std::size_t{view.clusterInstanceCount} + 1, visible);
+        readBack(graph, "probed visible instances", outputs.visible, std::size_t{view.instanceCount} + 1, visible);
     }
 
     // The last frame's: per pixel, rows from the top, and the visible instances.
