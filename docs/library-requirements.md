@@ -1,6 +1,6 @@
 # 对依赖库的新需求
 
-前五项是对 compute_shaders 的，最后一节是 stackfull 的一处修正（已经改了）。
+前七项是对 compute_shaders 的，最后一节是 stackfull 的一处修正（已经改了）。第 6、7 项是 P9（GPU 线程每帧的录制）测出来的，只改 tc 内部的实现，不改接口，已经实现（`ef33c8b`、`03db9f2`）。
 
 lrender 需要 tc 新增五项能力。前三项互相独立；第四项是 `hardware-raster.md` 里硬件光栅方案的前提，现在桌面的零拷贝上屏也用它；第五项是测零拷贝上屏时发现的。每一项写明 lrender 怎么用、为什么在 tc 的职责之内、接口草案（照 tc 现有的写法，命名只是建议）、各后端的语义与回退，以及验收方式。
 
@@ -193,6 +193,55 @@ BufferResource<T, D> createBuffer(typename DimTraits<D>::IndexType extent, HostA
 - CPU：不变。
 
 **验收：** 各后端上设备写、主机读的结果正确，和 `Writes` 的 buffer 一样；RTX 5070 Ti 上主机读 8 MB 的 `Reads` buffer 不到 1 ms；lrender 的帧图把回读 buffer 改成 `Reads` 之后，Sponza 1080p 的离屏目标和 Readback 路径的收尾时间从 230 ms 降到几毫秒。
+
+## 6. Vulkan 后端复用 fence（已实现，`ef33c8b`）
+
+**lrender 怎么用。** GPU 线程每帧录完所有视图的 pass 后 `submitWithFence()` 一次，拿到的 `Submission` 留到下一帧（`FrameQueue::lastSubmission`），sync file 交给运行时的 IO 线程等。
+
+**问题。** Vulkan 后端每次提交都 `vkCreateFence` 一个新的 fence，`FenceCompletion` 析构时 `vkDestroyFence`。NVIDIA 595 驱动上这两个调用很贵。100 万个实例的规模场景、1080p、关掉计时，在 tc 里逐个计时，每帧的平均值：
+
+| 调用 | 每帧 |
+|---|---|
+| `vkCreateFence` | 370 µs |
+| `vkDestroyFence`（上一帧的） | 522 µs |
+| `vkQueueSubmit` | 45 µs |
+| 可导出的信号量和导出 sync file | 2 µs |
+
+GPU 线程每帧录制 1.93 ms，其中 0.89 ms 是建、毁 fence；其余是约 80 次 dispatch 的录制（约 0.62 ms，见第 7 项）和 lrender 自己的工作。
+
+**为什么在 tc 的职责之内。** fence 是 Vulkan 后端实现 `Submission` 的内部细节，lrender 碰不到，接口和语义都不变。
+
+**改法。** 后端留一个用过的 fence 池（放在 `VulkanContext` 里，多线程析构 `FenceCompletion` 时加锁）。提交时从池里取，没有才新建；`FenceCompletion` 析构时把 fence 还回池里，取用前 `vkResetFences`。这样做是合规的：录制中的批在 `inFlight` 里一直持有它的 `FenceCompletion`，直到 fence 发出信号、批退休，所以 `FenceCompletion` 析构时它的 fence 一定已经发出信号，不再和任何队列命令关联，可以重置。池里留多少：最多是同时在飞的提交数，设备销毁时一并销毁。
+
+**后端：** 只有 Vulkan 改；GL 的 fence（`glFenceSync`）和 CPU 后端不变。
+
+**验收：** tc 现有的测试全部通过，另加一个测试：连续提交几百次、每次等完成，fence 的数量不随提交数增长，`Submission` 的完成状态和以前一样（包括应用比批更晚放开 `Submission` 的情况）。lrender 上，RTX 5070 Ti 静态场景的录制从 1.93 ms 降到 1.1 ms 左右；在打开同步校验的 validation layer 下 lrender 的测试没有新的消息。
+
+**结果。** 新测试 `SubmissionsDroppedWaitedOrKeptStayTrue` 提交 300 次，有的马上放开（这时工作还没做完）、有的等完、有的留到最后，各后端上每次的工作都做了，留下的都报完成；临时计数看到两百多次提交只新建了 25 个 fence（留着的 `Submission` 和在飞的批各占一个）。tc 的测试全部通过，Vulkan 的测试在打开同步校验的 validation layer 下没有消息。
+
+## 7. Vulkan 后端每次 dispatch 的主机开销（已实现，`03db9f2`）
+
+**问题。** 同一测量里，`VulkanDevice::doExecute` 每次 dispatch 约 7.8 µs，每帧约 80 次：
+
+| 部分 | 每次 |
+|---|---|
+| 检查与查绑定 | 0.15 µs |
+| 找管线（`pipelineFor`） | 0.78 µs |
+| 分配描述符集 | 0.45 µs |
+| 填描述符写入 | 2.65 µs |
+| `vkUpdateDescriptorSets` | 0.22 µs |
+| 冒险跟踪与 claim | 1.65 µs |
+| 录命令 | 1.85 µs |
+
+填写入那一步，每个绑定都先拼一个出错时才用的名字（`std::string{slot.name} + "' (binding " + std::to_string(slot.binding) + ")"`，着色 kernel 有二十多个绑定），每次 dispatch 还新建六七个 `std::vector`。
+
+**为什么在 tc 的职责之内。** 都是 `doExecute` 的实现细节，接口和语义不变。
+
+**改法。** 名字只在出错的分支里拼；描述符写入、访问记录这些临时 vector 改成设备的成员，每次 dispatch `clear()` 后复用。先做这两处再测，冒险跟踪和找管线等测完再看。
+
+**验收：** tc 现有的测试全部通过，出错时的消息与现在相同；RTX 5070 Ti 上每次 dispatch 的主机时间从约 7.8 µs 降到 5 µs 以下。
+
+**结果。** 两处做完测得每次 5.7 µs（填写入从 2.65 µs 降到 0.65 µs），找管线仍要 0.75 µs：管线的键每次都把每个绑定的采样器句柄拼进字符串。于是又改成只拼有不可变采样器的绑定（带上绑定号），键放在一个留着的字符串里；外部纹理销毁时按 `:句柄` 加上 `|` 或串尾找要丢的管线，原来的子串匹配会把句柄是它前缀的也算进去。找管线降到 0.26 µs，每次合计 5.1 到 5.4 µs，离 5 µs 差一点；剩下的是冒险跟踪和 claim（1.6 到 1.75 µs，每次都线性扫上次屏障以来的访问）和录命令（1.8 到 1.9 µs，主要在驱动里），以后需要再看。
 
 ## stackfull：交给空闲 IO 工作线程的任务可能唤不醒它（已修正，`acb8861`）
 
