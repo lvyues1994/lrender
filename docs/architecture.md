@@ -245,7 +245,7 @@ struct Presenter {                  // lr::present 提供实现，宿主也可�
 
 #### RenderWorld：渲染侧的常驻镜像
 
-渲染线程上的一份场景镜像，按种类以 SoA 存放，槽位稳定。每帧只应用 `RenderWorldDelta`，并记下每张表的脏区间；编码只处理脏的部分。一个增量里的网格，每个的编码（顶点和包围盒）在帧池上各是一项并行完成，槽位和顶点、索引的区间仍按增量里的顺序在渲染线程上分，所以结果与逐个编码逐位相同；实例、材质和灯光的编码很小，在渲染线程上做。每个实例还记着上一帧的世界矩阵（`GpuInstance::previousObjectToWorld`），用来算 TAA 的运动矢量：增量移动了实例，这一帧写的是移动前的矩阵，下一帧再写一次这个实例，把它改成当前的矩阵；新实例两者相同。所以每帧必须恰好应用一次增量。实例的统计（混合实例数、簇数之和、场景包围盒）按 1024 个实例分块累加，增量只重算它改到的块，只有网格的簇数或包围盒、材质是否混合变了才全部重算；原来实例一有变化就扫一遍所有实例，100 万个实例时要 30 ms 左右。
+渲染线程上的一份场景镜像，按种类以 SoA 存放，槽位稳定。每帧只应用 `RenderWorldDelta`，并记下每张表的脏区间；编码只处理脏的部分。一个增量里的网格，每个的编码（顶点和包围盒）在帧池上各是一项并行完成，槽位和顶点、索引的区间仍按增量里的顺序在渲染线程上分，所以结果与逐个编码逐位相同；实例、材质和灯光的编码很小，在渲染线程上做。每个实例还记着移动它的那一帧（`GpuInstance::movedFrame`，按 `apply()` 计数）和那一帧之前的世界矩阵（`previousObjectToWorld`），用来算 TAA 的运动矢量。运动 kernel 只在 `movedFrame` 等于这一帧（`ViewContext::sceneFrame`）时用之前的矩阵；别的帧里实例没有动，上一帧它就在当前的位置。所以移动过的实例下一帧不用再写一次（原来要再写一次，把上一帧的矩阵改成当前的）；同一帧里 upsert 两次的实例，之前的矩阵仍是这一帧之前的位置；新实例两者相同。所以每帧必须恰好应用一次增量。实例的 id 到下标用 `IdIndex`：id 小于实例数的两倍（再多 1024）时放在数组里，按顺序分配的 id 都在这里，其余的在哈希表里。已有实例的移动在帧池上并行，每 512 个一项，各写自己的位置，写入的顺序与依次做相同；同一个增量把某个实例 upsert 两次时依次做。实例的统计（混合实例数、簇数之和、场景包围盒）按 1024 个实例分块累加，增量只重算它改到的块，只有网格的簇数或包围盒、材质是否混合变了才全部重算；原来实例一有变化就扫一遍所有实例，100 万个实例时要 30 ms 左右。
 
 镜像持有网格的不可变句柄，设备丢失之后可以重新上传几何；纹理的像素数据不保留（见“纹理”）。
 
@@ -355,7 +355,8 @@ struct GpuInstance {
     Encoded<mat4, Affine3x4> worldToObject;
     uint meshIndex;
     uint materialIndex;
-    Encoded<mat4, Affine3x4> previousObjectToWorld; // 上一帧的，算运动矢量用
+    Encoded<mat4, Affine3x4> previousObjectToWorld; // movedFrame 那一帧之前的，算运动矢量用
+    uint movedFrame;                                // 移动它的那一帧
 };
 using VertexTable   = TableBinding<GpuVertex, 0, Soa<>>;    // 光栅化和遍历只读位置
 using BvhNodeTable  = TableBinding<GpuBvhNode, 1>;          // 8 个字，按 uvec4 宽读

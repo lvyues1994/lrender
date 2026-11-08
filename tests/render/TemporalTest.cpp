@@ -376,6 +376,15 @@ TEST_CASE("motion follows moving instances and the camera, and is 0 where nothin
     auto const still = *taa.motion->motion;
     CHECK(std::all_of(still.begin(), still.end(), [](core::vec2 const &m) { return m.x == 0.0f and m.y == 0.0f; }));
 
+    // Moved in one frame, the mover has moved in that one, and stands still in the next.
+    auto const step = static_cast<float>(kStep / flat.scale);
+    taa.render(moveTo(step));
+    auto const centre = static_cast<std::size_t>(kGhostSize / 2 * kGhostSize + kGhostSize / 2 + kStep);
+    CHECK((*taa.motion->motion)[centre].x == doctest::Approx(kStep).epsilon(1e-3));
+    taa.render();
+    auto const stopped = *taa.motion->motion;
+    CHECK(std::all_of(stopped.begin(), stopped.end(), [](core::vec2 const &m) { return m.x == 0.0f and m.y == 0.0f; }));
+
     // The camera moves right by `pan`: the backdrop, 4.5 away, moves left on the screen.
     constexpr auto pan = 0.05f;
     taa.view.camera = test::cameraAt(core::vec3{pan, 0.0f, 4.0f}, core::vec3{pan, 0.0f, 0.0f});

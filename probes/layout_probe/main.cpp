@@ -183,7 +183,7 @@ void probeInstances(tc::Device &device, Options const &options) {
     for (auto index = std::size_t{0}; index < count; ++index) {
         auto const toWorld = randomPlacement(random);
         data.instances.push_back(
-            render::GpuInstance{toWorld, tc::inverse(toWorld), static_cast<tc::uint>(index % data.meshes->size()), 0, toWorld});
+            render::GpuInstance{toWorld, tc::inverse(toWorld), static_cast<tc::uint>(index % data.meshes->size()), 0, toWorld, 0});
     }
     data.results = std::make_shared<tc::BufferResource<tc::uint>>(static_cast<std::int32_t>(count));
     device.uploadBuffer(*data.results);

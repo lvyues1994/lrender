@@ -110,7 +110,9 @@ std::vector<Range> rangesOf(std::vector<Indexed<T>> const &writes) {
     for (auto const &write : writes) {
         indices.push_back(write.index);
     }
-    std::sort(indices.begin(), indices.end());
+    if (not std::is_sorted(indices.begin(), indices.end())) {
+        std::sort(indices.begin(), indices.end());
+    }
     indices.erase(std::unique(indices.begin(), indices.end()), indices.end());
     auto ranges = std::vector<Range>{};
     for (auto const index : indices) {

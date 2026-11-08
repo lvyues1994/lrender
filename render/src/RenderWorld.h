@@ -1,6 +1,7 @@
 #pragma once
 
 #include "Bvh.h"
+#include "IdIndex.h"
 #include "RangeAllocator.h"
 #include "RenderWork.h"
 #include "SceneUpdate.h"
@@ -77,6 +78,8 @@ struct RenderWorld {
     core::EnvironmentDesc const &environment() const noexcept { return sky; }
     // Counts the deltas that changed meshes, textures, materials, instances, lights or the sky.
     std::uint64_t version() const noexcept { return changes; }
+    // Counts apply() calls: the frames, as GpuInstance::movedFrame has them.
+    std::uint32_t frame() const noexcept { return frames; }
 
 private:
     struct MeshRecord {
@@ -101,8 +104,9 @@ private:
         core::MeshId mesh;
         core::MaterialId material;
         core::mat4 objectToWorld;
-        core::mat4 previousObjectToWorld; // as of the previous apply()
+        core::mat4 previousObjectToWorld; // as of the apply() before movedFrame's
         core::mat4 worldToObject;
+        std::uint32_t movedFrame;
     };
     // What updateSummaries() adds up, of kInstancesPerChunk instances in order; only the
     // chunks an apply() changes are added up again.
@@ -126,11 +130,12 @@ private:
     bool fragmented() const noexcept;
     void compactGeometry(SceneUpdate &update);
     void upsertMaterial(core::MaterialUpsert const &upsert, SceneUpdate &update);
+    GpuInstance encodeInstance(std::uint32_t index) const;
     void writeInstance(std::uint32_t index, SceneUpdate &update) const;
+    void upsertInstances(std::vector<core::InstanceUpsert> const &upserts, SceneUpdate &update);
     void writeLight(std::uint32_t index, SceneUpdate &update) const;
     void removeInstance(core::InstanceId id, SceneUpdate &update);
     void upsertInstance(core::InstanceUpsert const &upsert, SceneUpdate &update);
-    void settleMovedInstances(SceneUpdate &update);
     void removeLight(core::LightId id, SceneUpdate &update);
     void applyTextures(core::RenderWorldDelta const &delta, SceneUpdate &update);
     void updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update);
@@ -167,10 +172,10 @@ private:
     std::uint32_t materialSlotEnd = 0;
 
     std::vector<InstanceRecord> instances;
-    std::unordered_map<core::InstanceId, std::uint32_t> instanceIndex;
-    // Upserted by the last apply(): their previous transform is out of date at the next.
-    std::vector<core::InstanceId> movedInstances;
+    IdIndex<core::InstanceId> instanceIndex;
     std::vector<InstanceChunk> instanceChunks;
+    // Per instance, the frame that last upserted it, while upsertInstances() runs.
+    std::vector<std::uint32_t> upsertFrames;
     std::uint32_t transparentInstances = 0;
     std::uint32_t clusterInstances = 0;
     std::uint32_t materialModels = 1;
@@ -181,6 +186,7 @@ private:
 
     core::EnvironmentDesc sky;
     std::uint64_t changes = 0;
+    std::uint32_t frames = 0;
 
     bool hierarchies = false;
     RangeAllocator blasNodeRanges;

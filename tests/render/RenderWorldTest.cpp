@@ -61,7 +61,7 @@ TEST_CASE("removing an instance moves the last one into its place") {
     CHECK(update.instances[0].value.objectToWorld.value[0][0] == doctest::Approx(3.0f));
 }
 
-TEST_CASE("an instance keeps where the previous frame had it, for motion") {
+TEST_CASE("an instance keeps where the previous frame had it, for the frame that moved it") {
     auto world = render::RenderWorld{};
     auto const added = world.apply(oneQuad());
     REQUIRE(added.instances.size() == 1);
@@ -75,13 +75,22 @@ TEST_CASE("an instance keeps where the previous frame had it, for motion") {
     REQUIRE(afterMove.instances.size() == 1);
     CHECK(afterMove.instances[0].value.objectToWorld.value[3][0] == 2.0f);
     CHECK(afterMove.instances[0].value.previousObjectToWorld.value[3][0] == 0.0f);
+    CHECK(afterMove.instances[0].value.movedFrame == world.frame());
 
-    // The next frame finds it where this one left it, and the one after has nothing to write.
-    auto const settled = world.apply(core::RenderWorldDelta{});
-    REQUIRE(settled.instances.size() == 1);
-    CHECK(settled.instances[0].value.previousObjectToWorld.value[3][0] == 2.0f);
+    // Frames after it have nothing to write: the instance stood still since.
     CHECK(world.apply(core::RenderWorldDelta{}).instances.empty());
+    CHECK(world.frame() == afterMove.instances[0].value.movedFrame + 1);
     CHECK(world.version() == 2);
+
+    // Upserted twice in one frame, it was still where the frame before had it.
+    auto twice = core::RenderWorldDelta{};
+    auto further = moved;
+    further[3][0] = 3.0f;
+    twice.instances = {{core::InstanceId{30}, core::MeshId{10}, core::MaterialId{20}, further},
+                       {core::InstanceId{30}, core::MeshId{10}, core::MaterialId{20}, moved}};
+    auto const afterTwice = world.apply(twice);
+    REQUIRE(afterTwice.instances.size() == 2);
+    CHECK(afterTwice.instances[1].value.previousObjectToWorld.value[3][0] == 2.0f);
 }
 
 TEST_CASE("materials of a material model the world does not allow are rejected") {
@@ -378,6 +387,40 @@ TEST_CASE("the counts and bounds of many changing instances are those of all of 
                      : 1;
     }
     CHECK(wrong == 0);
+}
+
+TEST_CASE("an id index finds what it was given, for ids in a row and far apart alike") {
+    auto index = render::IdIndex<core::InstanceId>{};
+    auto expected = std::map<std::uint32_t, std::uint32_t>{};
+    auto const give = [&](std::uint32_t const id, std::uint32_t const at) {
+        index.set(core::InstanceId{id}, at);
+        expected[id] = at;
+    };
+    give(5000000, 1); // far past what the array reaches: in the map
+    give(6500, 2);    // in the map until the array grows to reach it
+    for (auto id = 0u; id < 3000; ++id) {
+        give(id, id + 10);
+    }
+    give(2999, 7); // replaces
+    for (auto id = 3000u; id < 6000; ++id) {
+        give(id, id);
+    }
+    index.erase(core::InstanceId{17});
+    expected.erase(17);
+    index.erase(core::InstanceId{5000000});
+    expected.erase(5000000);
+    give(5000000, 3);
+    auto wrong = 0;
+    for (auto id = 0u; id < 7000; ++id) {
+        auto const found = index.find(core::InstanceId{id});
+        auto const there = expected.find(id);
+        wrong += there == expected.end() ? (found ? 1 : 0) : (found == there->second ? 0 : 1);
+    }
+    CHECK(wrong == 0);
+    CHECK(index.at(core::InstanceId{5000000}) == 3);
+    CHECK(index.at(core::InstanceId{6500}) == 2);
+    CHECK(index.count(core::InstanceId{17}) == 0);
+    CHECK_THROWS_AS(index.at(core::InstanceId{17}), std::out_of_range);
 }
 
 TEST_CASE("the world hands images over to the GPU thread without keeping them, and reports them once lost") {

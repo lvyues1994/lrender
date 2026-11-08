@@ -60,6 +60,7 @@ struct TC_KERNEL TemporalMotion {
     BufferBinding<mat4, 5> matrices;
     BufferBinding<vec2, 6> motion;
     Uniform<ivec2, 0> size{};
+    Uniform<uint, 1> frame{}; // ViewContext::sceneFrame
 
     LR_FIND_VISIBLE_SLOT
 
@@ -106,7 +107,9 @@ struct TC_KERNEL TemporalMotion {
         if (triangle != noTriangle()) {
             uint instance = visible[1u + findSlot(triangle)].x;
             mat4 objectToWorld = instances[instance].objectToWorld.value;
-            mat4 previousObjectToWorld = instances[instance].previousObjectToWorld.value;
+            mat4 previousObjectToWorld = instances[instance].movedFrame == frame.value
+                                           ? instances[instance].previousObjectToWorld.value
+                                           : objectToWorld;
             vec3 point = objectPointOn(triangle, origin, normalize(far - origin), objectToWorld);
             now = (objectToWorld * vec4(point, 1.0f)).xyz();
             before = (previousObjectToWorld * vec4(point, 1.0f)).xyz();

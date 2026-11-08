@@ -63,9 +63,10 @@ struct GpuInstance {
     tc::Encoded<tc::mat4, tc::Affine3x4> worldToObject;
     tc::uint mesh;
     tc::uint material;
-    // Where the previous frame had the instance, for motion vectors; objectToWorld when it
-    // did not move or is new.
+    // Where the previous frame had the instance, for motion vectors, in the frame that
+    // moved it (ViewContext::sceneFrame); in every other it stood where objectToWorld says.
     tc::Encoded<tc::mat4, tc::Affine3x4> previousObjectToWorld;
+    tc::uint movedFrame;
 };
 
 struct GpuMaterial {

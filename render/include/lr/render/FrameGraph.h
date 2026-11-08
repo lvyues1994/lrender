@@ -367,6 +367,9 @@ struct ViewContext {
     // Of every instance; min > max when there are none.
     core::Aabb sceneBounds;
     std::optional<ShadowLight> shadowLight;
+    // Counts the frames the scene has seen: instances moved in this one carry where they
+    // were before (GpuInstance::movedFrame).
+    std::uint32_t sceneFrame = 0;
     // Changes whenever a frame's delta changes meshes, textures, materials, instances,
     // lights or the environment.
     std::uint64_t sceneVersion = 0;

@@ -36,7 +36,8 @@ struct TemporalAntiAliasingFeature final : RenderFeature {
         motionPass.write(motion);
         auto const views =
             std::array<core::mat4, 3>{view.inverseViewProjection, temporal.viewProjection, temporal.previousViewProjection};
-        motionPass.record([visibility, matrices, motion, views, extent = view.extent](PassContext &context) {
+        motionPass.record([visibility, matrices, motion, views, extent = view.extent,
+                           frame = view.sceneFrame](PassContext &context) {
             auto &device = context.device();
             auto const &scene = context.scene();
             auto &matrixBuffer = context.buffer(matrices);
@@ -52,6 +53,7 @@ struct TemporalAntiAliasingFeature final : RenderFeature {
             bind(device, kernel.matrices, matrixBuffer);
             bind(device, kernel.motion, context.buffer(motion));
             set(device, kernel.size, extent);
+            set(device, kernel.frame, frame);
             context.dispatch(kernel, groupsCovering(extent));
         });
 

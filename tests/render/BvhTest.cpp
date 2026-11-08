@@ -448,8 +448,8 @@ bool sameNodes(std::vector<render::Indexed<render::GpuBvhNode>> const &a,
     });
 }
 
-// The frame pool encodes the meshes and builds their hierarchies at once; what it makes
-// lands where the serial order puts it.
+// The frame pool encodes the meshes and builds their hierarchies at once, and moves the
+// instances; what it makes lands where the serial order puts it.
 TEST_CASE("a world that works on the frame pool makes the updates a serial one makes") {
     auto config = runtime::RuntimeConfig{};
     config.framePoolThreads = 3;
@@ -463,8 +463,13 @@ TEST_CASE("a world that works on the frame pool makes the updates a serial one m
     auto const delta = scatteredInstances(random);
     auto again = core::RenderWorldDelta{};
     again.meshes = {delta.meshes[2], delta.meshes[0]};
+    auto moved = core::RenderWorldDelta{};
+    for (auto instance : delta.instances) {
+        instance.objectToWorld[3][1] += 0.5f;
+        moved.instances.push_back(instance);
+    }
 
-    for (auto const *step : std::vector<core::RenderWorldDelta const *>{&delta, &again}) {
+    for (auto const *step : std::vector<core::RenderWorldDelta const *>{&delta, &again, &moved}) {
         auto a = pooled.apply(*step);
         auto b = serial.apply(*step);
         if (step == &delta) {
@@ -503,6 +508,17 @@ TEST_CASE("a world that works on the frame pool makes the updates a serial one m
         CHECK(sameNodes(a.tlasNodes, b.tlasNodes));
         CHECK(gather(a.blasRoots) == gather(b.blasRoots));
         CHECK(a.blasTriangles.size() == b.blasTriangles.size());
+        auto const sameInstances = std::equal(
+            a.instances.begin(), a.instances.end(), b.instances.begin(), b.instances.end(), [](auto const &x, auto const &y) {
+                return x.index == y.index and x.value.objectToWorld.value == y.value.objectToWorld.value
+                   and x.value.worldToObject.value == y.value.worldToObject.value
+                   and x.value.previousObjectToWorld.value == y.value.previousObjectToWorld.value
+                   and x.value.movedFrame == y.value.movedFrame and x.value.mesh == y.value.mesh;
+            });
+        CHECK(sameInstances);
+        CHECK(pooled.clusterInstanceCount() == serial.clusterInstanceCount());
+        CHECK(pooled.bounds().min == serial.bounds().min);
+        CHECK(pooled.bounds().max == serial.bounds().max);
     }
 }
 

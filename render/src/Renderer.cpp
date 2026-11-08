@@ -277,6 +277,7 @@ ViewContext makeViewContext(ViewPlan const &plan, RenderWorld const &world) {
     context.sceneBounds = world.bounds();
     context.shadowLight = world.shadowLight();
     context.sceneVersion = world.version();
+    context.sceneFrame = world.frame();
     return context;
 }
 

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <optional>
 #include <stdexcept>
 #include <string>
 #include <unordered_map>
@@ -154,6 +155,25 @@ bool known(Id const id, World const &world, std::unordered_set<Id> const &upsert
     return world.count(id) != 0 or upserted.count(id) != 0;
 }
 
+// Whether the world has each of `ids` or `upserts` upserts it; the upserted ids are only
+// gathered for one the world does not have.
+template <class Ids, class World, class Upserts>
+bool allKnown(Ids const &ids, World const &world, Upserts const &upserts) {
+    auto upserted = std::optional<decltype(idsOf(upserts))>{};
+    for (auto const id : ids) {
+        if (world.count(id) != 0) {
+            continue;
+        }
+        if (not upserted) {
+            upserted = idsOf(upserts);
+        }
+        if (upserted->count(id) == 0) {
+            return false;
+        }
+    }
+    return true;
+}
+
 std::vector<core::Aabb> triangleBounds(core::MeshData const &mesh) {
     auto bounds = std::vector<core::Aabb>{};
     bounds.reserve(mesh.indices.size() / 3);
@@ -192,14 +212,10 @@ void RenderWorld::validate(core::RenderWorldDelta const &delta) const {
     }
 
     auto const &removed = delta.removed;
-    auto const allKnown = [](auto const &ids, auto const &world, auto const &upserted) {
-        return std::all_of(ids.begin(), ids.end(), [&](auto const id) { return known(id, world, upserted); });
-    };
-    if (not allKnown(removed.meshes, meshes, upsertedMeshes)
-        or not allKnown(removed.textures, textureIds, idsOf(delta.textures))
-        or not allKnown(removed.materials, materials, upsertedMaterials)
-        or not allKnown(removed.instances, instanceIndex, idsOf(delta.instances))
-        or not allKnown(removed.lights, lightIndex, idsOf(delta.lights))) {
+    if (not allKnown(removed.meshes, meshes, delta.meshes) or not allKnown(removed.textures, textureIds, delta.textures)
+        or not allKnown(removed.materials, materials, delta.materials)
+        or not allKnown(removed.instances, instanceIndex, delta.instances)
+        or not allKnown(removed.lights, lightIndex, delta.lights)) {
         throw std::invalid_argument{"lr::render: the delta removes an object the world does not have"};
     }
 
@@ -519,32 +535,40 @@ void RenderWorld::markAllInstances() {
     }
 }
 
+// The changed chunks are added up again as items of `parallel`, each on its own, so the
+// sums are those of adding up every instance in order.
 void RenderWorld::updateSummaries() {
     instanceChunks.resize((instanceCount() + kInstancesPerChunk - 1) / kInstancesPerChunk);
+    auto dirty = std::vector<std::uint32_t>{};
+    for (auto index = std::uint32_t{0}; index < instanceChunks.size(); ++index) {
+        if (instanceChunks[index].dirty) {
+            dirty.push_back(index);
+        }
+    }
+    parallel->run(dirty.size(), [&](std::size_t const item) {
+        // Added up here and stored once: neighbouring chunks share cache lines.
+        auto sums = InstanceChunk{};
+        sums.dirty = false;
+        auto const first = dirty[item] * kInstancesPerChunk;
+        for (auto at = first; at < std::min(first + kInstancesPerChunk, instanceCount()); ++at) {
+            auto const &record = instances[at];
+            if (materials.at(record.material).desc.alphaMode == core::AlphaMode::Blend) {
+                ++sums.transparent;
+            }
+            auto const &mesh = meshes.at(record.mesh).gpu;
+            sums.clusters += mesh.clusterCount;
+            if (mesh.triangleCount != 0) {
+                auto const box = core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, record.objectToWorld);
+                sums.bounds.min = tc::min(sums.bounds.min, box.min);
+                sums.bounds.max = tc::max(sums.bounds.max, box.max);
+            }
+        }
+        instanceChunks[dirty[item]] = sums;
+    });
     transparentInstances = 0;
     clusterInstances = 0;
     sceneBounds = core::Aabb{core::vec3{INFINITY}, core::vec3{-INFINITY}};
-    for (auto index = std::size_t{0}; index < instanceChunks.size(); ++index) {
-        auto &chunk = instanceChunks[index];
-        if (chunk.dirty) {
-            chunk = InstanceChunk{};
-            chunk.dirty = false;
-            auto const first = static_cast<std::uint32_t>(index) * kInstancesPerChunk;
-            for (auto at = first; at < std::min(first + kInstancesPerChunk, instanceCount()); ++at) {
-                auto const &record = instances[at];
-                if (materials.at(record.material).desc.alphaMode == core::AlphaMode::Blend) {
-                    ++chunk.transparent;
-                }
-                auto const &mesh = meshes.at(record.mesh).gpu;
-                chunk.clusters += mesh.clusterCount;
-                if (mesh.triangleCount != 0) {
-                    auto const box =
-                        core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, record.objectToWorld);
-                    chunk.bounds.min = tc::min(chunk.bounds.min, box.min);
-                    chunk.bounds.max = tc::max(chunk.bounds.max, box.max);
-                }
-            }
-        }
+    for (auto const &chunk : instanceChunks) {
         transparentInstances += chunk.transparent;
         clusterInstances += chunk.clusters;
         sceneBounds.min = tc::min(sceneBounds.min, chunk.bounds.min);
@@ -552,45 +576,77 @@ void RenderWorld::updateSummaries() {
     }
 }
 
-void RenderWorld::writeInstance(std::uint32_t const index, SceneUpdate &update) const {
+GpuInstance RenderWorld::encodeInstance(std::uint32_t const index) const {
     auto const &record = instances[index];
-    auto const gpu = GpuInstance{record.objectToWorld, record.worldToObject, meshes.at(record.mesh).slot,
-                                 materials.at(record.material).slot, record.previousObjectToWorld};
-    update.instances.push_back(Indexed<GpuInstance>{index, gpu});
+    return GpuInstance{record.objectToWorld, record.worldToObject, meshes.at(record.mesh).slot,
+                       materials.at(record.material).slot, record.previousObjectToWorld, record.movedFrame};
+}
+
+void RenderWorld::writeInstance(std::uint32_t const index, SceneUpdate &update) const {
+    update.instances.push_back(Indexed<GpuInstance>{index, encodeInstance(index)});
 }
 
 // A new instance was nowhere before; one already there was where the last frame had it.
 void RenderWorld::upsertInstance(core::InstanceUpsert const &upsert, SceneUpdate &update) {
     auto const found = instanceIndex.find(upsert.id);
-    if (found == instanceIndex.end()) {
+    if (not found) {
         auto const index = instanceCount();
         instances.push_back(InstanceRecord{upsert.id, upsert.mesh, upsert.material, upsert.objectToWorld,
-                                           upsert.objectToWorld, tc::inverse(upsert.objectToWorld)});
-        instanceIndex[upsert.id] = index;
+                                           upsert.objectToWorld, tc::inverse(upsert.objectToWorld), frames});
+        instanceIndex.set(upsert.id, index);
         addedInstances = true;
         markInstance(index);
         writeInstance(index, update);
         return;
     }
-    auto &record = instances[found->second];
-    record = InstanceRecord{upsert.id,           upsert.mesh,          upsert.material,
-                            upsert.objectToWorld, record.objectToWorld, tc::inverse(upsert.objectToWorld)};
-    movedInstances.push_back(upsert.id);
-    markInstance(found->second);
-    writeInstance(found->second, update);
+    auto &record = instances[*found];
+    // Upserted again in the same frame, it was where the frame before had it.
+    auto const before = record.movedFrame == frames ? record.previousObjectToWorld : record.objectToWorld;
+    record = InstanceRecord{upsert.id,   upsert.mesh, upsert.material, upsert.objectToWorld,
+                            before,      tc::inverse(upsert.objectToWorld), frames};
+    markInstance(*found);
+    writeInstance(*found, update);
 }
 
-// The instances the last frame moved stay where it put them.
-void RenderWorld::settleMovedInstances(SceneUpdate &update) {
-    for (auto const id : movedInstances) {
-        auto const found = instanceIndex.find(id);
-        if (found != instanceIndex.end()) {
-            auto &record = instances[found->second];
-            record.previousObjectToWorld = record.objectToWorld;
-            writeInstance(found->second, update);
+// New instances go after the others, in turn; those already there move as items of
+// `parallel`, each into its own place, or in turn when the delta upserts one of them twice.
+void RenderWorld::upsertInstances(std::vector<core::InstanceUpsert> const &upserts, SceneUpdate &update) {
+    upsertFrames.resize(instances.size(), 0);
+    auto moves = std::vector<std::pair<core::InstanceUpsert const *, std::uint32_t>>{};
+    auto twice = false;
+    for (auto const &upsert : upserts) {
+        auto const found = instanceIndex.find(upsert.id);
+        if (not found) {
+            upsertInstance(upsert, update);
+            upsertFrames.push_back(frames);
+            continue;
         }
+        twice = twice or upsertFrames[*found] == frames;
+        upsertFrames[*found] = frames;
+        moves.emplace_back(&upsert, *found);
     }
-    movedInstances.clear();
+    if (twice) {
+        for (auto const &move : moves) {
+            upsertInstance(*move.first, update);
+        }
+        return;
+    }
+    auto const first = update.instances.size();
+    update.instances.resize(first + moves.size());
+    constexpr auto kMovesPerItem = std::size_t{512};
+    parallel->run((moves.size() + kMovesPerItem - 1) / kMovesPerItem, [&](std::size_t const block) {
+        for (auto item = block * kMovesPerItem; item < std::min(moves.size(), (block + 1) * kMovesPerItem); ++item) {
+            auto const &[upsert, index] = moves[item];
+            auto &record = instances[index];
+            record = InstanceRecord{upsert->id,           upsert->mesh,         upsert->material,
+                                    upsert->objectToWorld, record.objectToWorld, tc::inverse(upsert->objectToWorld),
+                                    frames};
+            update.instances[first + item] = Indexed<GpuInstance>{index, encodeInstance(index)};
+        }
+    });
+    for (auto const &move : moves) {
+        markInstance(move.second);
+    }
 }
 
 void RenderWorld::writeLight(std::uint32_t const index, SceneUpdate &update) const {
@@ -603,7 +659,7 @@ void RenderWorld::removeInstance(core::InstanceId const id, SceneUpdate &update)
     instanceIndex.erase(id);
     if (index != last) {
         instances[index] = instances[last];
-        instanceIndex[instances[index].id] = index;
+        instanceIndex.set(instances[index].id, index);
         writeInstance(index, update);
     }
     instances.pop_back();
@@ -814,6 +870,7 @@ SceneCapacity RenderWorld::capacity() const noexcept {
 SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     validate(delta);
     auto update = SceneUpdate{};
+    ++frames;
     addedInstances = false;
     if (fragmented()) {
         compactGeometry(update);
@@ -824,10 +881,7 @@ SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     for (auto const &upsert : delta.materials) {
         upsertMaterial(upsert, update);
     }
-    settleMovedInstances(update);
-    for (auto const &upsert : delta.instances) {
-        upsertInstance(upsert, update);
-    }
+    upsertInstances(delta.instances, update);
     for (auto const &upsert : delta.lights) {
         auto const found = lightIndex.find(upsert.id);
         auto const index = found != lightIndex.end() ? found->second : lightCount();
@@ -876,12 +930,15 @@ SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     // Writes to elements that later moved or went away are harmless: each index keeps its
     // last write, and the tables hold every index written.
     update.capacity = capacity();
-    for (auto const &write : update.instances) {
-        update.capacity.instances = std::max(update.capacity.instances, roundUpToPowerOfTwo(write.index + 1));
-    }
-    for (auto const &write : update.lights) {
-        update.capacity.lights = std::max(update.capacity.lights, roundUpToPowerOfTwo(write.index + 1));
-    }
+    auto const reach = [](auto const &writes) {
+        auto last = std::uint32_t{0};
+        for (auto const &write : writes) {
+            last = std::max(last, write.index + 1);
+        }
+        return roundUpToPowerOfTwo(last);
+    };
+    update.capacity.instances = std::max(update.capacity.instances, reach(update.instances));
+    update.capacity.lights = std::max(update.capacity.lights, reach(update.lights));
     update.instanceCount = instanceCount();
     update.lightCount = lightCount();
     update.tlasNodeCount = tlasNodeCount;
