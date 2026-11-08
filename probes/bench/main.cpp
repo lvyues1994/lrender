@@ -2,7 +2,7 @@
 //
 //   lrender_bench [--backend <name>] [--device <name part>] [--size <w>x<h>]
 //                 [--scene scale|demo|sponza|game|<file.gltf>] [--scenes <directory>]
-//                 [--instances <n>] [--lights <n>] [--segments <n>] [--moving <n>]
+//                 [--instances <n>] [--lights <n>] [--segments <n>] [--moving <n>] [--replacing <n>]
 //                 [--config <name>[:<setting>=<value>,...]]... [--camera orbit|still]
 //                 [--warmup <frames>] [--frames <n>] [--timers on|off] [--json <file>]
 //
@@ -18,7 +18,8 @@
 // Readback and the SharedBuffer path (where the device can share). The scale scene is lr::examples::makeScaleScene's; sponza and game are the glTF sample
 // scenes tools/fetch-scenes.sh downloads into --scenes (build/scenes unless given). With
 // --moving, every frame after the first moves that many of the scene's instances, the next
-// ones in turn, up and down a little.
+// ones in turn, up and down a little; with --replacing, it removes that many and adds them
+// again where they were, under new ids.
 
 #include <lr/asset/AssetLibrary.h>
 #include <lr/asset/AssetSource.h>
@@ -89,6 +90,7 @@ struct Options {
     std::uint32_t warmup = 60;
     std::uint32_t frames = kOrbitFrames; // a full turn
     std::uint32_t moving = 0;            // instances moved per frame
+    std::uint32_t replacing = 0;         // instances removed and added again per frame
     bool timers = true;
     std::string json;
 };
@@ -202,6 +204,8 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         return applyCount(options.warmup, value);
     } else if (flag == "--moving") {
         return applyCount(options.moving, value);
+    } else if (flag == "--replacing") {
+        return applyCount(options.replacing, value);
     } else if (flag == "--frames") {
         return applyCount(options.frames, value) and options.frames > 0;
     } else if (flag == "--timers") {
@@ -511,6 +515,26 @@ lr::core::RenderWorldDelta movedInstances(lr::core::RenderWorldDelta const &scen
     return delta;
 }
 
+// Instance k of the scene goes under id k, then k + n, k + 2n... for n instances.
+struct InstanceReplacer {
+    explicit InstanceReplacer(lr::core::RenderWorldDelta const &scene) : instances(scene.instances) {}
+
+    // The next `count` instances in turn, removed and added again under their next ids.
+    lr::core::RenderWorldDelta next(std::uint32_t const count) {
+        auto delta = lr::core::RenderWorldDelta{};
+        for (auto k = std::uint32_t{0}; k < count and not instances.empty(); ++k) {
+            auto &instance = instances[turn++ % instances.size()];
+            delta.removed.instances.push_back(instance.id);
+            instance.id = lr::core::InstanceId{instance.id.value + static_cast<std::uint32_t>(instances.size())};
+            delta.instances.push_back(instance);
+        }
+        return delta;
+    }
+
+    std::vector<lr::core::InstanceUpsert> instances;
+    std::size_t turn = 0;
+};
+
 // Around the camera's target, a full turn every kOrbitFrames frames.
 lr::core::CameraDesc cameraAt(lr::core::CameraDesc const &start, std::uint32_t const frame, bool const orbit) {
     if (not orbit) {
@@ -584,7 +608,7 @@ std::string json(Report const &report, std::vector<Run> const &runs) {
         << ",\n  \"size\": [" << report.options.size.x << ", " << report.options.size.y << "]"
         << ",\n  \"scene\": " << quoted(report.options.scene) << ",\n  \"sceneContents\": " << quoted(report.scene)
         << ",\n  \"camera\": " << quoted(report.options.orbit ? "orbit" : "still")
-        << ",\n  \"moving\": " << report.options.moving
+        << ",\n  \"moving\": " << report.options.moving << ",\n  \"replacing\": " << report.options.replacing
         << ",\n  \"timers\": " << (report.options.timers ? "true" : "false")
         << ",\n  \"warmupFrames\": " << report.warmupFrames << ",\n  \"settled\": " << (report.settled ? "true" : "false")
         << ",\n  \"frames\": " << report.options.frames << ",\n  \"gpuClocks\": {\"before\": "
@@ -675,14 +699,24 @@ int run(Options const &options) {
     auto scene = sceneOf(options, *runs.front().renderer, *runtime);
     auto report = Report{options, runs.front().renderer->deviceInfo().deviceName, scene.description, 0, false, "", ""};
 
+    auto replacers = std::vector<InstanceReplacer>(runs.size(), InstanceReplacer{scene.delta});
+    auto const changes = [&](std::size_t const run, std::uint32_t const frame) {
+        auto delta = movedInstances(scene.delta, options.moving, frame);
+        if (options.replacing > 0) {
+            auto replaced = replacers[run].next(options.replacing);
+            delta.instances.insert(delta.instances.end(), replaced.instances.begin(), replaced.instances.end());
+            delta.removed.instances = std::move(replaced.removed.instances);
+        }
+        return delta;
+    };
     auto settled = [&runs] {
         return std::all_of(runs.begin(), runs.end(),
                            [](Run const &run) { return run.warmup.settled(kWindow, kStableWithin); });
     };
     for (auto frame = 0u; frame < options.warmup + kMaxExtraWarmup; ++frame) {
-        for (auto &run : runs) {
-            auto delta = frame == 0 ? scene.delta : movedInstances(scene.delta, options.moving, frame);
-            run.warmup.add(frameTimeOf(render(run, std::move(delta), scene.camera, false)));
+        for (auto index = std::size_t{0}; index < runs.size(); ++index) {
+            auto delta = frame == 0 ? scene.delta : changes(index, frame);
+            runs[index].warmup.add(frameTimeOf(render(runs[index], std::move(delta), scene.camera, false)));
         }
         report.warmupFrames = frame + 1;
         if (report.warmupFrames >= options.warmup and settled()) {
@@ -700,9 +734,9 @@ int run(Options const &options) {
         presented.push_back(run.presenter != nullptr ? run.presenter->stats() : lr::present::PresentStats{});
     }
     for (auto frame = 0u; frame < options.frames; ++frame) {
-        for (auto &run : runs) {
-            measure(run.measured, render(run, movedInstances(scene.delta, options.moving, report.warmupFrames + frame),
-                                         cameraAt(scene.camera, frame, options.orbit), frame == 0));
+        for (auto index = std::size_t{0}; index < runs.size(); ++index) {
+            measure(runs[index].measured, render(runs[index], changes(index, report.warmupFrames + frame),
+                                                 cameraAt(scene.camera, frame, options.orbit), frame == 0));
         }
     }
     report.clocksAfter = gpuClocks(*runs.front().renderer);
@@ -736,6 +770,7 @@ int main(int argc, char **argv) {
                      "usage: lrender_bench [--backend <name>] [--device <name part>] [--size <w>x<h>]\n"
                      "                     [--scene scale|demo|sponza|game|<file.gltf>] [--scenes <directory>]\n"
                      "                     [--instances <n>] [--lights <n>] [--segments <n>] [--moving <n>]\n"
+                     "                     [--replacing <n>]\n"
                      "                     [--config <name>[:<setting>=<value>,...]]... [--camera orbit|still]\n"
                      "                     [--warmup <frames>] [--frames <n>] [--timers on|off] [--json <file>]\n");
         return 2;
