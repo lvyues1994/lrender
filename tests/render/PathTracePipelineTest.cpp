@@ -784,4 +784,53 @@ TEST_CASE("the path tracer traces moved instances as it traces instances placed 
     });
 }
 
+// Instances added and removed change lrender's instance hierarchy in place; with opaque
+// materials only, whose paths do not depend on the instances' order, the path tracer
+// traces what one given the instances that stayed traces.
+TEST_CASE("the path tracer traces instances that came and went as it traces those that stayed") {
+    auto const camera = test::cameraAt(core::vec3{0.0f, 2.0f, 4.0f}, core::vec3{0.0f, 0.6f, 0.0f});
+    auto const extent = core::ivec2{kEquivalencePixels, kEquivalencePixels};
+    auto options = test::HarnessOptions{};
+    options.rayQueries = render::VariantUse::Off;
+    test::forEachBackend(options, [&](RenderHarness &churned) {
+        auto placedThere = options;
+        placedThere.backend = churned.renderer->deviceInfo().backend;
+        placedThere.device = test::deviceFor(placedThere.backend);
+        auto fresh = RenderHarness{placedThere};
+        auto const view = pathTraced(churned, churned.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        auto const freshView =
+            pathTraced(fresh, fresh.renderer->targets().createImage(render::ImageTargetDesc{extent}), camera);
+        auto scene = smallScene();
+        auto const opaque = [](std::uint32_t const k) { return core::MaterialId{k % 3}; };
+        auto const at = [](std::uint32_t const k) {
+            return placed(core::vec3{-1.2f + 0.6f * static_cast<float>(k % 5), 0.3f, -1.0f + 0.5f * static_cast<float>(k / 5)},
+                          0.3f * static_cast<float>(k), core::vec3{0.3f});
+        };
+        for (auto k = 0u; k < 12; ++k) {
+            scene.instances.push_back({core::InstanceId{10 + k}, core::MeshId{1 + k % 2}, opaque(k), at(k)});
+        }
+        churned.render(frameOf(scene, view));
+        auto result = render::FrameResult{};
+        auto next = 22u;
+        for (auto frame = 0u; frame < 5; ++frame) {
+            auto delta = core::RenderWorldDelta{};
+            for (auto k = 0u; k < 2; ++k, ++next) {
+                delta.instances.push_back({core::InstanceId{next}, core::MeshId{1 + next % 2}, opaque(next), at(next % 20)});
+            }
+            delta.removed.instances = {core::InstanceId{10 + 2 * frame}, core::InstanceId{11 + 2 * frame}};
+            for (auto const &instance : delta.instances) {
+                scene.instances.push_back(instance);
+            }
+            for (auto const id : delta.removed.instances) {
+                scene.instances.erase(std::find_if(scene.instances.begin(), scene.instances.end(),
+                                                   [id](core::InstanceUpsert const &instance) { return instance.id == id; }));
+            }
+            result = churned.render(frameOf(std::move(delta), view));
+        }
+        auto const expected = fresh.render(frameOf(scene, freshView));
+        CHECK(result.views[0].stats.accumulatedSamples == expected.views[0].stats.accumulatedSamples);
+        CHECK(result.views[0].image->pixels == expected.views[0].image->pixels);
+    });
+}
+
 } // namespace

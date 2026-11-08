@@ -96,8 +96,7 @@ Walk walk(render::Bvh const &bvh, std::vector<core::Aabb> const &bounds) {
     return result;
 }
 
-void checkStructure(std::vector<core::Aabb> const &bounds, std::uint32_t const maxLeafSize) {
-    auto const bvh = render::buildBvh(bounds, render::BvhBuildConfig{maxLeafSize});
+void checkStructure(render::Bvh const &bvh, std::vector<core::Aabb> const &bounds, std::uint32_t const maxLeafSize) {
     auto const found = walk(bvh, bounds);
 
     CHECK(found.nested);
@@ -112,6 +111,10 @@ void checkStructure(std::vector<core::Aabb> const &bounds, std::uint32_t const m
         all[index] = static_cast<std::uint32_t>(index);
     }
     CHECK(order == all);
+}
+
+void checkStructure(std::vector<core::Aabb> const &bounds, std::uint32_t const maxLeafSize) {
+    checkStructure(render::buildBvh(bounds, render::BvhBuildConfig{maxLeafSize}), bounds, maxLeafSize);
 }
 
 TEST_CASE("every primitive is in exactly one leaf, and every node holds its children") {
@@ -142,6 +145,44 @@ TEST_CASE("hierarchies stay within the depth limit where the heuristic alone wou
     // Equal centres give the heuristic nothing to split.
     checkStructure(std::vector<core::Aabb>(5000, core::Aabb{core::vec3{0.0f}, core::vec3{1.0f}}), 4);
     CHECK(render::buildBvh({}, render::BvhBuildConfig{4}).nodes.empty());
+}
+
+bool sameTree(render::Bvh const &a, render::Bvh const &b) {
+    return a.order == b.order
+       and std::equal(a.nodes.begin(), a.nodes.end(), b.nodes.begin(), b.nodes.end(), [](auto const &x, auto const &y) {
+               return x.boundsMin == y.boundsMin and x.boundsMax == y.boundsMax and x.first == y.first
+                  and x.count == y.count;
+           });
+}
+
+// With a small grain, many nodes split in chunks over the frame pool and many subtrees
+// are built at once.
+TEST_CASE("a hierarchy built over the frame pool is whole, and the one a serial build of the same items makes") {
+    auto config = runtime::RuntimeConfig{};
+    config.framePoolThreads = 4;
+    auto const runtime = runtime::makeRuntime(config);
+    auto const pool = render::makeFramePoolFor(*runtime);
+    auto const serial = render::makeSerialFor();
+    auto random = std::mt19937{9};
+    auto spread = std::vector<core::Aabb>{};
+    for (auto index = 0; index < 100; ++index) {
+        auto const x = std::ldexp(1.0f, index);
+        spread.push_back(core::Aabb{core::vec3{x, 0.0f, 0.0f}, core::vec3{x * 1.5f, 1.0f, 1.0f}});
+    }
+    auto const cases = std::vector<std::vector<core::Aabb>>{
+        boundsOf(randomTriangles(random, 1)), boundsOf(randomTriangles(random, 1000)),
+        boundsOf(randomTriangles(random, 30000)), spread,
+        std::vector<core::Aabb>(5000, core::Aabb{core::vec3{0.0f}, core::vec3{1.0f}})};
+    for (auto const &bounds : cases) {
+        for (auto const maxLeafSize : {1u, 4u}) {
+            CAPTURE(bounds.size());
+            CAPTURE(maxLeafSize);
+            auto const build = render::BvhBuildConfig{maxLeafSize, 64};
+            auto const pooled = render::buildBvh(bounds, build, *pool);
+            CHECK(sameTree(pooled, render::buildBvh(bounds, build, *serial)));
+            checkStructure(pooled, bounds, maxLeafSize);
+        }
+    }
 }
 
 template <class T>
@@ -403,6 +444,81 @@ TEST_CASE("instances that only move refit the instance hierarchy, which still fi
     auto const rebuilt = world.apply(emptied);
     CHECK(rebuilt.tlasNodeCount == nodes - 2);
     CHECK(rebuilt.tlasNodes.size() == rebuilt.tlasNodeCount);
+}
+
+// Whether every instance with triangles is in exactly one leaf the instance hierarchy
+// reaches, and every box there holds what is under it.
+bool wholeInstanceTree(HostScene const &scene, std::size_t const instanceCount) {
+    auto inLeaves = std::vector<int>(instanceCount, 0);
+    auto stack = std::vector<std::uint32_t>{0};
+    auto whole = true;
+    while (scene.tlasNodeCount > 0 and not stack.empty()) {
+        auto const &node = scene.tlasNodes.at(stack.back());
+        stack.pop_back();
+        auto const box = render::boundsOf(node);
+        if (node.count != 0) {
+            if (node.first >= instanceCount) {
+                return false;
+            }
+            inLeaves[node.first] += 1;
+            auto const &instance = scene.instances.at(node.first);
+            auto const root = scene.blasRoots.at(instance.mesh);
+            whole = whole and root != render::noBvhNode()
+                and contains(box, core::transformed(render::boundsOf(scene.blasNodes.at(root)), instance.objectToWorld.value));
+            continue;
+        }
+        for (auto const child : {node.first, node.first + 1}) {
+            whole = whole and contains(box, render::boundsOf(scene.tlasNodes.at(child)));
+            stack.push_back(child);
+        }
+    }
+    for (auto index = std::size_t{0}; index < instanceCount; ++index) {
+        auto const hasTriangles = scene.blasRoots.at(scene.instances[index].mesh) != render::noBvhNode();
+        whole = whole and inLeaves[index] == (hasTriangles ? 1 : 0);
+    }
+    return whole;
+}
+
+TEST_CASE("instances that come and go change the instance hierarchy in place, which still finds every hit") {
+    auto random = std::mt19937{8};
+    auto world = render::RenderWorld{};
+    auto const start = scatteredInstances(random);
+    auto update = world.apply(start);
+    world.keepHierarchies(update);
+    auto scene = HostScene{update};
+    auto place = std::uniform_real_distribution<float>{-3.0f, 3.0f};
+    auto live = std::vector<core::InstanceId>{};
+    for (auto const &instance : start.instances) {
+        live.push_back(instance.id);
+    }
+    auto nextId = std::uint32_t{1000};
+    auto rebuilt = 0;
+    for (auto frame = 0; frame < 40; ++frame) {
+        auto delta = core::RenderWorldDelta{};
+        for (auto k = 0; k < 3; ++k) {
+            auto transform = core::Transform{};
+            transform.translation = core::vec3{place(random), place(random), place(random)};
+            auto const mesh = core::MeshId{frame % 7 == 0 ? 3u : static_cast<std::uint32_t>(random() % 3)};
+            delta.instances.push_back({core::InstanceId{nextId}, mesh, core::MaterialId{0}, core::matrixOf(transform)});
+            live.push_back(core::InstanceId{nextId++});
+        }
+        for (auto k = 0; k < 2 and live.size() > 3; ++k) {
+            auto const at = random() % (live.size() - 3); // not those this frame adds
+            delta.removed.instances.push_back(live[at]);
+            live.erase(live.begin() + static_cast<std::ptrdiff_t>(at));
+        }
+        auto const changed = world.apply(delta);
+        CAPTURE(frame);
+        rebuilt += changed.tlasNodes.size() == changed.tlasNodeCount ? 1 : 0;
+        CHECK(changed.tlasNodes.size() < changed.tlasNodeCount); // in place: only what the changes touched
+        patch(scene.instances, changed.instances);
+        scene.instances.resize(changed.instanceCount);
+        patch(scene.tlasNodes, changed.tlasNodes);
+        scene.tlasNodeCount = changed.tlasNodeCount;
+        CHECK(wholeInstanceTree(scene, changed.instanceCount));
+        CHECK(disagreementsOf(scene, random, 200) == 0);
+    }
+    CHECK(rebuilt == 0);
 }
 
 TEST_CASE("hierarchies follow the deltas after they are first built") {

@@ -5,6 +5,7 @@
 #include <algorithm>
 #include <cmath>
 #include <iterator>
+#include <numeric>
 #include <optional>
 #include <stdexcept>
 #include <string>
@@ -594,7 +595,13 @@ void RenderWorld::upsertInstance(core::InstanceUpsert const &upsert, SceneUpdate
         instances.push_back(InstanceRecord{upsert.id, upsert.mesh, upsert.material, upsert.objectToWorld,
                                            upsert.objectToWorld, tc::inverse(upsert.objectToWorld), frames});
         instanceIndex.set(upsert.id, index);
-        addedInstances = true;
+        if (hierarchies) {
+            tlasLeaves.push_back(noBvhNode());
+            auto const &mesh = meshes.at(upsert.mesh).gpu;
+            if (mesh.triangleCount != 0) {
+                insertTlasLeaf(index, core::transformed(core::Aabb{mesh.boundsMin, mesh.boundsMax}, upsert.objectToWorld));
+            }
+        }
         markInstance(index);
         writeInstance(index, update);
         return;
@@ -623,6 +630,10 @@ void RenderWorld::upsertInstances(std::vector<core::InstanceUpsert> const &upser
         }
         twice = twice or upsertFrames[*found] == frames;
         upsertFrames[*found] = frames;
+        // A mesh with triangles for one without, or the other way round: a leaf to add or remove.
+        if (hierarchies and (meshes.at(upsert.mesh).gpu.triangleCount != 0) != (tlasLeaves[*found] != noBvhNode())) {
+            tlasStale = true;
+        }
         moves.emplace_back(&upsert, *found);
     }
     if (twice) {
@@ -657,6 +668,18 @@ void RenderWorld::removeInstance(core::InstanceId const id, SceneUpdate &update)
     auto const index = instanceIndex.at(id);
     auto const last = static_cast<std::uint32_t>(instances.size() - 1);
     instanceIndex.erase(id);
+    if (hierarchies) {
+        if (tlasLeaves[index] != noBvhNode()) {
+            removeTlasLeaf(index);
+        }
+        auto const moved = tlasLeaves[last];
+        if (index != last and moved != noBvhNode() and not tlasStale) {
+            tlas[moved].first = index;
+            tlasChanged.push_back(moved);
+        }
+        tlasLeaves[index] = moved;
+        tlasLeaves.pop_back();
+    }
     if (index != last) {
         instances[index] = instances[last];
         instanceIndex.set(instances[index].id, index);
@@ -718,43 +741,142 @@ void RenderWorld::placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &upd
     }
 }
 
-// Instances of meshes without triangles are left out.
+// Instances of meshes without triangles are left out. The bounds and the nodes are worked
+// out in chunks over `parallel`: each instance is in one leaf, each node has one parent.
 void RenderWorld::buildTlas(SceneUpdate &update) {
-    auto bounds = std::vector<core::Aabb>{};
-    auto members = std::vector<std::uint32_t>{};
-    for (auto index = std::uint32_t{0}; index < instanceCount(); ++index) {
-        auto const &mesh = meshes.at(instances[index].mesh);
-        if (mesh.blasRoot != noBvhNode()) {
-            bounds.push_back(core::transformed(mesh.blasBounds, instances[index].objectToWorld));
-            members.push_back(index);
+    constexpr auto kChunk = std::uint32_t{8192};
+    auto const count = instanceCount();
+    auto const chunksOf = [](std::size_t const items) { return (items + kChunk - 1) / kChunk; };
+    auto const rangeOf = [&](std::size_t const chunk, std::size_t const items) {
+        return std::pair<std::uint32_t, std::uint32_t>{static_cast<std::uint32_t>(chunk * kChunk),
+                                                       static_cast<std::uint32_t>(std::min(items, (chunk + 1) * kChunk))};
+    };
+    auto const hasTriangles = [this](std::uint32_t const index) {
+        return meshes.at(instances[index].mesh).blasRoot != noBvhNode();
+    };
+    auto firsts = std::vector<std::uint32_t>(chunksOf(count) + 1, 0);
+    parallel->run(chunksOf(count), [&](std::size_t const chunk) {
+        auto const [first, last] = rangeOf(chunk, count);
+        for (auto index = first; index < last; ++index) {
+            firsts[chunk + 1] += hasTriangles(index) ? 1u : 0u;
         }
-    }
-    auto const bvh = buildBvh(bounds, BvhBuildConfig{1});
-    update.tlasNodes.clear();
-    tlas = bvh.nodes;
+    });
+    std::partial_sum(firsts.begin(), firsts.end(), firsts.begin());
+    auto bounds = std::vector<core::Aabb>(firsts.back());
+    auto members = std::vector<std::uint32_t>(firsts.back());
+    parallel->run(chunksOf(count), [&](std::size_t const chunk) {
+        auto const [first, last] = rangeOf(chunk, count);
+        auto at = firsts[chunk];
+        for (auto index = first; index < last; ++index) {
+            if (hasTriangles(index)) {
+                bounds[at] = core::transformed(meshes.at(instances[index].mesh).blasBounds, instances[index].objectToWorld);
+                members[at++] = index;
+            }
+        }
+    });
+    auto bvh = buildBvh(bounds, BvhBuildConfig{1}, *parallel);
+    tlas = std::move(bvh.nodes);
     tlasParents.assign(tlas.size(), noBvhNode());
-    tlasLeaves.assign(instanceCount(), noBvhNode());
-    for (auto index = std::uint32_t{0}; index < tlas.size(); ++index) {
-        auto &node = tlas[index];
-        if (node.count != 0) {
-            node.first = members[bvh.order[node.first]];
-            tlasLeaves[node.first] = index;
-        } else {
-            tlasParents[node.first] = index;
-            tlasParents[node.first + 1] = index;
+    tlasLeaves.assign(count, noBvhNode());
+    update.tlasNodes.clear();
+    update.tlasNodes.resize(tlas.size());
+    parallel->run(chunksOf(tlas.size()), [&](std::size_t const chunk) {
+        auto const [first, last] = rangeOf(chunk, tlas.size());
+        for (auto index = first; index < last; ++index) {
+            auto &node = tlas[index];
+            if (node.count != 0) {
+                node.first = members[bvh.order[node.first]];
+                tlasLeaves[node.first] = index;
+            } else {
+                tlasParents[node.first] = index;
+                tlasParents[node.first + 1] = index;
+            }
+            update.tlasNodes[index] = Indexed<GpuBvhNode>{index, node};
         }
-        update.tlasNodes.push_back(Indexed<GpuBvhNode>{index, node});
-    }
+    });
     tlasNodeCount = static_cast<std::uint32_t>(tlas.size());
+    tlasFreePairs.clear();
+    tlasChanged.clear();
+    tlasEdits = 0;
+    tlasStale = false;
 }
 
-bool RenderWorld::refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update) {
-    for (auto const &upsert : delta.instances) {
-        auto const index = instanceIndex.at(upsert.id);
-        if ((tlasLeaves[index] == noBvhNode()) != (meshes.at(instances[index].mesh).blasRoot == noBvhNode())) {
-            return false;
-        }
+namespace {
+
+float halfArea(core::Aabb const &box) noexcept {
+    auto const size = tc::max(box.max - box.min, core::vec3{0.0f});
+    return size.x * size.y + size.y * size.z + size.z * size.x;
+}
+
+core::Aabb merged(core::Aabb const &a, core::Aabb const &b) noexcept {
+    return core::Aabb{tc::min(a.min, b.min), tc::max(a.max, b.max)};
+}
+
+} // namespace
+
+void RenderWorld::insertTlasLeaf(std::uint32_t const instance, core::Aabb const &box) {
+    if (tlasStale or tlas.empty()) {
+        tlasStale = true;
+        return;
     }
+    auto node = std::uint32_t{0};
+    while (tlas[node].count == 0) {
+        auto const first = tlas[node].first;
+        auto const growth = [&](std::uint32_t const child) {
+            auto const held = boundsOf(tlas[child]);
+            return halfArea(merged(held, box)) - halfArea(held);
+        };
+        node = growth(first + 1) < growth(first) ? first + 1 : first;
+    }
+    auto pair = static_cast<std::uint32_t>(tlas.size());
+    if (tlasFreePairs.empty()) {
+        tlas.resize(tlas.size() + 2);
+        tlasParents.resize(tlas.size(), noBvhNode());
+    } else {
+        pair = tlasFreePairs.back();
+        tlasFreePairs.pop_back();
+    }
+    auto const beside = boundsOf(tlas[node]);
+    tlas[pair] = tlas[node];
+    tlasLeaves[tlas[pair].first] = pair;
+    tlas[pair + 1] = GpuBvhNode{box.min, instance, box.max, 1};
+    tlasLeaves[instance] = pair + 1;
+    auto const both = merged(beside, box);
+    tlas[node] = GpuBvhNode{both.min, pair, both.max, 0};
+    tlasParents[pair] = node;
+    tlasParents[pair + 1] = node;
+    tlasChanged.insert(tlasChanged.end(), {node, pair, pair + 1});
+    ++tlasEdits;
+}
+
+void RenderWorld::removeTlasLeaf(std::uint32_t const instance) {
+    auto const leaf = tlasLeaves[instance];
+    tlasLeaves[instance] = noBvhNode();
+    if (tlasStale) {
+        return;
+    }
+    auto const parent = tlasParents[leaf];
+    if (parent == noBvhNode()) { // the only leaf
+        tlasStale = true;
+        return;
+    }
+    auto const pair = tlas[parent].first;
+    auto const sibling = leaf == pair ? pair + 1 : pair;
+    tlas[parent] = tlas[sibling];
+    if (tlas[parent].count == 0) {
+        tlasParents[tlas[parent].first] = parent;
+        tlasParents[tlas[parent].first + 1] = parent;
+    } else {
+        tlasLeaves[tlas[parent].first] = parent;
+    }
+    tlasParents[pair] = noBvhNode();
+    tlasParents[pair + 1] = noBvhNode();
+    tlasFreePairs.push_back(pair);
+    tlasChanged.push_back(parent);
+    ++tlasEdits;
+}
+
+void RenderWorld::refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update) {
     auto written = std::vector<std::uint32_t>{};
     auto const rewrite = [&](std::uint32_t const node, core::Aabb const &box) {
         auto &held = tlas[node];
@@ -766,28 +888,46 @@ bool RenderWorld::refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &up
         written.push_back(node);
         return true;
     };
-    for (auto const &upsert : delta.instances) {
-        auto const index = instanceIndex.at(upsert.id);
-        auto node = tlasLeaves[index];
-        if (node == noBvhNode()) {
-            continue;
+    auto const boxOf = [&](std::uint32_t const node) {
+        auto const &held = tlas[node];
+        if (held.count != 0) {
+            auto const &record = instances[held.first];
+            return core::transformed(meshes.at(record.mesh).blasBounds, record.objectToWorld);
         }
-        auto const &record = instances[index];
-        auto changed = rewrite(node, core::transformed(meshes.at(record.mesh).blasBounds, record.objectToWorld));
+        return merged(boundsOf(tlas[held.first]), boundsOf(tlas[held.first + 1]));
+    };
+    // Up from `node`, while the boxes change: a walk from every changed node passes over
+    // whatever another change left to do.
+    auto const refitFrom = [&](std::uint32_t node) {
+        auto changed = rewrite(node, boxOf(node));
         while (changed and tlasParents[node] != noBvhNode()) {
             node = tlasParents[node];
-            auto const first = tlas[node].first;
-            auto const children = core::Aabb{tc::min(tlas[first].boundsMin, tlas[first + 1].boundsMin),
-                                             tc::max(tlas[first].boundsMax, tlas[first + 1].boundsMax)};
-            changed = rewrite(node, children);
+            changed = rewrite(node, boxOf(node));
+        }
+    };
+    for (auto const &upsert : delta.instances) {
+        auto const index = instanceIndex.find(upsert.id);
+        if (index and tlasLeaves[*index] != noBvhNode()) {
+            refitFrom(tlasLeaves[*index]);
         }
     }
+    for (auto const node : tlasChanged) {
+        // Freed pairs were changed too, before they were freed.
+        if (node == 0 or tlasParents[node] != noBvhNode()) {
+            refitFrom(node);
+            if (tlasParents[node] != noBvhNode()) {
+                refitFrom(tlasParents[node]);
+            }
+        }
+    }
+    written.insert(written.end(), tlasChanged.begin(), tlasChanged.end());
+    tlasChanged.clear();
     std::sort(written.begin(), written.end());
     written.erase(std::unique(written.begin(), written.end()), written.end());
     for (auto const node : written) {
         update.tlasNodes.push_back(Indexed<GpuBvhNode>{node, tlas[node]});
     }
-    return true;
+    tlasNodeCount = static_cast<std::uint32_t>(tlas.size());
 }
 
 void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUpdate &update) {
@@ -799,10 +939,13 @@ void RenderWorld::updateHierarchies(core::RenderWorldDelta const &delta, SceneUp
         }
     }
     buildBlases(records, update);
-    if (not delta.meshes.empty() or addedInstances or not delta.removed.instances.empty()) {
+    // Built again once the changes since the last build are many enough that the tree
+    // they made has drifted from what the heuristic would make.
+    auto const drifted = tlasEdits > std::max<std::uint32_t>(4096, instanceCount() / 8);
+    if (not delta.meshes.empty() or tlasStale or drifted) {
         buildTlas(update);
-    } else if (not delta.instances.empty() and not refitTlas(delta, update)) {
-        buildTlas(update);
+    } else if (not delta.instances.empty() or not tlasChanged.empty()) {
+        refitTlas(delta, update);
     }
 }
 
@@ -871,7 +1014,6 @@ SceneUpdate RenderWorld::apply(core::RenderWorldDelta const &delta) {
     validate(delta);
     auto update = SceneUpdate{};
     ++frames;
-    addedInstances = false;
     if (fragmented()) {
         compactGeometry(update);
     }

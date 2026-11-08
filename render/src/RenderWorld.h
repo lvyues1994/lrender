@@ -146,10 +146,15 @@ private:
     void buildBlases(std::vector<MeshRecord *> const &records, SceneUpdate &update);
     void placeBlas(MeshRecord &record, Bvh const &bvh, SceneUpdate &update);
     void buildTlas(SceneUpdate &update);
-    // The instance hierarchy's boxes again for the moved instances of `delta`, which only
-    // moves instances that were there: false, changing nothing, when an instance's mesh
-    // gained or lost its hierarchy.
-    bool refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update);
+    // Changes to the instance hierarchy as apply() adds and removes instances, between
+    // builds: a new leaf goes where its box makes the tree grow least, beside the leaf it
+    // finds there; a removed leaf's sibling takes their parent's place, and the pair they
+    // held is kept for a later leaf. Their boxes are made right by refitTlas().
+    void insertTlasLeaf(std::uint32_t instance, core::Aabb const &box);
+    void removeTlasLeaf(std::uint32_t instance);
+    // The boxes again of the leaves of `delta`'s instances and of the nodes the changes
+    // above touched, and of every node over them.
+    void refitTlas(core::RenderWorldDelta const &delta, SceneUpdate &update);
     SceneCapacity capacity() const noexcept;
 
     std::unique_ptr<ParallelFor> ownParallel;
@@ -192,13 +197,15 @@ private:
     RangeAllocator blasNodeRanges;
     RangeAllocator blasTriangleRanges;
     std::uint32_t tlasNodeCount = 0;
-    // The instance hierarchy as it was last built or refitted, each node's parent, and each
+    // The instance hierarchy as it was last built or changed, each node's parent, and each
     // instance's leaf (noBvhNode() for those it leaves out).
     std::vector<GpuBvhNode> tlas;
     std::vector<std::uint32_t> tlasParents;
     std::vector<std::uint32_t> tlasLeaves;
-    // Whether this apply() added instances.
-    bool addedInstances = false;
+    std::vector<std::uint32_t> tlasFreePairs; // the first of two sibling slots no node uses
+    std::vector<std::uint32_t> tlasChanged;   // by this apply(), for refitTlas()
+    std::uint32_t tlasEdits = 0;              // leaves added and removed since the last build
+    bool tlasStale = false;                   // to be built again in updateHierarchies()
 };
 
 } // namespace lr::render

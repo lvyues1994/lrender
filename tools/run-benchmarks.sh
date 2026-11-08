@@ -44,6 +44,8 @@ nvidia)
     measure scale-1m-moving-100k --scene scale --instances 1000000 --lights 1000 --moving 100000 --frames 120
     measure scale-1m-pathtrace-moving --scene scale --instances 1000000 --lights 1000 --moving 1000 --frames 60 \
         --warmup 10 --config hierarchies:pipeline=pathtrace,rayqueries=off
+    measure scale-1m-pathtrace-replacing --scene scale --instances 1000000 --lights 1000 --replacing 1000 \
+        --frames 120 --warmup 5 --config hierarchies:pipeline=pathtrace,rayqueries=off
     measure sponza-pathtrace --scene sponza --config rayqueries:pipeline=pathtrace \
         --config hierarchies:pipeline=pathtrace,rayqueries=off
     ;;
