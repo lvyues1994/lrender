@@ -48,7 +48,7 @@ lr_add_test(lr_render_tests
             render/TextureTest.cpp render/ShadowTest.cpp render/TransparencyTest.cpp
             render/VariantTest.cpp render/MaterialModelTest.cpp render/TemporalTest.cpp
             render/KernelReloadTest.cpp render/RenderWorkTest.cpp render/ClusterTest.cpp
-            render/LightGridTest.cpp render/GeometryReclaimTest.cpp
+            render/LightGridTest.cpp render/GeometryReclaimTest.cpp render/DenoiseTest.cpp
     KERNELS render/TestKernels.h render/TestMaterialModels.h
     LIBRARIES lr::render tc_devices)
 # White-box tests of the render module's internals, and of its kernels' functions on the host.

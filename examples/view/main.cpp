@@ -2,14 +2,15 @@
 // lr::scene World that scripts change every frame.
 //
 //   lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
-//                [--pipeline visibility|pathtrace] [--frames <n>] [--gltf <file> | --mesh <file>]
-//                [--present sdl|vulkan]
+//                [--pipeline visibility|pathtrace|pathtrace-interactive] [--frames <n>]
+//                [--gltf <file> | --mesh <file>] [--present sdl|vulkan]
 //
 // --present vulkan shows the frames through lr::present::VulkanPresenter on the window's
 // Vulkan surface, on the SharedBuffer path where the device is the same GPU; sdl (the
 // default) blits them through an SDL renderer, on the Readback path.
 // The camera circles slowly; drag with the left mouse button to turn it and scroll to zoom.
-// Tab switches between the visibility and the path tracing pipelines (1 and 2 pick one);
+// Tab steps through the visibility, the path tracing and the denoised path tracing
+// pipelines (1, 2 and 3 pick one);
 // T turns the visibility pipeline's temporal anti-aliasing off and on (on to begin with);
 // Esc or Q quits. With --frames it quits after that many frames, simulating 60 frames a
 // second, for runs nobody watches (SDL_VIDEODRIVER=offscreen). A --gltf scene is loaded
@@ -64,11 +65,25 @@ using lr::core::vec3;
 
 constexpr auto kFramesInFlight = std::uint32_t{2};
 
+// The built-in pipelines, in the order the number keys pick them.
+enum class Pipeline { Visibility, PathTrace, PathTraceInteractive };
+
+std::optional<Pipeline> pipelineNamed(std::string const &name) {
+    if (name == "visibility") {
+        return Pipeline::Visibility;
+    } else if (name == "pathtrace") {
+        return Pipeline::PathTrace;
+    } else if (name == "pathtrace-interactive") {
+        return Pipeline::PathTraceInteractive;
+    }
+    return std::nullopt;
+}
+
 struct Options {
     std::string backend = "cpu";
     std::string device;
     ivec2 size{960, 540};
-    bool pathTrace = false;
+    Pipeline pipeline = Pipeline::Visibility;
     std::uint32_t frames = 0; // 0: until the window is closed
     std::string gltf;
     std::string mesh;
@@ -92,8 +107,9 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         options.size = size.value_or(ivec2{0});
         return size.has_value();
     } else if (flag == "--pipeline") {
-        options.pathTrace = value == "pathtrace";
-        return value == "pathtrace" or value == "visibility";
+        auto const pipeline = pipelineNamed(value);
+        options.pipeline = pipeline.value_or(Pipeline::Visibility);
+        return pipeline.has_value();
     } else if (flag == "--frames") {
         auto const frames = lr::examples::parseCount(value);
         options.frames = frames.value_or(0u);
@@ -121,7 +137,7 @@ std::optional<Options> parse(int const argc, char **const argv) {
 }
 
 struct ViewerInput {
-    bool pathTrace = false;
+    Pipeline pipeline = Pipeline::Visibility;
     bool taa = true;
     bool quit = false;
     bool resized = false;
@@ -131,13 +147,15 @@ void handleKey(SDL_Keycode const key, ViewerInput &input) {
     if (key == SDLK_ESCAPE or key == SDLK_q) {
         input.quit = true;
     } else if (key == SDLK_TAB) {
-        input.pathTrace = not input.pathTrace;
+        input.pipeline = static_cast<Pipeline>((static_cast<int>(input.pipeline) + 1) % 3);
     } else if (key == SDLK_t) {
         input.taa = not input.taa;
     } else if (key == SDLK_1) {
-        input.pathTrace = false;
+        input.pipeline = Pipeline::Visibility;
     } else if (key == SDLK_2) {
-        input.pathTrace = true;
+        input.pipeline = Pipeline::PathTrace;
+    } else if (key == SDLK_3) {
+        input.pipeline = Pipeline::PathTraceInteractive;
     }
 }
 
@@ -439,7 +457,17 @@ void submitFrame(Session const &session, ViewerInput const &input, lr::render::F
     auto &view = frame.views.at(0);
     view.id = lr::core::ViewId{0};
     view.target = session.target;
-    view.pipeline = input.pathTrace ? pipelines.pathTraceReference() : pipelines.visibility();
+    switch (input.pipeline) {
+    case Pipeline::Visibility:
+        view.pipeline = pipelines.visibility();
+        break;
+    case Pipeline::PathTrace:
+        view.pipeline = pipelines.pathTraceReference();
+        break;
+    case Pipeline::PathTraceInteractive:
+        view.pipeline = pipelines.pathTraceInteractive();
+        break;
+    }
     view.settings.antiAliasing = input.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
     lexec::spawn(session.renderer.submit(std::move(frame))
                      | lexec::then([&reports](lr::render::FrameResult const &result) noexcept { reports.finished(result); })
@@ -467,8 +495,11 @@ lr::render::FrameDesc simulate(Simulation const &simulation, SimulationClock &cl
 }
 
 void showStatus(Session const &session, ViewerInput const &input, FrameReports const &reports) {
-    auto const title = input.pathTrace ? "lrender: path tracing, " + std::to_string(reports.samples.load()) + " samples"
-                                       : std::string{"lrender: visibility buffer, TAA "} + (input.taa ? "on" : "off");
+    auto const samples = std::to_string(reports.samples.load()) + " samples";
+    auto const title = input.pipeline == Pipeline::PathTrace ? "lrender: path tracing, " + samples
+                     : input.pipeline == Pipeline::PathTraceInteractive
+                         ? "lrender: path tracing, denoised, " + samples
+                         : std::string{"lrender: visibility buffer, TAA "} + (input.taa ? "on" : "off");
     SDL_SetWindowTitle(session.window, title.c_str());
 }
 
@@ -476,7 +507,7 @@ void showStatus(Session const &session, ViewerInput const &input, FrameReports c
 // waiting for a frame. Each frame submitted is a tick of the scripts.
 LoopResult runLoop(Session const &session, Options const &options, Simulation const &simulation,
                    KernelReloads &kernels, FrameReports &reports, lexec::counting_scope &scope) {
-    auto input = ViewerInput{options.pathTrace, true, false, false};
+    auto input = ViewerInput{options.pipeline, true, false, false};
     auto clock = SimulationClock{options.frames != 0};
     auto result = LoopResult{};
     while (not input.quit and not reports.firstFailure()) {
@@ -637,8 +668,8 @@ int main(int argc, char **argv) {
     if (not options) {
         std::fprintf(stderr, "usage: lrender_view [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
-                             "                    [--pipeline visibility|pathtrace] [--frames <n>] "
-                             "[--gltf <file> | --mesh <file>]\n"
+                             "                    [--pipeline visibility|pathtrace|pathtrace-interactive] "
+                             "[--frames <n>] [--gltf <file> | --mesh <file>]\n"
                              "                    [--present sdl|vulkan]\n");
         return 2;
     }

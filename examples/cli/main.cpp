@@ -1,7 +1,8 @@
 // lrender_cli: renders the demo scene, or a glTF file's, offline and writes it to a PPM file.
 //
 //   lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] [--size <w>x<h>]
-//               [--pipeline visibility|pathtrace] [--taa] [--samples <n>] [--timers on|off]
+//               [--pipeline visibility|pathtrace|pathtrace-interactive] [--taa] [--samples <n>]
+//               [--timers on|off]
 //               [--gltf <file>] [--out <file> | --sequence <directory>] [--graph <file>]
 //
 // The path tracer renders --samples frames, one sample per pixel each, and writes the last
@@ -42,6 +43,7 @@ struct Options {
     std::string device;
     lr::core::ivec2 size{960, 540};
     bool pathTrace = false;
+    bool denoise = false; // the path tracer's interactive pipeline
     bool taa = false;
     std::optional<std::uint32_t> samples;
     bool timers = false;
@@ -69,8 +71,9 @@ bool apply(Options &options, std::string const &flag, std::string const &value) 
         options.size = size.value_or(lr::core::ivec2{0});
         return size.has_value();
     } else if (flag == "--pipeline") {
-        options.pathTrace = value == "pathtrace";
-        return value == "pathtrace" or value == "visibility";
+        options.pathTrace = value == "pathtrace" or value == "pathtrace-interactive";
+        options.denoise = value == "pathtrace-interactive";
+        return options.pathTrace or value == "visibility";
     } else if (flag == "--samples") {
         options.samples = lr::examples::parseCount(value);
         return options.samples.has_value();
@@ -190,7 +193,10 @@ int run(Options const &options) {
     auto view = lr::render::ViewDesc{};
     view.id = lr::core::ViewId{0};
     view.target = targetOf(*renderer, options, sequence);
-    view.pipeline = options.pathTrace ? renderer->pipelines().pathTraceReference() : renderer->pipelines().visibility();
+    auto &pipelines = renderer->pipelines();
+    view.pipeline = options.denoise     ? pipelines.pathTraceInteractive()
+                  : options.pathTrace ? pipelines.pathTraceReference()
+                                      : pipelines.visibility();
     view.camera = scene.camera;
     view.settings.antiAliasing = options.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
     auto delta = std::move(scene.delta);
@@ -245,8 +251,8 @@ int main(int argc, char **argv) {
     if (not options) {
         std::fprintf(stderr, "usage: lrender_cli [--backend cpu|opengl|gles|vulkan] [--device <name part>] "
                              "[--size <w>x<h>]\n"
-                             "                   [--pipeline visibility|pathtrace] [--taa] [--samples <n>] "
-                             "[--timers on|off]\n"
+                             "                   [--pipeline visibility|pathtrace|pathtrace-interactive] [--taa] "
+                             "[--samples <n>] [--timers on|off]\n"
                              "                   [--gltf <file>] [--out <file> | --sequence <directory>] "
                              "[--graph <file>]\n");
         return 2;

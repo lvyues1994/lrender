@@ -36,7 +36,7 @@ cmake --workflow --preset debug        # 配置、构建、测试
 ./build/debug/examples/lrender_cli --pipeline pathtrace --samples 16 --sequence frames/   # frames/frame0.ppm …
 ```
 
-演示场景的纹理都是程序生成的：棋盘格地面、带法线贴图的木箱、用 alpha 遮罩镂空的格栅，还有一个半透明的球，太阳投下级联阴影。`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--sequence <目录>` 改为把每一帧写成 `<目录>/frame<帧号>.ppm`（目录要先存在）；`--timers on` 打印每个 pass 的设备耗时；`--graph <文件>` 把最后一帧的帧图写成 Graphviz 的 DOT（`dot -Tsvg 文件 > graph.svg` 画出来），程序也会打印帧图资源共用内存前后各要多少。`--taa` 打开可见性缓冲管线的时间抗锯齿，渲染 `--samples` 帧（默认 16）静止的场景再写出最后一帧。程序启动时打印设备选中的 kernel 变体（子组、一遍写入的可见性缓冲、路径追踪用不用 ray query）。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
+演示场景的纹理都是程序生成的：棋盘格地面、带法线贴图的木箱、用 alpha 遮罩镂空的格栅，还有一个半透明的球，太阳投下级联阴影。`--pipeline pathtrace` 用参考路径追踪器渲染 `--samples` 帧、每帧每像素一个采样，写出最后一帧；`--pipeline pathtrace-interactive` 是同一个路径追踪器加上降噪，移动时显示降噪的颜色，静止 64 帧后与参考相同；`--sequence <目录>` 改为把每一帧写成 `<目录>/frame<帧号>.ppm`（目录要先存在）；`--timers on` 打印每个 pass 的设备耗时；`--graph <文件>` 把最后一帧的帧图写成 Graphviz 的 DOT（`dot -Tsvg 文件 > graph.svg` 画出来），程序也会打印帧图资源共用内存前后各要多少。`--taa` 打开可见性缓冲管线的时间抗锯齿，渲染 `--samples` 帧（默认 16）静止的场景再写出最后一帧。程序启动时打印设备选中的 kernel 变体（子组、一遍写入的可见性缓冲、路径追踪用不用 ray query）。`./build/debug/probes/layout_probe --backend vulkan` 在设备上给场景表的各种布局计时。
 
 在窗口里看演示场景：
 
@@ -45,7 +45,7 @@ cmake --workflow --preset debug        # 配置、构建、测试
 SDL_VIDEODRIVER=offscreen ./build/debug/examples/lrender_view --frames 30   # 不开窗口，跑 30 帧就退出
 ```
 
-场景放在一个 `lr::scene::World` 里，由脚本每帧推动：相机慢慢绕场景转，发光的球带着上方的点光源上下浮动。左键拖动改变相机的方向，滚轮缩放；Tab 在可见性缓冲和路径追踪两条管线之间切换（1、2 直接选），T 开关时间抗锯齿（默认开），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出，这时每帧按 1/60 秒模拟，退出前打印 tick 数和相机从哪里转到了哪里。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。`--present vulkan` 改用 `lr::present::VulkanPresenter`，在窗口的 Vulkan surface 上建交换链；设备和它是同一块 GPU 时，帧直接写进它的内存（SharedBuffer 路径），不经过主机，NVIDIA 上回读 1080p 一帧要两百多毫秒，这条路径省掉了它。默认的 `--present sdl` 经 SDL 渲染器回读再上屏。
+场景放在一个 `lr::scene::World` 里，由脚本每帧推动：相机慢慢绕场景转，发光的球带着上方的点光源上下浮动。左键拖动改变相机的方向，滚轮缩放；Tab 依次切换可见性缓冲、路径追踪和降噪的路径追踪三条管线（1、2、3 直接选），T 开关时间抗锯齿（默认开），Esc 或 Q 退出。`--backend`、`--device`、`--pipeline` 与 `lrender_cli` 相同，`--frames <n>` 渲染 n 帧后退出，这时每帧按 1/60 秒模拟，退出前打印 tick 数和相机从哪里转到了哪里。没有显示器时 SDL 可能选不到加速渲染器，会自动退回软件渲染器，也可以用 `SDL_RENDER_DRIVER=software` 指定。`--present vulkan` 改用 `lr::present::VulkanPresenter`，在窗口的 Vulkan surface 上建交换链；设备和它是同一块 GPU 时，帧直接写进它的内存（SharedBuffer 路径），不经过主机，NVIDIA 上回读 1080p 一帧要两百多毫秒，这条路径省掉了它。默认的 `--present sdl` 经 SDL 渲染器回读再上屏。
 
 两个程序都可以用 `--gltf` 换成 glTF 场景（`.gltf` 带外部文件或 data URI，或 `.glb`；图片是 PNG、JPEG 或 KTX2）：
 

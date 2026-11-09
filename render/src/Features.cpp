@@ -1,7 +1,9 @@
 #include <lr/render/Features.h>
 
+#include "MotionPass.h"
 #include "PassHelpers.h"
 #include "ShadowCascades.h"
+#include "kernels/Denoise.h"
 #include "kernels/Lights.h"
 #include "kernels/PathTrace.h"
 #include "kernels/Post.h"
@@ -11,6 +13,7 @@
 #include <lr/render/MaterialModel.h>
 
 #include <algorithm>
+#include <array>
 #include <cmath>
 #include <cstddef>
 #include <optional>
@@ -26,6 +29,13 @@ namespace {
 
 // Room for this many transparent fragments per pixel on average; more are dropped.
 constexpr auto kTransparentFragmentsPerPixel = std::size_t{2};
+
+// The denoiser shows its colour while the path tracer's mean holds fewer samples than the
+// first, and fades into the mean up to the second.
+constexpr auto kDenoiseFadeFrom = 16.0f;
+constexpr auto kDenoiseFadeTo = 64.0f;
+// A-trous iterations, the first one step apart, each twice the step of the one before.
+constexpr auto kDenoiseIterations = 5;
 
 std::size_t roundUpToPowerOfTwo(std::size_t const value) {
     auto result = std::size_t{1};
@@ -1123,6 +1133,7 @@ struct PathTraceFeature final : RenderFeature {
             context.dispatch(kernel, groupsCovering(inputs.extent));
         });
         graph.onFinish([total](ViewResult &result) { result.stats.accumulatedSamples = *total; });
+        graph.blackboard().put(PathTraceOutputs{accumulation.current, total});
     }
 
 private:
@@ -1184,6 +1195,174 @@ private:
         std::make_shared<std::unordered_map<ViewId, SampleCount>>();
 };
 
+struct PathTraceDenoiseFeature final : RenderFeature {
+    FeatureStage stage() const noexcept override { return FeatureStage::PostProcess; }
+
+    FeatureRequirements requirements() const noexcept override {
+        auto requirements = FeatureRequirements{};
+        requirements.previousView = true;
+        return requirements;
+    }
+
+    void setup(FrameGraphBuilder &graph, ViewContext const &view) override {
+        auto &board = graph.blackboard();
+        if (not view.temporal or not board.contains<VisibilityOutputs>() or not board.contains<PathTraceOutputs>()) {
+            return;
+        }
+        auto const visibility = board.get<VisibilityOutputs>();
+        auto const traced = board.get<PathTraceOutputs>();
+        auto const pixels = pixelsOf(view.extent);
+        auto const extent = view.extent;
+        auto const motion = motionOf(graph, view);
+        auto const guides = graph.history<AccumulationFormat>("denoise guides", extent);
+        auto const albedo = graph.createImage<HdrFormat>("denoise albedo", extent);
+        auto const emission = graph.createImage<HdrFormat>("denoise emission", extent);
+        auto const illumination = graph.createBuffer<tc::vec4>("denoise illumination", pixels);
+        auto const color = graph.historyBuffer<tc::vec4>("denoise colour", pixels);
+        auto const moments = graph.historyBuffer<tc::vec2>("denoise moments", pixels);
+        auto const filtered = std::array{graph.createBuffer<tc::vec4>("denoise filtered", pixels),
+                                         graph.createBuffer<tc::vec4>("denoise filtered back", pixels)};
+        auto const shadows = shadowsOf(graph);
+        auto const shading = shadingViewOf(view, shadows, lightGridOf(graph, view));
+
+        auto &guide = graph.addPass("denoise guides");
+        guide.read(visibility.visible);
+        guide.read(visibility.triangles);
+        guide.read(shading.shadows.map);
+        guide.read(shading.lights.grid);
+        guide.write(guides.current);
+        guide.write(albedo);
+        guide.write(emission);
+        guide.record([shading, visibility, guides, albedo, emission](PassContext &context) {
+            auto &device = context.device();
+            auto kernel = kernels::PathTraceGuides{};
+            device.useKernel(kernel);
+            bindSurfaceShading(device, kernel, surfaceResources(context, shading, visibility.visible));
+            bind(device, kernel.triangles, context.buffer(visibility.triangles));
+            bind(device, kernel.normalDepth, context.image(guides.current));
+            bind(device, kernel.albedo, context.image(albedo));
+            bind(device, kernel.emission, context.image(emission));
+            context.dispatch(kernel, groupsCovering(shading.extent));
+        });
+
+        auto &demodulate = graph.addPass("demodulate illumination");
+        demodulate.read(view.sceneColor);
+        demodulate.read(albedo);
+        demodulate.read(emission);
+        demodulate.read(guides.current);
+        demodulate.write(illumination);
+        demodulate.record([color = view.sceneColor, albedo, emission, guides, illumination,
+                           extent](PassContext &context) {
+            auto &device = context.device();
+            auto kernel = kernels::DemodulateIllumination{};
+            device.useKernel(kernel);
+            bind(device, kernel.color, context.image(color));
+            bind(device, kernel.albedo, context.image(albedo));
+            bind(device, kernel.emission, context.image(emission));
+            bind(device, kernel.normalDepth, context.image(guides.current));
+            bind(device, kernel.illumination, context.buffer(illumination));
+            set(device, kernel.size, extent);
+            context.dispatch(kernel, groupsCovering(extent));
+        });
+
+        auto &accumulate = graph.addPass("accumulate illumination");
+        accumulate.read(guides.current);
+        accumulate.read(guides.previous);
+        accumulate.read(illumination);
+        accumulate.read(motion);
+        accumulate.read(color.previous);
+        accumulate.read(moments.previous);
+        accumulate.write(color.current);
+        accumulate.write(moments.current);
+        auto const historyValid = guides.valid and color.valid and moments.valid and view.temporal->continues;
+        accumulate.record([guides, illumination, motion, color, moments, extent,
+                           valid = historyValid ? 1u : 0u](PassContext &context) {
+            auto &device = context.device();
+            auto kernel = kernels::AccumulateIllumination{};
+            device.useKernel(kernel);
+            bind(device, kernel.normalDepth, context.image(guides.current));
+            bind(device, kernel.previousNormalDepth, context.image(guides.previous));
+            bind(device, kernel.illumination, context.buffer(illumination));
+            bind(device, kernel.motion, context.buffer(motion));
+            bind(device, kernel.previousColor, context.buffer(color.previous));
+            bind(device, kernel.previousMoments, context.buffer(moments.previous));
+            bind(device, kernel.color, context.buffer(color.current));
+            bind(device, kernel.moments, context.buffer(moments.current));
+            set(device, kernel.size, extent);
+            set(device, kernel.historyValid, valid);
+            context.dispatch(kernel, groupsCovering(extent));
+        });
+
+        auto &variance = graph.addPass("estimate variance");
+        variance.read(guides.current);
+        variance.read(color.current);
+        variance.read(moments.current);
+        variance.write(filtered[0]);
+        variance.record([guides, color, moments, target = filtered[0], extent](PassContext &context) {
+            auto &device = context.device();
+            auto kernel = kernels::EstimateVariance{};
+            device.useKernel(kernel);
+            bind(device, kernel.normalDepth, context.image(guides.current));
+            bind(device, kernel.color, context.buffer(color.current));
+            bind(device, kernel.moments, context.buffer(moments.current));
+            bind(device, kernel.filtered, context.buffer(target));
+            set(device, kernel.size, extent);
+            context.dispatch(kernel, groupsCovering(extent));
+        });
+
+        auto &filter = graph.addPass("filter illumination");
+        filter.read(guides.current);
+        filter.read(filtered[0]);
+        filter.write(filtered[0]);
+        filter.write(filtered[1]);
+        filter.read(color.current);
+        filter.write(color.current);
+        filter.record([guides, filtered, color, extent](PassContext &context) {
+            auto &device = context.device();
+            for (auto iteration = 0; iteration < kDenoiseIterations; ++iteration) {
+                auto const from = static_cast<std::size_t>(iteration % 2);
+                auto kernel = kernels::FilterIllumination{};
+                device.useKernel(kernel);
+                bind(device, kernel.normalDepth, context.image(guides.current));
+                bind(device, kernel.source, context.buffer(filtered[from]));
+                bind(device, kernel.target, context.buffer(filtered[1 - from]));
+                bind(device, kernel.color, context.buffer(color.current));
+                set(device, kernel.size, extent);
+                set(device, kernel.step, 1 << iteration);
+                set(device, kernel.feedback, iteration == 0 ? 1u : 0u);
+                context.dispatch(kernel, groupsCovering(extent));
+            }
+        });
+
+        auto const denoised = filtered[static_cast<std::size_t>(kDenoiseIterations % 2)];
+        auto &remodulate = graph.addPass("remodulate illumination");
+        remodulate.read(denoised);
+        remodulate.read(traced.mean);
+        remodulate.read(albedo);
+        remodulate.read(emission);
+        remodulate.read(guides.current);
+        remodulate.read(view.sceneColor);
+        remodulate.write(view.sceneColor);
+        remodulate.record([color = view.sceneColor, traced, albedo, emission, guides, denoised,
+                           extent](PassContext &context) {
+            auto const fade =
+                (static_cast<float>(*traced.samples) - kDenoiseFadeFrom) / (kDenoiseFadeTo - kDenoiseFadeFrom);
+            auto &device = context.device();
+            auto kernel = kernels::RemodulateIllumination{};
+            device.useKernel(kernel);
+            bind(device, kernel.color, context.image(color));
+            bind(device, kernel.mean, context.image(traced.mean));
+            bind(device, kernel.albedo, context.image(albedo));
+            bind(device, kernel.emission, context.image(emission));
+            bind(device, kernel.normalDepth, context.image(guides.current));
+            bind(device, kernel.filtered, context.buffer(denoised));
+            set(device, kernel.size, extent);
+            set(device, kernel.reference, std::clamp(fade, 0.0f, 1.0f));
+            context.dispatch(kernel, groupsCovering(extent));
+        });
+    }
+};
+
 struct TonemapFeature final : RenderFeature {
     FeatureStage stage() const noexcept override { return FeatureStage::Output; }
 
@@ -1215,5 +1394,6 @@ std::shared_ptr<RenderFeature> makeShadingFeature() { return std::make_shared<Sh
 std::shared_ptr<RenderFeature> makeTransparencyFeature() { return std::make_shared<TransparencyFeature>(); }
 std::shared_ptr<RenderFeature> makeTonemapFeature() { return std::make_shared<TonemapFeature>(); }
 std::shared_ptr<RenderFeature> makePathTraceFeature() { return std::make_shared<PathTraceFeature>(); }
+std::shared_ptr<RenderFeature> makePathTraceDenoiseFeature() { return std::make_shared<PathTraceDenoiseFeature>(); }
 
 } // namespace lr::render

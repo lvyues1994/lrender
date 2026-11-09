@@ -347,7 +347,7 @@ struct ViewContext {
     core::EnvironmentDesc environment;
     core::mat4 viewMatrix{1.0f};
     core::mat4 projection{1.0f};
-    // Jittered where `temporal` is set.
+    // Jittered where the view's settings ask for temporal anti-aliasing and a feature for it.
     core::mat4 viewProjection{1.0f};
     core::mat4 inverseViewProjection{1.0f};
     std::optional<TemporalView> temporal;
@@ -397,6 +397,9 @@ struct FeatureRequirements {
     // A projection jittered anew every frame (ViewContext::temporal) for views whose
     // settings ask for temporal anti-aliasing.
     bool temporalJitter = false;
+    // ViewContext::temporal, without jittering the projection, for features that find
+    // where pixels were in the previous frame.
+    bool previousView = false;
 };
 
 // A pipeline is a list of features, set up in stage order (and, within a stage, in the

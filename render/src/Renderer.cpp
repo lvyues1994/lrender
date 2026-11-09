@@ -124,10 +124,13 @@ struct PipelinesImpl final : PipelineRegistry {
                                         makeTransparencyFeature(), makeTemporalAntiAliasingFeature(),
                                         makeTonemapFeature()});
         pipelines.push_back(FeatureList{makePathTraceFeature(), makeTonemapFeature()});
+        pipelines.push_back(FeatureList{makeVisibilityFeature(), makePathTraceFeature(), makePathTraceDenoiseFeature(),
+                                        makeTonemapFeature()});
     }
 
     PipelineId visibility() const noexcept override { return PipelineId{0}; }
     PipelineId pathTraceReference() const noexcept override { return PipelineId{1}; }
+    PipelineId pathTraceInteractive() const noexcept override { return PipelineId{2}; }
 
     PipelineId create(PipelineDesc desc) override {
         auto const lock = std::lock_guard<std::mutex>{mutex};
@@ -246,6 +249,12 @@ bool jitters(ViewPlan const &plan) {
     return plan.desc.settings.antiAliasing == AntiAliasing::Taa
        and std::any_of(plan.features.begin(), plan.features.end(),
                        [](auto const &feature) { return feature->requirements().temporalJitter; });
+}
+
+bool tracksPreviousView(ViewPlan const &plan) {
+    return jitters(plan) or std::any_of(plan.features.begin(), plan.features.end(), [](auto const &feature) {
+               return feature->requirements().previousView;
+           });
 }
 
 RendererCapabilities chooseFor(gpu::GpuQueue &gpu, RendererConfig const &config) {
@@ -457,11 +466,13 @@ private:
         context.cullOccluded = cullOccluded;
         context.clusterLights = clusterLights;
         context.materialModels = modelList;
-        if (jitters(plan)) {
+        if (tracksPreviousView(plan)) {
             auto const temporal = temporalViews.advance(TemporalRequest{plan.desc.id, frameIndex, context.extent,
                                                                         context.viewProjection, plan.desc.cameraCut});
-            context.viewProjection = jitteredViewProjection(context.viewProjection, temporal.jitter, context.extent);
-            context.inverseViewProjection = tc::inverse(context.viewProjection);
+            if (jitters(plan)) {
+                context.viewProjection = jitteredViewProjection(context.viewProjection, temporal.jitter, context.extent);
+                context.inverseViewProjection = tc::inverse(context.viewProjection);
+            }
             context.temporal = temporal;
         }
         return context;

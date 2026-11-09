@@ -9,7 +9,7 @@
 // Every --config gets a renderer of its own on the same device. Their frames alternate, each
 // waited for before the next starts, so that whatever the GPU's clocks do affects them alike.
 // Settings: aliasing=on|off, clusters=on|off, occlusion=on|off, lightgrid=on|off, subgroups=auto|off,
-// singlepass=auto|off, rayqueries=auto|off, taa=on|off, pipeline=visibility|pathtrace,
+// singlepass=auto|off, rayqueries=auto|off, taa=on|off, pipeline=visibility|pathtrace|pathtrace-interactive,
 // present=drop|readback|shared. Before the --frames that count (a full turn of the orbit unless given), every configuration renders --warmup frames from where the orbit
 // starts, then more until the medians of its last two windows of 30 frames agree within 2%
 // (at most 600 more): the GPU's clocks have risen and the textures have streamed in. Frames
@@ -70,6 +70,7 @@ struct Settings {
     VariantUse rayQueries = VariantUse::Auto;
     bool taa = false;
     bool pathTrace = false;
+    bool denoise = false; // the path tracer's interactive pipeline
 };
 
 struct ConfigSpec {
@@ -136,8 +137,10 @@ bool applySetting(Settings &settings, std::string const &key, std::string const 
         settings.rayQueries = *use;
     } else if (key == "taa" and on) {
         settings.taa = *on;
-    } else if (key == "pipeline" and (value == "visibility" or value == "pathtrace")) {
-        settings.pathTrace = value == "pathtrace";
+    } else if (key == "pipeline"
+               and (value == "visibility" or value == "pathtrace" or value == "pathtrace-interactive")) {
+        settings.pathTrace = value != "visibility";
+        settings.denoise = value == "pathtrace-interactive";
     } else if (key == "present" and (value == "drop" or value == "readback" or value == "shared")) {
         settings.present = value == "drop"       ? Presentation::Drop
                          : value == "readback" ? Presentation::Readback
@@ -413,8 +416,10 @@ Run makeRun(ConfigSpec spec, Options const &options, lr::runtime::Runtime &runti
     auto const shown = presenter != nullptr ? std::shared_ptr<lr::render::Presenter>{presenter}
                                             : std::make_shared<DroppingPresenter>();
     view.target = renderer->targets().createWindow(lr::render::WindowTargetDesc{options.size, shown});
-    view.pipeline = spec.settings.pathTrace ? renderer->pipelines().pathTraceReference()
-                                            : renderer->pipelines().visibility();
+    auto &pipelines = renderer->pipelines();
+    view.pipeline = spec.settings.denoise     ? pipelines.pathTraceInteractive()
+                  : spec.settings.pathTrace ? pipelines.pathTraceReference()
+                                            : pipelines.visibility();
     view.settings.antiAliasing = spec.settings.taa ? lr::render::AntiAliasing::Taa : lr::render::AntiAliasing::None;
     return Run{std::move(spec), std::move(presenter), std::move(renderer), view, {}, {}};
 }

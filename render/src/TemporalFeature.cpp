@@ -1,5 +1,6 @@
 #include <lr/render/Features.h>
 
+#include "MotionPass.h"
 #include "PassHelpers.h"
 #include "kernels/Temporal.h"
 
@@ -24,38 +25,8 @@ struct TemporalAntiAliasingFeature final : RenderFeature {
             return;
         }
         auto const &temporal = *view.temporal;
-        auto const visibility = graph.blackboard().get<VisibilityOutputs>();
         auto const history = graph.history<HdrFormat>("temporal anti-aliasing", view.extent);
-        auto const matrices = graph.createUploadBuffer<tc::mat4>("temporal matrices", 3);
-        auto const motion = graph.createBuffer<tc::vec2>("motion", pixelsOf(view.extent));
-
-        auto &motionPass = graph.addPass("temporal motion");
-        motionPass.read(visibility.visible);
-        motionPass.read(visibility.triangles);
-        motionPass.write(matrices);
-        motionPass.write(motion);
-        auto const views =
-            std::array<core::mat4, 3>{view.inverseViewProjection, temporal.viewProjection, temporal.previousViewProjection};
-        motionPass.record([visibility, matrices, motion, views, extent = view.extent,
-                           frame = view.sceneFrame](PassContext &context) {
-            auto &device = context.device();
-            auto const &scene = context.scene();
-            auto &matrixBuffer = context.buffer(matrices);
-            std::copy(views.begin(), views.end(), matrixBuffer.data());
-            device.uploadBuffer(matrixBuffer);
-            auto kernel = kernels::TemporalMotion{};
-            device.useKernel(kernel);
-            bind(device, kernel.instances, *scene.instances);
-            bind(device, kernel.vertices, *scene.vertices);
-            bind(device, kernel.indices, *scene.indices);
-            bind(device, kernel.visible, context.buffer(visibility.visible));
-            bind(device, kernel.triangles, context.buffer(visibility.triangles));
-            bind(device, kernel.matrices, matrixBuffer);
-            bind(device, kernel.motion, context.buffer(motion));
-            set(device, kernel.size, extent);
-            set(device, kernel.frame, frame);
-            context.dispatch(kernel, groupsCovering(extent));
-        });
+        auto const motion = motionOf(graph, view);
 
         auto &resolve = graph.addPass("temporal resolve");
         resolve.read(view.sceneColor);
@@ -88,11 +59,50 @@ struct TemporalAntiAliasingFeature final : RenderFeature {
             set(device, kernel.size, extent);
             context.dispatch(kernel, groupsCovering(extent));
         });
-        graph.blackboard().put(TemporalOutputs{motion});
     }
 };
 
 } // namespace
+
+BufferRef<tc::vec2> motionOf(FrameGraphBuilder &graph, ViewContext const &view) {
+    auto &board = graph.blackboard();
+    if (board.contains<TemporalOutputs>()) {
+        return board.get<TemporalOutputs>().motion;
+    }
+    auto const &temporal = *view.temporal;
+    auto const visibility = board.get<VisibilityOutputs>();
+    auto const matrices = graph.createUploadBuffer<tc::mat4>("temporal matrices", 3);
+    auto const motion = graph.createBuffer<tc::vec2>("motion", pixelsOf(view.extent));
+    auto &motionPass = graph.addPass("temporal motion");
+    motionPass.read(visibility.visible);
+    motionPass.read(visibility.triangles);
+    motionPass.write(matrices);
+    motionPass.write(motion);
+    auto const views =
+        std::array<core::mat4, 3>{view.inverseViewProjection, temporal.viewProjection, temporal.previousViewProjection};
+    motionPass.record([visibility, matrices, motion, views, extent = view.extent,
+                       frame = view.sceneFrame](PassContext &context) {
+        auto &device = context.device();
+        auto const &scene = context.scene();
+        auto &matrixBuffer = context.buffer(matrices);
+        std::copy(views.begin(), views.end(), matrixBuffer.data());
+        device.uploadBuffer(matrixBuffer);
+        auto kernel = kernels::TemporalMotion{};
+        device.useKernel(kernel);
+        bind(device, kernel.instances, *scene.instances);
+        bind(device, kernel.vertices, *scene.vertices);
+        bind(device, kernel.indices, *scene.indices);
+        bind(device, kernel.visible, context.buffer(visibility.visible));
+        bind(device, kernel.triangles, context.buffer(visibility.triangles));
+        bind(device, kernel.matrices, matrixBuffer);
+        bind(device, kernel.motion, context.buffer(motion));
+        set(device, kernel.size, extent);
+        set(device, kernel.frame, frame);
+        context.dispatch(kernel, groupsCovering(extent));
+    });
+    board.put(TemporalOutputs{motion});
+    return motion;
+}
 
 std::shared_ptr<RenderFeature> makeTemporalAntiAliasingFeature() {
     return std::make_shared<TemporalAntiAliasingFeature>();

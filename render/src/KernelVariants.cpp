@@ -1,5 +1,6 @@
 #include "KernelVariants.h"
 
+#include "kernels/Denoise.h"
 #include "kernels/Lights.h"
 #include "kernels/PathTrace.h"
 #include "kernels/Post.h"
@@ -64,6 +65,8 @@ LrenderPrograms const &lrenderPrograms() {
          ScanVisibleBlocks::fileLocation, WriteVisible::fileLocation, CullClusters::fileLocation,
          SumClusterBlocks::fileLocation, WriteVisibleClusters::fileLocation, DownsampleDepth::fileLocation,
          DownsamplePyramid::fileLocation, CullOccludedClusters::fileLocation, AssignLights::fileLocation,
+         PathTraceGuides::fileLocation, DemodulateIllumination::fileLocation, AccumulateIllumination::fileLocation,
+         EstimateVariance::fileLocation, FilterIllumination::fileLocation, RemodulateIllumination::fileLocation,
          RasterVisibility::fileLocation, RasterVisibilityTiles::fileLocation, ScanLargeTriangles::fileLocation,
          CopyVisibleTotals::fileLocation, ClassifyPixels::fileLocation,
          AllocateModelLists::fileLocation, ScatterModelPixels::fileLocation,

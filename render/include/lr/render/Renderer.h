@@ -73,6 +73,10 @@ struct PipelineRegistry {
     // The reference: a path tracer that adds a sample per pixel each frame of a view and
     // shows their mean, tone mapped (ViewStats::accumulatedSamples).
     virtual PipelineId pathTraceReference() const noexcept = 0;
+    // The same path tracer, denoised while the view or the scene changes (see
+    // makePathTraceDenoiseFeature()): once the mean holds enough samples, it shows the mean
+    // as the reference does.
+    virtual PipelineId pathTraceInteractive() const noexcept = 0;
     virtual PipelineId create(PipelineDesc desc) = 0;
 };
 

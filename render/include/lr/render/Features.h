@@ -32,7 +32,8 @@ struct LightGridOutputs {
     BufferRef<tc::uint> grid;
 };
 
-// What the temporal anti-aliasing feature puts on the blackboard when it runs.
+// What the first feature that needs it puts on the blackboard (the temporal anti-aliasing
+// feature, the path tracer's denoiser).
 struct TemporalOutputs {
     // Per pixel, in pixels right and down: where the surface it shows is on the screen
     // less where it was in the previous frame, both without the frames' jitters.
@@ -55,10 +56,25 @@ std::shared_ptr<RenderFeature> makeTransparencyFeature();
 std::shared_ptr<RenderFeature> makeTemporalAntiAliasingFeature();
 std::shared_ptr<RenderFeature> makeTonemapFeature();
 
+// What the path tracing feature puts on the blackboard: the view's mean, and the samples it
+// holds, set on the GPU thread as the feature's pass is recorded, before the passes after it.
+struct PathTraceOutputs {
+    ImageRef<AccumulationFormat> mean;
+    std::shared_ptr<std::uint32_t const> samples;
+};
+
 // The path tracing pipeline's shading: a Shading-stage feature that adds one sample per
 // pixel to the view's running mean and writes the mean to the scene colour. The mean
 // starts over when the camera, the extent or the scene changes, or textures finish
 // streaming in.
 std::shared_ptr<RenderFeature> makePathTraceFeature();
+
+// A PostProcess feature that denoises the path tracer's mean, for pipelines that also have
+// the visibility feature: spatiotemporal variance-guided filtering of the illumination,
+// with guides from the visibility buffer (blended surfaces are not in it, so what shows
+// through them is filtered by what is behind). While the mean holds fewer than 16
+// samples the view shows the denoised colour; from 16 to 64 it fades into the mean, so a
+// view that stays still ends with the reference's colour.
+std::shared_ptr<RenderFeature> makePathTraceDenoiseFeature();
 
 } // namespace lr::render
